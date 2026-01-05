@@ -107,7 +107,7 @@ namespace ImageCore
             }
 
             // 디스패처를 통해 디코드 실행 (포맷 라우팅 + 디코더 선택 포함)
-            PipelineResult result = dispatcher.Decode(task.request, task.wicFactory);
+            PipelineResult result = dispatcher.Decode(task.request, nullptr);
 
             // 콜백 호출 (WIC bitmap 또는 ScratchImage 결과 전달)
             if (task.callback)

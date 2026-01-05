@@ -128,14 +128,20 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="ImageRequest.h" />
+    <ClInclude Include="DecodeTypes.h" />
+    <ClInclude Include="IImageDecoder.h" />
+    <ClInclude Include="IImageDecoderFactory.h" />
+    <ClInclude Include="ImageCore.h" />
     <ClInclude Include="ImageLoader.h" />
     <ClInclude Include="ImageCache.h" />
+    <ClInclude Include="DecoderRegistry.h" />
     <ClInclude Include="ImageDecodeDispatcher.h" />
     <ClInclude Include="DecodeScheduler.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="ImageLoader.cpp" />
     <ClCompile Include="ImageCache.cpp" />
+    <ClCompile Include="DecoderRegistry.cpp" />
     <ClCompile Include="ImageDecodeDispatcher.cpp" />
     <ClCompile Include="DecodeScheduler.cpp" />
   </ItemGroup>

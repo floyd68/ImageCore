@@ -1,6 +1,7 @@
 #include "ImageLoader.h"
 #include "ImageCache.h"
 #include "DecodeScheduler.h"
+#include "ImageCore.h"
 #include <algorithm>
 #include <wincodec.h>
 #include <comdef.h>
@@ -26,18 +27,8 @@ namespace ImageCore
 
     void ImageLoader::Initialize()
     {
-        // WIC Factory 생성 (ImageCore가 자체적으로 관리)
-        HRESULT hr = CoCreateInstance(
-            CLSID_WICImagingFactory,
-            nullptr,
-            CLSCTX_INPROC_SERVER,
-            IID_PPV_ARGS(&m_wicFactory));
-        
-        if (FAILED(hr))
-        {
-            // WIC Factory 생성 실패 시 nullptr로 유지
-            m_wicFactory.Reset();
-        }
+        // Ensure built-in decoders are registered (safe to call multiple times)
+        RegisterBuiltInDecoders();
 
         m_cache = std::make_unique<ImageCache>();
         m_scheduler = std::make_unique<DecodeScheduler>();
@@ -51,7 +42,6 @@ namespace ImageCore
         }
         m_scheduler.reset();
         m_cache.reset();
-        m_wicFactory.Reset();
     }
 
     ImageHandle ImageLoader::Request(
@@ -63,13 +53,6 @@ namespace ImageCore
             return 0;
         }
 
-        // WIC Factory 확인
-        if (m_wicFactory == nullptr)
-        {
-            callback(E_FAIL, nullptr, nullptr);
-            return 0;
-        }
-
         ImageHandle handle = m_nextHandle.fetch_add(1);
 
         // 1. 캐시 확인은 제거 (D2D1Bitmap 캐시는 FD2D 레이어에서 관리)
@@ -78,7 +61,6 @@ namespace ImageCore
         DecodeTask task;
         task.request = request;
         task.handle = handle;
-        task.wicFactory = m_wicFactory.Get();  // ImageCore가 관리하는 Factory 사용
         task.callback = [callback](PipelineResult&& result)
         {
             if (FAILED(result.hr))

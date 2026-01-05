@@ -62,8 +62,6 @@ namespace ImageCore
         std::unique_ptr<ImageCache> m_cache;
         std::unique_ptr<DecodeScheduler> m_scheduler;
 
-        Microsoft::WRL::ComPtr<IWICImagingFactory> m_wicFactory;  // ImageCore가 자체적으로 관리
-
         std::atomic<ImageHandle> m_nextHandle;
         std::mutex m_mutex;
     };

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "ImageRequest.h"
-#include "ImageDecodeDispatcher.h"
+#include "DecodeTypes.h"
 #include <thread>
 #include <vector>
 #include <queue>
@@ -18,13 +18,11 @@ namespace ImageCore
     struct DecodeTask
     {
         ImageRequest request;
-        IWICImagingFactory* wicFactory;  // WIC Factory (UI 레이어에서 제공)
         std::function<void(PipelineResult&&)> callback;  // WIC bitmap 또는 ScratchImage 결과를 받는 콜백 (move semantics)
         uint64_t handle;
 
         DecodeTask()
-            : wicFactory(nullptr)
-            , handle(0)
+            : handle(0)
         {
         }
     };
