@@ -139,6 +139,11 @@ namespace ImageCore
 
     std::vector<std::shared_ptr<IImageDecoderFactory>> DecoderRegistry::GetCandidateFactories(const ImageRequest& request) const
     {
+        return GetCandidateFactories(request, {});
+    }
+
+    std::vector<std::shared_ptr<IImageDecoderFactory>> DecoderRegistry::GetCandidateFactories(const ImageRequest& request, std::span<const uint8_t> header) const
+    {
         std::vector<std::shared_ptr<IImageDecoderFactory>> result;
 
         const std::wstring ext = GetLowerExtensionFromPath(request.source);
@@ -164,7 +169,11 @@ namespace ImageCore
 
             if (it->second->SupportsPurpose(request.purpose))
             {
-                result.push_back(it->second);
+                // header/magic 기반 probe에서 제외될 수 있게 한다.
+                if (it->second->Probe(header, ext))
+                {
+                    result.push_back(it->second);
+                }
             }
         };
 

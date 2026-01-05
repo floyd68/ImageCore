@@ -2,6 +2,7 @@
 #include "DecoderRegistry.h"
 #include "IImageDecoderFactory.h"
 #include "ImageCore.h"
+#include "ImageFormatDetector.h"
 
 #include "../external/DirectXTex/DirectXTex/DirectXTex.h"
 #ifdef USE_OPENEXR
@@ -518,6 +519,25 @@ namespace ImageCore
                 return std::span<const std::wstring_view>(s_exts, std::size(s_exts));
             }
 
+            bool Probe(std::span<const uint8_t> header, std::wstring_view extensionLower) const override
+            {
+                UNREFERENCED_PARAMETER(extensionLower);
+                const ImageFormatInfo info = ImageFormatDetector::DetectByMagic(header);
+                switch (info.format)
+                {
+                case ImageFormat::PNG:
+                case ImageFormat::JPEG:
+                case ImageFormat::BMP:
+                case ImageFormat::GIF:
+                case ImageFormat::TIFF:
+                case ImageFormat::WEBP:
+                    return true;
+                default:
+                    // Unknown이면 확장자 기반 후보로는 남겨둔다 (Decode 실패 시 다른 디코더 시도)
+                    return true;
+                }
+            }
+
             bool SupportsPurpose(ImagePurpose purpose) const override
             {
                 switch (purpose)
@@ -563,6 +583,27 @@ namespace ImageCore
                     L".exr",
                 };
                 return std::span<const std::wstring_view>(s_exts, std::size(s_exts));
+            }
+
+            bool Probe(std::span<const uint8_t> header, std::wstring_view extensionLower) const override
+            {
+                // Magic number가 강하게 DXTex 포맷을 가리키면 우선 후보로 남긴다.
+                const ImageFormatInfo info = ImageFormatDetector::DetectByMagic(header);
+                switch (info.format)
+                {
+                case ImageFormat::DDS:
+                case ImageFormat::KTX2:
+                case ImageFormat::EXR:
+                case ImageFormat::HDR:
+                    return true;
+                default:
+                    break;
+                }
+
+                // Magic이 Unknown이면 확장자 기반으로만 후보에 남긴다.
+                // (TGA/HDR 같은 케이스)
+                UNREFERENCED_PARAMETER(extensionLower);
+                return true;
             }
 
             bool SupportsPurpose(ImagePurpose purpose) const override
@@ -615,8 +656,11 @@ namespace ImageCore
         // safe even if app already called it
         RegisterBuiltInDecoders();
 
+        static ImageFormatDetector s_detector;
+        const FormatProbe probe = s_detector.ProbeFile(request.source);
+
         HRESULT lastHr = E_FAIL;
-        auto factories = DecoderRegistry::Instance().GetCandidateFactories(request);
+        auto factories = DecoderRegistry::Instance().GetCandidateFactories(request, probe.header);
 
         for (const auto& factory : factories)
         {

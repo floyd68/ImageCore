@@ -34,6 +34,7 @@ namespace ImageCore
 
         // 이 요청에 대해 시도할 factory 목록 (우선순위 순)
         std::vector<std::shared_ptr<IImageDecoderFactory>> GetCandidateFactories(const ImageRequest& request) const;
+        std::vector<std::shared_ptr<IImageDecoderFactory>> GetCandidateFactories(const ImageRequest& request, std::span<const uint8_t> header) const;
 
     private:
         DecoderRegistry() = default;

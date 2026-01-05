@@ -135,6 +135,7 @@
     <ClInclude Include="ImageLoader.h" />
     <ClInclude Include="ImageCache.h" />
     <ClInclude Include="DecoderRegistry.h" />
+    <ClInclude Include="ImageFormatDetector.h" />
     <ClInclude Include="ImageDecodeDispatcher.h" />
     <ClInclude Include="DecodeScheduler.h" />
   </ItemGroup>
@@ -142,6 +143,7 @@
     <ClCompile Include="ImageLoader.cpp" />
     <ClCompile Include="ImageCache.cpp" />
     <ClCompile Include="DecoderRegistry.cpp" />
+    <ClCompile Include="ImageFormatDetector.cpp" />
     <ClCompile Include="ImageDecodeDispatcher.cpp" />
     <ClCompile Include="DecodeScheduler.cpp" />
   </ItemGroup>

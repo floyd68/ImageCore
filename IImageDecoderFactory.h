@@ -5,6 +5,8 @@
 #include <string>
 #include <string_view>
 #include <memory>
+#include <cstdint>
+#include <windows.h>
 
 namespace ImageCore
 {
@@ -24,6 +26,15 @@ namespace ImageCore
 
         // 지원 확장자 목록 (".dds" 형태, 소문자 권장)
         virtual std::span<const std::wstring_view> SupportedExtensions() const = 0;
+
+        // Magic/header 기반 힌트로 지원 여부를 더 정밀하게 판별.
+        // 기본 구현은 true(=후보에서 제외하지 않음). 커스텀 디코더는 필요하면 override.
+        virtual bool Probe(std::span<const uint8_t> header, std::wstring_view extensionLower) const
+        {
+            UNREFERENCED_PARAMETER(header);
+            UNREFERENCED_PARAMETER(extensionLower);
+            return true;
+        }
 
         // Thumbnail/Preview/FullResolution 중 지원 여부
         virtual bool SupportsPurpose(ImagePurpose purpose) const = 0;
