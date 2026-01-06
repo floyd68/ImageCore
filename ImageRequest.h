@@ -23,11 +23,15 @@ namespace ImageCore
         ImagePurpose purpose;       // 로딩 목적
         Size targetSize;            // 썸네일/미리보기용 목표 크기
         bool srgb;                  // sRGB 색공간 사용 여부
+        // If true, allow returning GPU-compressed DDS ScratchImage for GPU-native rendering.
+        // If false (e.g., D2D-only renderer), the decode pipeline should return CPU-displayable BGRA8 pixels.
+        bool allowGpuCompressedDDS;
 
         ImageRequest()
             : purpose(ImagePurpose::FullResolution)
             , targetSize{ 0.0f, 0.0f }
             , srgb(true)
+            , allowGpuCompressedDDS(true)
         {
         }
 
@@ -36,6 +40,7 @@ namespace ImageCore
             , purpose(p)
             , targetSize{ 0.0f, 0.0f }
             , srgb(true)
+            , allowGpuCompressedDDS(true)
         {
         }
     };
@@ -47,7 +52,8 @@ namespace ImageCore
             a.purpose == b.purpose &&
             a.targetSize.w == b.targetSize.w &&
             a.targetSize.h == b.targetSize.h &&
-            a.srgb == b.srgb;
+            a.srgb == b.srgb &&
+            a.allowGpuCompressedDDS == b.allowGpuCompressedDDS;
     }
 
     inline bool operator<(const ImageRequest& a, const ImageRequest& b)
@@ -68,7 +74,11 @@ namespace ImageCore
         {
             return a.targetSize.h < b.targetSize.h;
         }
-        return a.srgb < b.srgb;
+        if (a.srgb != b.srgb)
+        {
+            return a.srgb < b.srgb;
+        }
+        return a.allowGpuCompressedDDS < b.allowGpuCompressedDDS;
     }
 }
 
@@ -85,7 +95,8 @@ namespace std
             size_t h3 = hash<float>{}(req.targetSize.w);
             size_t h4 = hash<float>{}(req.targetSize.h);
             size_t h5 = hash<bool>{}(req.srgb);
-            return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^ (h5 << 4);
+            size_t h6 = hash<bool>{}(req.allowGpuCompressedDDS);
+            return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^ (h5 << 4) ^ (h6 << 5);
         }
     };
 }

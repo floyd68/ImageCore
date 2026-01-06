@@ -9,8 +9,9 @@ namespace ImageCore
     {
     public:
         virtual ~IImageDecoder() = default;
-        virtual PipelineResult Decode(const ImageRequest& request, IWICImagingFactory* wicFactory) = 0;
+        virtual PipelineResult Decode(const ImageRequest& request, IWICImagingFactory* wicFactory, const DecodeInput& input) = 0;
     };
 }
+
 
 

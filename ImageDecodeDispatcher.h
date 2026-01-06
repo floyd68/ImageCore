@@ -9,7 +9,7 @@ namespace ImageCore
     class ImageDecodeDispatcher final
     {
     public:
-        PipelineResult Decode(const ImageRequest& request, IWICImagingFactory* wicFactory);
+        PipelineResult Decode(const ImageRequest& request, IWICImagingFactory* wicFactory, const DecodeInput& input);
     };
 }
 

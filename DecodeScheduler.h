@@ -11,6 +11,7 @@
 #include <functional>
 #include <memory>
 #include <wincodec.h>
+#include <unordered_map>
 
 namespace ImageCore
 {
@@ -46,15 +47,36 @@ namespace ImageCore
         void Shutdown();
 
     private:
-        void WorkerThread();
+        enum class WorkerKind
+        {
+            HighPriority,
+            Background
+        };
 
-        std::vector<std::thread> m_workers;
-        std::queue<DecodeTask> m_taskQueue;
+        void WorkerThread(WorkerKind kind);
+        void ThumbPrefetchThread();
+
+        std::vector<std::thread> m_highWorkers;
+        std::vector<std::thread> m_backgroundWorkers;
+        std::thread m_thumbPrefetchWorker;
+
+        std::queue<DecodeTask> m_highQueue;
+        std::queue<DecodeTask> m_thumbIoQueue;     // serialized disk reads (thumbnail/preview)
+        std::queue<DecodeTask> m_backgroundQueue;  // CPU decode/resize work (from prefetched bytes)
         std::mutex m_queueMutex;
         std::condition_variable m_queueCondition;
         std::atomic<bool> m_shutdown;
 
         size_t m_threadCount;
+
+        struct VolumeIoProfile
+        {
+            bool incursSeek { true };
+            size_t prefetchDepth { 2 };
+        };
+
+        std::unordered_map<std::wstring, VolumeIoProfile> m_volumeProfiles {};
+        size_t m_globalPrefetchCap { 4 };
     };
 }
 

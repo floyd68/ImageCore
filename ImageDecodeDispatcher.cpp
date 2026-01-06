@@ -38,6 +38,46 @@ namespace ImageCore
         class WICDecoderCommon
         {
         protected:
+            static HRESULT CreateDecoder(
+                const std::wstring& path,
+                std::span<const uint8_t> bytes,
+                Microsoft::WRL::ComPtr<IWICBitmapDecoder>& outDecoder)
+            {
+                Microsoft::WRL::ComPtr<IWICImagingFactory> wicFactory = GetWicFactory();
+                if (!wicFactory)
+                {
+                    return E_POINTER;
+                }
+
+                HRESULT hr = E_FAIL;
+                if (!bytes.empty() && bytes.size() <= static_cast<size_t>(UINT32_MAX))
+                {
+                    Microsoft::WRL::ComPtr<IWICStream> stream;
+                    hr = wicFactory->CreateStream(&stream);
+                    if (SUCCEEDED(hr) && stream)
+                    {
+                        hr = stream->InitializeFromMemory(
+                            const_cast<BYTE*>(reinterpret_cast<const BYTE*>(bytes.data())),
+                            static_cast<DWORD>(bytes.size()));
+                    }
+                    if (SUCCEEDED(hr) && stream)
+                    {
+                        hr = wicFactory->CreateDecoderFromStream(stream.Get(), nullptr, WICDecodeMetadataCacheOnLoad, &outDecoder);
+                    }
+                }
+                else
+                {
+                    hr = wicFactory->CreateDecoderFromFilename(
+                        path.c_str(),
+                        nullptr,
+                        GENERIC_READ,
+                        WICDecodeMetadataCacheOnLoad,
+                        &outDecoder);
+                }
+
+                return hr;
+            }
+
             static Microsoft::WRL::ComPtr<IWICImagingFactory> GetWicFactory()
             {
                 // Per-thread WIC factory (DecodeScheduler worker threads already CoInitializeEx'd).
@@ -53,7 +93,11 @@ namespace ImageCore
                 return s_factory;
             }
 
-            static bool TryEmbeddedThumbnail(const std::wstring& path, Microsoft::WRL::ComPtr<IWICBitmapSource>& outBitmap, Size& outSize)
+            static bool TryEmbeddedThumbnail(
+                const std::wstring& path,
+                std::span<const uint8_t> bytes,
+                Microsoft::WRL::ComPtr<IWICBitmapSource>& outBitmap,
+                Size& outSize)
             {
                 Microsoft::WRL::ComPtr<IWICImagingFactory> wicFactory = GetWicFactory();
                 if (!wicFactory)
@@ -62,12 +106,7 @@ namespace ImageCore
                 }
 
                 Microsoft::WRL::ComPtr<IWICBitmapDecoder> decoder;
-                HRESULT hr = wicFactory->CreateDecoderFromFilename(
-                    path.c_str(),
-                    nullptr,
-                    GENERIC_READ,
-                    WICDecodeMetadataCacheOnLoad,
-                    &decoder);
+                HRESULT hr = CreateDecoder(path, bytes, decoder);
                 if (FAILED(hr))
                 {
                     return false;
@@ -112,7 +151,12 @@ namespace ImageCore
                 return true;
             }
 
-            static HRESULT DecodeAndScale(const std::wstring& path, const Size& targetSize, Microsoft::WRL::ComPtr<IWICBitmapSource>& outBitmap, Size& outSize)
+            static HRESULT DecodeAndScale(
+                const std::wstring& path,
+                std::span<const uint8_t> bytes,
+                const Size& targetSize,
+                Microsoft::WRL::ComPtr<IWICBitmapSource>& outBitmap,
+                Size& outSize)
             {
                 Microsoft::WRL::ComPtr<IWICImagingFactory> wicFactory = GetWicFactory();
                 if (!wicFactory)
@@ -121,12 +165,7 @@ namespace ImageCore
                 }
 
                 Microsoft::WRL::ComPtr<IWICBitmapDecoder> decoder;
-                HRESULT hr = wicFactory->CreateDecoderFromFilename(
-                    path.c_str(),
-                    nullptr,
-                    GENERIC_READ,
-                    WICDecodeMetadataCacheOnLoad,
-                    &decoder);
+                HRESULT hr = CreateDecoder(path, bytes, decoder);
                 if (FAILED(hr))
                 {
                     return hr;
@@ -203,7 +242,11 @@ namespace ImageCore
                 return hr;
             }
 
-            static HRESULT LoadWithWIC(const std::wstring& path, Microsoft::WRL::ComPtr<IWICBitmapSource>& outBitmap, Size& outSize)
+            static HRESULT LoadWithWIC(
+                const std::wstring& path,
+                std::span<const uint8_t> bytes,
+                Microsoft::WRL::ComPtr<IWICBitmapSource>& outBitmap,
+                Size& outSize)
             {
                 Microsoft::WRL::ComPtr<IWICImagingFactory> wicFactory = GetWicFactory();
                 if (!wicFactory)
@@ -212,12 +255,7 @@ namespace ImageCore
                 }
 
                 Microsoft::WRL::ComPtr<IWICBitmapDecoder> decoder;
-                HRESULT hr = wicFactory->CreateDecoderFromFilename(
-                    path.c_str(),
-                    nullptr,
-                    GENERIC_READ,
-                    WICDecodeMetadataCacheOnLoad,
-                    &decoder);
+                HRESULT hr = CreateDecoder(path, bytes, decoder);
                 if (FAILED(hr))
                 {
                     return hr;
@@ -265,19 +303,45 @@ namespace ImageCore
         class DXTexDecoderCommon
         {
         protected:
-            static HRESULT LoadWithDirectXTex(const std::wstring& path, DirectX::ScratchImage& scratchImage, DirectX::TexMetadata& metadata)
+            static HRESULT LoadWithDirectXTex(
+                const ImageRequest& request,
+                std::span<const uint8_t> bytes,
+                DirectX::ScratchImage& scratchImage,
+                DirectX::TexMetadata& metadata)
             {
+                const std::wstring& path = request.source;
                 const std::wstring ext = GetLowerExtension(path);
                 if (ext == L".dds")
                 {
-                    return DirectX::LoadFromDDSFile(path.c_str(), DirectX::DDS_FLAGS_NONE, &metadata, scratchImage);
+                    // NOTE:
+                    // - FullResolution(main image): top mip is enough for viewing; avoid loading mip chains.
+                    // - Thumbnail/Preview: prefer loading mip chains so we can decode from a small mip
+                    //   (huge speedup for 8K BCn textures).
+                    DirectX::DDS_FLAGS flags = DirectX::DDS_FLAGS_NONE;
+                    if (request.purpose == ImagePurpose::FullResolution)
+                    {
+                        flags = static_cast<DirectX::DDS_FLAGS>(DirectX::DDS_FLAGS_NONE | DirectX::DDS_FLAGS_IGNORE_MIPS);
+                    }
+                    if (!bytes.empty())
+                    {
+                        return DirectX::LoadFromDDSMemory(bytes.data(), bytes.size(), flags, &metadata, scratchImage);
+                    }
+                    return DirectX::LoadFromDDSFile(path.c_str(), flags, &metadata, scratchImage);
                 }
                 if (ext == L".hdr")
                 {
+                    if (!bytes.empty())
+                    {
+                        return DirectX::LoadFromHDRMemory(bytes.data(), bytes.size(), &metadata, scratchImage);
+                    }
                     return DirectX::LoadFromHDRFile(path.c_str(), &metadata, scratchImage);
                 }
                 if (ext == L".tga")
                 {
+                    if (!bytes.empty())
+                    {
+                        return DirectX::LoadFromTGAMemory(bytes.data(), bytes.size(), DirectX::TGA_FLAGS_NONE, &metadata, scratchImage);
+                    }
                     return DirectX::LoadFromTGAFile(path.c_str(), DirectX::TGA_FLAGS_NONE, &metadata, scratchImage);
                 }
                 if (ext == L".exr")
@@ -292,20 +356,21 @@ namespace ImageCore
                 return E_NOTIMPL;
             }
 
-            static HRESULT ConvertScratchImageToBGRA8(const DirectX::ScratchImage& scratchImage, DirectX::ScratchImage& outScratchImage)
+            static HRESULT ConvertImageToBGRA8(const DirectX::Image& image, DirectX::ScratchImage& outScratchImage)
             {
-                const DirectX::Image* image = scratchImage.GetImage(0, 0, 0);
-                if (!image)
+                // Fast-path: already in the target format and not compressed.
+                if (!DirectX::IsCompressed(image.format) && image.format == DXGI_FORMAT_B8G8R8A8_UNORM)
                 {
-                    return E_FAIL;
+                    outScratchImage = DirectX::ScratchImage();
+                    return outScratchImage.InitializeFromImage(image, false);
                 }
 
                 DirectX::ScratchImage decompressed;
-                const DirectX::Image* sourceImage = image;
+                const DirectX::Image* sourceImage = &image;
 
-                if (DirectX::IsCompressed(image->format))
+                if (DirectX::IsCompressed(image.format))
                 {
-                    HRESULT hr = DirectX::Decompress(*image, DXGI_FORMAT_UNKNOWN, decompressed);
+                    HRESULT hr = DirectX::Decompress(image, DXGI_FORMAT_UNKNOWN, decompressed);
                     if (FAILED(hr))
                     {
                         return hr;
@@ -324,13 +389,24 @@ namespace ImageCore
                     DirectX::TEX_THRESHOLD_DEFAULT,
                     outScratchImage);
             }
+
+            static HRESULT ConvertScratchImageToBGRA8(const DirectX::ScratchImage& scratchImage, DirectX::ScratchImage& outScratchImage)
+            {
+                const DirectX::Image* image = scratchImage.GetImage(0, 0, 0);
+                if (!image)
+                {
+                    return E_FAIL;
+                }
+
+                return ConvertImageToBGRA8(*image, outScratchImage);
+            }
         };
 
         // ---------- Built-in decoders ----------
         class WICThumbnailDecoder final : public IImageDecoder, private WICDecoderCommon
         {
         public:
-            PipelineResult Decode(const ImageRequest& request, IWICImagingFactory* wicFactory) override
+            PipelineResult Decode(const ImageRequest& request, IWICImagingFactory* wicFactory, const DecodeInput& input) override
             {
                 UNREFERENCED_PARAMETER(wicFactory);
                 if (request.source.empty())
@@ -341,7 +417,7 @@ namespace ImageCore
                 Microsoft::WRL::ComPtr<IWICBitmapSource> wicBitmap;
                 Size imageSize;
 
-                if (TryEmbeddedThumbnail(request.source, wicBitmap, imageSize))
+                if (TryEmbeddedThumbnail(request.source, input.bytes, wicBitmap, imageSize))
                 {
                     PipelineResult result;
                     result.hr = S_OK;
@@ -350,7 +426,7 @@ namespace ImageCore
                     return result;
                 }
 
-                HRESULT hr = DecodeAndScale(request.source, request.targetSize, wicBitmap, imageSize);
+                HRESULT hr = DecodeAndScale(request.source, input.bytes, request.targetSize, wicBitmap, imageSize);
                 if (FAILED(hr))
                 {
                     return PipelineResult(hr);
@@ -367,7 +443,7 @@ namespace ImageCore
         class WICFullImageDecoder final : public IImageDecoder, private WICDecoderCommon
         {
         public:
-            PipelineResult Decode(const ImageRequest& request, IWICImagingFactory* wicFactory) override
+            PipelineResult Decode(const ImageRequest& request, IWICImagingFactory* wicFactory, const DecodeInput& input) override
             {
                 UNREFERENCED_PARAMETER(wicFactory);
                 if (request.source.empty())
@@ -377,7 +453,7 @@ namespace ImageCore
 
                 Microsoft::WRL::ComPtr<IWICBitmapSource> wicBitmap;
                 Size imageSize;
-                HRESULT hr = LoadWithWIC(request.source, wicBitmap, imageSize);
+                HRESULT hr = LoadWithWIC(request.source, input.bytes, wicBitmap, imageSize);
                 if (FAILED(hr))
                 {
                     return PipelineResult(hr);
@@ -394,7 +470,7 @@ namespace ImageCore
         class DXTexThumbnailDecoder final : public IImageDecoder, private DXTexDecoderCommon
         {
         public:
-            PipelineResult Decode(const ImageRequest& request, IWICImagingFactory* wicFactory) override
+            PipelineResult Decode(const ImageRequest& request, IWICImagingFactory* wicFactory, const DecodeInput& input) override
             {
                 UNREFERENCED_PARAMETER(wicFactory);
                 if (request.source.empty())
@@ -404,17 +480,70 @@ namespace ImageCore
 
                 DirectX::ScratchImage scratchImage;
                 DirectX::TexMetadata metadata;
-                HRESULT hr = LoadWithDirectXTex(request.source, scratchImage, metadata);
+                HRESULT hr = LoadWithDirectXTex(request, input.bytes, scratchImage, metadata);
                 if (FAILED(hr))
                 {
                     return PipelineResult(hr);
                 }
 
-                auto convertedScratch = std::make_unique<DirectX::ScratchImage>();
-                hr = ConvertScratchImageToBGRA8(scratchImage, *convertedScratch);
-                if (FAILED(hr))
+                // Prefer decoding from a smaller mip for thumbnails (huge CPU win for 8K BCn DDS).
+                size_t mipIndex = 0;
+                if (GetLowerExtension(request.source) == L".dds" && metadata.mipLevels > 1 &&
+                    request.targetSize.w > 0.0f && request.targetSize.h > 0.0f)
                 {
-                    return PipelineResult(hr);
+                    const float targetMax = (std::max)(request.targetSize.w, request.targetSize.h);
+                    size_t bestMip = 0;
+                    size_t bestMaxDim = static_cast<size_t>(-1);
+
+                    for (size_t m = 0; m < metadata.mipLevels; ++m)
+                    {
+                        const DirectX::Image* img = scratchImage.GetImage(m, 0, 0);
+                        if (!img)
+                        {
+                            continue;
+                        }
+
+                        const size_t maxDim = (std::max)(img->width, img->height);
+                        // Pick the smallest mip that is still >= target (avoids upscaling).
+                        if (static_cast<float>(maxDim) >= targetMax)
+                        {
+                            if (maxDim < bestMaxDim)
+                            {
+                                bestMaxDim = maxDim;
+                                bestMip = m;
+                            }
+                        }
+                    }
+
+                    if (bestMaxDim != static_cast<size_t>(-1))
+                    {
+                        mipIndex = bestMip;
+                    }
+                    else
+                    {
+                        // If all mips are smaller than target, use the smallest available.
+                        mipIndex = static_cast<size_t>((metadata.mipLevels > 0) ? (metadata.mipLevels - 1) : 0);
+                    }
+                }
+
+                auto convertedScratch = std::make_unique<DirectX::ScratchImage>();
+                const DirectX::Image* loadedImage = scratchImage.GetImage(mipIndex, 0, 0);
+                if (loadedImage && !DirectX::IsCompressed(loadedImage->format) && loadedImage->format == DXGI_FORMAT_B8G8R8A8_UNORM)
+                {
+                    // Avoid unnecessary Convert/copy when DDS is already BGRA8.
+                    convertedScratch->InitializeFromImage(*loadedImage, false);
+                }
+                else
+                {
+                    if (!loadedImage)
+                    {
+                        return PipelineResult(E_FAIL);
+                    }
+                    hr = ConvertImageToBGRA8(*loadedImage, *convertedScratch);
+                    if (FAILED(hr))
+                    {
+                        return PipelineResult(hr);
+                    }
                 }
 
                 const DirectX::Image* convertedImage = convertedScratch->GetImage(0, 0, 0);
@@ -434,7 +563,8 @@ namespace ImageCore
                     const size_t scaledHeight = static_cast<size_t>(std::round(convertedImage->height * scale));
 
                     auto scaledScratch = std::make_unique<DirectX::ScratchImage>();
-                    hr = DirectX::Resize(*convertedImage, scaledWidth, scaledHeight, DirectX::TEX_FILTER_CUBIC, *scaledScratch);
+                    // Thumbnails: prioritize speed (FANT is a fast downsampling filter).
+                    hr = DirectX::Resize(*convertedImage, scaledWidth, scaledHeight, DirectX::TEX_FILTER_FANT, *scaledScratch);
                     if (SUCCEEDED(hr))
                     {
                         convertedScratch = std::move(scaledScratch);
@@ -458,7 +588,7 @@ namespace ImageCore
         class DXTexFullImageDecoder final : public IImageDecoder, private DXTexDecoderCommon
         {
         public:
-            PipelineResult Decode(const ImageRequest& request, IWICImagingFactory* wicFactory) override
+            PipelineResult Decode(const ImageRequest& request, IWICImagingFactory* wicFactory, const DecodeInput& input) override
             {
                 UNREFERENCED_PARAMETER(wicFactory);
                 if (request.source.empty())
@@ -468,17 +598,41 @@ namespace ImageCore
 
                 DirectX::ScratchImage scratchImage;
                 DirectX::TexMetadata metadata;
-                HRESULT hr = LoadWithDirectXTex(request.source, scratchImage, metadata);
+                HRESULT hr = LoadWithDirectXTex(request, input.bytes, scratchImage, metadata);
                 if (FAILED(hr))
                 {
                     return PipelineResult(hr);
                 }
 
-                auto convertedScratch = std::make_unique<DirectX::ScratchImage>();
-                hr = ConvertScratchImageToBGRA8(scratchImage, *convertedScratch);
-                if (FAILED(hr))
+                // Performance / GPU path: if the DDS is GPU-compressed, return the original ScratchImage
+                // so the renderer can upload it as a GPU texture without CPU Decompress.
+                const std::wstring ext = GetLowerExtension(request.source);
+                const DirectX::Image* loadedImage = scratchImage.GetImage(0, 0, 0);
+                if (request.allowGpuCompressedDDS && ext == L".dds" && loadedImage && DirectX::IsCompressed(loadedImage->format))
                 {
-                    return PipelineResult(hr);
+                    auto gpuScratch = std::make_unique<DirectX::ScratchImage>();
+                    *gpuScratch = std::move(scratchImage);
+
+                    PipelineResult result;
+                    result.hr = S_OK;
+                    result.scratchImage = std::move(gpuScratch);
+                    result.imageSize = { static_cast<float>(metadata.width), static_cast<float>(metadata.height) };
+                    return result;
+                }
+
+                auto convertedScratch = std::make_unique<DirectX::ScratchImage>();
+                if (loadedImage && !DirectX::IsCompressed(loadedImage->format) && loadedImage->format == DXGI_FORMAT_B8G8R8A8_UNORM)
+                {
+                    // Avoid unnecessary Convert/copy when DDS is already BGRA8.
+                    *convertedScratch = std::move(scratchImage);
+                }
+                else
+                {
+                    hr = ConvertScratchImageToBGRA8(scratchImage, *convertedScratch);
+                    if (FAILED(hr))
+                    {
+                        return PipelineResult(hr);
+                    }
                 }
 
                 const DirectX::Image* image = convertedScratch->GetImage(0, 0, 0);
@@ -646,7 +800,7 @@ namespace ImageCore
         });
     }
 
-    PipelineResult ImageDecodeDispatcher::Decode(const ImageRequest& request, IWICImagingFactory* wicFactory)
+    PipelineResult ImageDecodeDispatcher::Decode(const ImageRequest& request, IWICImagingFactory* wicFactory, const DecodeInput& input)
     {
         if (request.source.empty())
         {
@@ -656,8 +810,24 @@ namespace ImageCore
         // safe even if app already called it
         RegisterBuiltInDecoders();
 
+        // Prefer explicit header bytes if available (avoids extra disk I/O in the dispatcher).
+        // Otherwise fall back to ProbeFile(path).
         static ImageFormatDetector s_detector;
-        const FormatProbe probe = s_detector.ProbeFile(request.source);
+        FormatProbe probe {};
+        if (!input.header.empty())
+        {
+            probe.header.assign(input.header.begin(), input.header.end());
+            probe.extensionLower = GetLowerExtension(request.source);
+            probe.info = ImageFormatDetector::DetectByMagic(probe.header);
+            if (probe.info.format == ImageFormat::Unknown && !probe.extensionLower.empty())
+            {
+                probe.info = ImageFormatDetector::DetectByExtension(probe.extensionLower);
+            }
+        }
+        else
+        {
+            probe = s_detector.ProbeFile(request.source);
+        }
 
         HRESULT lastHr = E_FAIL;
         auto factories = DecoderRegistry::Instance().GetCandidateFactories(request, probe.header);
@@ -675,7 +845,7 @@ namespace ImageCore
                 continue;
             }
 
-            PipelineResult result = decoder->Decode(request, wicFactory);
+            PipelineResult result = decoder->Decode(request, wicFactory, input);
             lastHr = result.hr;
             if (SUCCEEDED(result.hr))
             {
