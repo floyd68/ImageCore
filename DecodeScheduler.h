@@ -12,6 +12,7 @@
 #include <memory>
 #include <wincodec.h>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace ImageCore
 {
@@ -40,6 +41,9 @@ namespace ImageCore
         // 작업 큐에 추가
         void Enqueue(DecodeTask task);
 
+        // 요청 취소 (best-effort: in-flight decode can't be interrupted, but callback will be suppressed)
+        void Cancel(uint64_t handle);
+
         // 모든 작업 완료 대기
         void WaitForCompletion();
 
@@ -55,6 +59,9 @@ namespace ImageCore
 
         void WorkerThread(WorkerKind kind);
         void ThumbPrefetchThread();
+
+        bool IsCanceled_NoLock(uint64_t handle) const;
+        bool ConsumeCanceled_NoLock(uint64_t handle);
 
         std::vector<std::thread> m_highWorkers;
         std::vector<std::thread> m_backgroundWorkers;
@@ -77,6 +84,9 @@ namespace ImageCore
 
         std::unordered_map<std::wstring, VolumeIoProfile> m_volumeProfiles {};
         size_t m_globalPrefetchCap { 4 };
+
+        // Canceled handles (guarded by m_queueMutex)
+        std::unordered_set<uint64_t> m_canceledHandles {};
     };
 }
 

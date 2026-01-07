@@ -166,6 +166,8 @@ namespace ImageCore
             CloseHandle(h);
             return bytes;
         }
+
+        // (debug-only tracing removed)
     }
 
     DecodeScheduler::DecodeScheduler()
@@ -249,7 +251,42 @@ namespace ImageCore
                 m_thumbIoQueue.push(std::move(task));
             }
         }
-        m_queueCondition.notify_one();
+        // Multiple threads wait on the same condition_variable with different queue predicates
+        // (high/background/thumb-IO). Using notify_all avoids a missed wakeup where we wake a thread
+        // whose predicate is false, leaving the correct worker asleep even though work is available.
+        m_queueCondition.notify_all();
+    }
+
+    void DecodeScheduler::Cancel(uint64_t handle)
+    {
+        if (handle == 0)
+        {
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(m_queueMutex);
+            m_canceledHandles.insert(handle);
+        }
+
+        // Wake all waiters so any thread blocked on empty queues can re-check cancel state.
+        m_queueCondition.notify_all();
+    }
+
+    bool DecodeScheduler::IsCanceled_NoLock(uint64_t handle) const
+    {
+        return m_canceledHandles.find(handle) != m_canceledHandles.end();
+    }
+
+    bool DecodeScheduler::ConsumeCanceled_NoLock(uint64_t handle)
+    {
+        auto it = m_canceledHandles.find(handle);
+        if (it == m_canceledHandles.end())
+        {
+            return false;
+        }
+        m_canceledHandles.erase(it);
+        return true;
     }
 
     void DecodeScheduler::WaitForCompletion()
@@ -347,10 +384,20 @@ namespace ImageCore
 
             {
                 std::unique_lock<std::mutex> lock(m_queueMutex);
-                m_queueCondition.wait(lock, [this]
+                if (kind == WorkerKind::HighPriority)
                 {
-                    return !m_highQueue.empty() || !m_backgroundQueue.empty() || m_shutdown;
-                });
+                    m_queueCondition.wait(lock, [this]
+                    {
+                        return !m_highQueue.empty() || m_shutdown;
+                    });
+                }
+                else
+                {
+                    m_queueCondition.wait(lock, [this]
+                    {
+                        return !m_highQueue.empty() || !m_backgroundQueue.empty() || m_shutdown;
+                    });
+                }
 
                 if (m_shutdown && m_highQueue.empty() && m_backgroundQueue.empty())
                 {
@@ -386,6 +433,12 @@ namespace ImageCore
                         continue;
                     }
                 }
+
+                // If canceled while sitting in the queue, skip the task.
+                if (ConsumeCanceled_NoLock(task.handle))
+                {
+                    continue;
+                }
             }
 
             // 디스패처를 통해 디코드 실행 (포맷 라우팅 + 디코더 선택 포함)
@@ -404,14 +457,32 @@ namespace ImageCore
                     }
                 }
 
-                result = dispatcher.Decode(task.request, nullptr, input);
+                try
+                {
+                    result = dispatcher.Decode(task.request, nullptr, input);
+                }
+                catch (...)
+                {
+                    // Never let an exception kill the worker thread.
+                    result = PipelineResult(E_FAIL);
+                }
             }
 
             // 콜백 호출 (WIC bitmap 또는 ScratchImage 결과 전달)
             if (task.callback)
             {
+                // If canceled while decoding, suppress callback.
+                {
+                    std::lock_guard<std::mutex> lock(m_queueMutex);
+                    if (ConsumeCanceled_NoLock(task.handle))
+                    {
+                        // Intentionally drop.
+                        goto after_decode;
+                    }
+                }
                 task.callback(std::move(result));  // move로 전달
             }
+after_decode:
 
             // Thumbnail/Preview prefetched bytes are transient; free them once decode finishes if unshared.
             if (task.request.purpose != ImagePurpose::FullResolution)
@@ -463,6 +534,11 @@ namespace ImageCore
 
                 task = std::move(m_thumbIoQueue.front());
                 m_thumbIoQueue.pop();
+
+                if (ConsumeCanceled_NoLock(task.handle))
+                {
+                    continue;
+                }
             }
 
             // Ensure this stage is only used for thumbnail/preview.
@@ -471,7 +547,7 @@ namespace ImageCore
                 // Should never happen, but push to high queue just in case.
                 std::lock_guard<std::mutex> lock(m_queueMutex);
                 m_highQueue.push(std::move(task));
-                m_queueCondition.notify_one();
+                m_queueCondition.notify_all();
                 continue;
             }
 
@@ -522,7 +598,7 @@ namespace ImageCore
                 std::lock_guard<std::mutex> lock(m_queueMutex);
                 m_backgroundQueue.push(std::move(task));
             }
-            m_queueCondition.notify_one();
+            m_queueCondition.notify_all();
         }
 
         (void)SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);

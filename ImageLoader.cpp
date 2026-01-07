@@ -81,10 +81,12 @@ namespace ImageCore
 
     void ImageLoader::Cancel(ImageHandle handle)
     {
-        // 현재 구현에서는 큐에서 제거하기 어려움
-        // 향후 개선 필요: handle을 task에 포함시키고 큐에서 찾아서 제거
-        // 현재는 단순히 무시 (콜백이 호출되면 무시하도록 클라이언트에서 처리)
-        UNREFERENCED_PARAMETER(handle);
+        if (handle == 0 || !m_scheduler)
+        {
+            return;
+        }
+
+        m_scheduler->Cancel(handle);
     }
 
     void ImageLoader::ClearCache()
