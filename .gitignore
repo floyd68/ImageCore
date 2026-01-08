@@ -1,0 +1,15 @@
+## Build outputs
+x64/
+ImageCore/
+*.obj
+*.pdb
+*.ilk
+*.tlog
+*.log
+*.idb
+*.ipdb
+*.iobj
+*.sdf
+*.VC.db
+*.VC.VC.opendb
+
