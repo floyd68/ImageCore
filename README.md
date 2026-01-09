@@ -2,6 +2,12 @@
 
 ImageCore is the async image loading/decoding pipeline used by `FICture2`.
 
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+Copyright (c) 2024 EunSuk, Lee (이은석, floyd)
+
 It focuses on high-throughput DDS workloads (thumbnails + full-resolution) while keeping UI interaction responsive.
 
 ## What it does
