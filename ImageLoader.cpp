@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <wincodec.h>
 #include <comdef.h>
+#include <dxgiformat.h>
 
 namespace ImageCore
 {
@@ -44,9 +45,9 @@ namespace ImageCore
         m_cache.reset();
     }
 
-    ImageHandle ImageLoader::Request(
+    ImageHandle ImageLoader::RequestDecoded(
         const ImageRequest& request,
-        ImageLoadCallback callback)
+        DecodedImageLoadCallback callback)
     {
         if (request.source.empty() || !callback)
         {
@@ -55,9 +56,6 @@ namespace ImageCore
 
         ImageHandle handle = m_nextHandle.fetch_add(1);
 
-        // 1. 캐시 확인은 제거 (D2D1Bitmap 캐시는 FD2D 레이어에서 관리)
-
-        // 2. 비동기 디코드 작업 큐에 추가
         DecodeTask task;
         task.request = request;
         task.handle = handle;
@@ -65,17 +63,20 @@ namespace ImageCore
         {
             if (FAILED(result.hr))
             {
-                callback(result.hr, nullptr, nullptr);
+                callback(result.hr, DecodedImage {});
                 return;
             }
 
-            // 콜백은 worker thread에서 즉시 호출됨.
-            // UI 레이어(FD2D)는 여기서 받은 WIC/Scratch를 저장하고 InvalidateRect 등으로 렌더를 유도하면 됨.
-            callback(S_OK, std::move(result.wicBitmap), std::move(result.scratchImage));
+            if (result.image.blocks == nullptr || result.image.blocks->empty() || result.image.dxgiFormat == DXGI_FORMAT_UNKNOWN)
+            {
+                callback(E_FAIL, DecodedImage {});
+                return;
+            }
+
+            callback(S_OK, std::move(result.image));
         };
 
         m_scheduler->Enqueue(std::move(task));
-
         return handle;
     }
 

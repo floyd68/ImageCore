@@ -51,9 +51,9 @@ It focuses on high-throughput DDS workloads (thumbnails + full-resolution) while
 
 1) Request goes to `DecodeScheduler` high queue
 2) High worker decodes via `ImageDecodeDispatcher`
-3) Callback returns either:
-   - `ScratchImage` (DirectXTex), or
-   - `IWICBitmapSource` (WIC)
+3) Callback returns a **`DecodedImage`** payload:
+   - CPU path: BGRA8 premultiplied pixels (`DXGI_FORMAT_B8G8R8A8_UNORM`)
+   - GPU path: BCn blocks (`DXGI_FORMAT_BC*`) when `allowGpuCompressedDDS == true`
 
 ### Thumbnail / Preview
 

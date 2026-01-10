@@ -1,14 +1,11 @@
 #pragma once
 
 #include "ImageRequest.h"
-#include <wincodec.h>
-#include <wrl/client.h>
+#include "DecodedImage.h"
 #include <memory>
 #include <span>
 #include <cstdint>
-
-// DirectXTex types
-#include "../external/DirectXTex/DirectXTex/DirectXTex.h"
+#include <windows.h>
 
 namespace ImageCore
 {
@@ -21,12 +18,11 @@ namespace ImageCore
         std::span<const uint8_t> header {};
     };
 
-    // 디코딩 결과 (WIC 또는 ScratchImage 중 하나를 채움)
+    // Decode result (unified payload).
     struct PipelineResult
     {
         HRESULT hr { E_FAIL };
-        Microsoft::WRL::ComPtr<IWICBitmapSource> wicBitmap {};
-        std::unique_ptr<DirectX::ScratchImage> scratchImage {};
+        DecodedImage image {};
         Size imageSize { 0.0f, 0.0f };
 
         PipelineResult() = default;

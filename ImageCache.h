@@ -12,8 +12,8 @@ namespace ImageCore
 {
     // LRU 캐시 엔트리
     // Note: D2D bitmap을 저장하지만, 이는 UI 레이어에서만 사용
-    // ImageCore는 WIC bitmap만 다루고, D2D 변환은 UI 레이어에서 처리하는 것이 이상적
-    // 하지만 현재 구조를 유지하기 위해 D2D 의존성 포함
+    // ImageCore는 decode 결과를 DecodedImage로 제공하고, D2D 변환은 UI 레이어에서 처리하는 것이 이상적.
+    // (현재는 기존 구조 호환을 위해 D2D 의존성을 유지)
     struct ImageCacheEntry
     {
         Microsoft::WRL::ComPtr<ID2D1Bitmap> bitmap;

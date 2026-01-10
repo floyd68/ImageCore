@@ -9,9 +9,12 @@
 #include "../external/DirectXTex/Auxiliary/DirectXTexEXR.h"
 #endif
 
+#include <wincodec.h>
+#include <wrl/client.h>
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
+#include <cstring>
 #include <mutex>
 #include <objbase.h>
 
@@ -38,6 +41,45 @@ namespace ImageCore
         class WICDecoderCommon
         {
         protected:
+            static HRESULT CopyWicBitmapToDecodedImage(
+                IWICBitmapSource* bitmap,
+                DecodedImage& outImage)
+            {
+                if (bitmap == nullptr)
+                {
+                    return E_INVALIDARG;
+                }
+
+                UINT width = 0;
+                UINT height = 0;
+                HRESULT hr = bitmap->GetSize(&width, &height);
+                if (FAILED(hr) || width == 0 || height == 0)
+                {
+                    return FAILED(hr) ? hr : E_FAIL;
+                }
+
+                outImage.width = width;
+                outImage.height = height;
+                outImage.dxgiFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
+                outImage.rowPitchBytes = width * 4u;
+                outImage.blockBytes = outImage.rowPitchBytes * outImage.height;
+
+                outImage.blocks = std::make_shared<std::vector<uint8_t>>();
+                outImage.blocks->resize(outImage.blockBytes);
+
+                const WICRect rc { 0, 0, static_cast<INT>(width), static_cast<INT>(height) };
+                hr = bitmap->CopyPixels(
+                    &rc,
+                    outImage.rowPitchBytes,
+                    outImage.blockBytes,
+                    outImage.blocks->data());
+                if (FAILED(hr))
+                {
+                    outImage = DecodedImage {};
+                }
+                return hr;
+            }
+
             static HRESULT CreateDecoder(
                 const std::wstring& path,
                 std::span<const uint8_t> bytes,
@@ -303,6 +345,27 @@ namespace ImageCore
         class DXTexDecoderCommon
         {
         protected:
+            static HRESULT CopyDxImageToDecodedImage(
+                const DirectX::Image& image,
+                DecodedImage& outImage)
+            {
+                if (image.pixels == nullptr || image.slicePitch == 0 || image.width == 0 || image.height == 0)
+                {
+                    return E_INVALIDARG;
+                }
+
+                outImage.width = static_cast<uint32_t>(image.width);
+                outImage.height = static_cast<uint32_t>(image.height);
+                outImage.dxgiFormat = static_cast<DXGI_FORMAT>(image.format);
+                outImage.rowPitchBytes = static_cast<uint32_t>(image.rowPitch);
+                outImage.blockBytes = static_cast<uint32_t>(image.slicePitch);
+
+                outImage.blocks = std::make_shared<std::vector<uint8_t>>();
+                outImage.blocks->resize(outImage.blockBytes);
+                std::memcpy(outImage.blocks->data(), image.pixels, outImage.blockBytes);
+                return S_OK;
+            }
+
             static HRESULT LoadWithDirectXTex(
                 const ImageRequest& request,
                 std::span<const uint8_t> bytes,
@@ -419,9 +482,16 @@ namespace ImageCore
 
                 if (TryEmbeddedThumbnail(request.source, input.bytes, wicBitmap, imageSize))
                 {
+                    DecodedImage decoded {};
+                    HRESULT hrCopy = CopyWicBitmapToDecodedImage(wicBitmap.Get(), decoded);
+                    if (FAILED(hrCopy))
+                    {
+                        return PipelineResult(hrCopy);
+                    }
+
                     PipelineResult result;
                     result.hr = S_OK;
-                    result.wicBitmap = wicBitmap;
+                    result.image = std::move(decoded);
                     result.imageSize = imageSize;
                     return result;
                 }
@@ -433,8 +503,15 @@ namespace ImageCore
                 }
 
                 PipelineResult result;
+                DecodedImage decoded {};
+                hr = CopyWicBitmapToDecodedImage(wicBitmap.Get(), decoded);
+                if (FAILED(hr))
+                {
+                    return PipelineResult(hr);
+                }
+
                 result.hr = S_OK;
-                result.wicBitmap = wicBitmap;
+                result.image = std::move(decoded);
                 result.imageSize = imageSize;
                 return result;
             }
@@ -460,8 +537,15 @@ namespace ImageCore
                 }
 
                 PipelineResult result;
+                DecodedImage decoded {};
+                hr = CopyWicBitmapToDecodedImage(wicBitmap.Get(), decoded);
+                if (FAILED(hr))
+                {
+                    return PipelineResult(hr);
+                }
+
                 result.hr = S_OK;
-                result.wicBitmap = wicBitmap;
+                result.image = std::move(decoded);
                 result.imageSize = imageSize;
                 return result;
             }
@@ -578,8 +662,15 @@ namespace ImageCore
                 }
 
                 PipelineResult result;
+                DecodedImage decoded {};
+                hr = CopyDxImageToDecodedImage(*convertedImage, decoded);
+                if (FAILED(hr))
+                {
+                    return PipelineResult(hr);
+                }
+
                 result.hr = S_OK;
-                result.scratchImage = std::move(convertedScratch);
+                result.image = std::move(decoded);
                 result.imageSize = { static_cast<float>(convertedImage->width), static_cast<float>(convertedImage->height) };
                 return result;
             }
@@ -604,18 +695,22 @@ namespace ImageCore
                     return PipelineResult(hr);
                 }
 
-                // Performance / GPU path: if the DDS is GPU-compressed, return the original ScratchImage
+                // Performance / GPU path: if the DDS is GPU-compressed, return the original BCn blocks (mip0)
                 // so the renderer can upload it as a GPU texture without CPU Decompress.
                 const std::wstring ext = GetLowerExtension(request.source);
                 const DirectX::Image* loadedImage = scratchImage.GetImage(0, 0, 0);
                 if (request.allowGpuCompressedDDS && ext == L".dds" && loadedImage && DirectX::IsCompressed(loadedImage->format))
                 {
-                    auto gpuScratch = std::make_unique<DirectX::ScratchImage>();
-                    *gpuScratch = std::move(scratchImage);
+                    DecodedImage decoded {};
+                    hr = CopyDxImageToDecodedImage(*loadedImage, decoded);
+                    if (FAILED(hr))
+                    {
+                        return PipelineResult(hr);
+                    }
 
                     PipelineResult result;
                     result.hr = S_OK;
-                    result.scratchImage = std::move(gpuScratch);
+                    result.image = std::move(decoded);
                     result.imageSize = { static_cast<float>(metadata.width), static_cast<float>(metadata.height) };
                     return result;
                 }
@@ -642,8 +737,15 @@ namespace ImageCore
                 }
 
                 PipelineResult result;
+                DecodedImage decoded {};
+                hr = CopyDxImageToDecodedImage(*image, decoded);
+                if (FAILED(hr))
+                {
+                    return PipelineResult(hr);
+                }
+
                 result.hr = S_OK;
-                result.scratchImage = std::move(convertedScratch);
+                result.image = std::move(decoded);
                 result.imageSize = { static_cast<float>(image->width), static_cast<float>(image->height) };
                 return result;
             }

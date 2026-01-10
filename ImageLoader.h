@@ -1,14 +1,13 @@
 #pragma once
 
 #include "ImageRequest.h"
+#include "DecodedImage.h"
+#include <cstdint>
 #include <memory>
 #include <functional>
 #include <mutex>
 #include <atomic>
-#include <d2d1.h>
-#include <wincodec.h>
-#include <wrl/client.h>
-#include "../external/DirectXTex/DirectXTex/DirectXTex.h"
+#include <windows.h>
 
 namespace ImageCore
 {
@@ -19,12 +18,11 @@ namespace ImageCore
     // ImageHandle: 비동기 요청 핸들
     using ImageHandle = uint64_t;
 
-    // 로딩 완료 콜백 (worker thread에서 호출됨)
-    // IWICBitmapSource 또는 ScratchImage를 전달, D2D bitmap 변환은 UI 레이어에서 처리
-    using ImageLoadCallback = std::function<void(
+    // Unified decoded payload callback (worker thread).
+    // No WIC/DirectXTex types leak to FD2D.
+    using DecodedImageLoadCallback = std::function<void(
         HRESULT hr,
-        Microsoft::WRL::ComPtr<IWICBitmapSource> wicBitmap,
-        std::unique_ptr<DirectX::ScratchImage> scratchImage)>;
+        DecodedImage image)>;
 
     class ImageLoader
     {
@@ -35,9 +33,10 @@ namespace ImageCore
         void Shutdown();
 
         // 이미지 로딩 요청 (비동기)
-        ImageHandle Request(
+        // 이미지 로딩 요청 (비동기) - unified payload
+        ImageHandle RequestDecoded(
             const ImageRequest& request,
-            ImageLoadCallback callback);
+            DecodedImageLoadCallback callback);
 
         // 요청 취소
         void Cancel(ImageHandle handle);
@@ -63,7 +62,6 @@ namespace ImageCore
         std::unique_ptr<DecodeScheduler> m_scheduler;
 
         std::atomic<ImageHandle> m_nextHandle;
-        std::mutex m_mutex;
     };
 }
 

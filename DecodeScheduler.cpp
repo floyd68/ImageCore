@@ -478,7 +478,7 @@ namespace ImageCore
                 }
             }
 
-            // 콜백 호출 (WIC bitmap 또는 ScratchImage 결과 전달)
+            // 콜백 호출 (DecodedImage 결과 전달)
             if (task.callback)
             {
                 // If canceled while decoding, suppress callback.

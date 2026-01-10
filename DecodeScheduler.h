@@ -10,7 +10,6 @@
 #include <atomic>
 #include <functional>
 #include <memory>
-#include <wincodec.h>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -20,7 +19,7 @@ namespace ImageCore
     struct DecodeTask
     {
         ImageRequest request;
-        std::function<void(PipelineResult&&)> callback;  // WIC bitmap 또는 ScratchImage 결과를 받는 콜백 (move semantics)
+        std::function<void(PipelineResult&&)> callback;  // DecodedImage 결과를 받는 콜백 (move semantics)
         uint64_t handle;
 
         DecodeTask()

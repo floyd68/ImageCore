@@ -23,8 +23,8 @@ namespace ImageCore
         ImagePurpose purpose;       // 로딩 목적
         Size targetSize;            // 썸네일/미리보기용 목표 크기
         bool srgb;                  // sRGB 색공간 사용 여부
-        // If true, allow returning GPU-compressed DDS ScratchImage for GPU-native rendering.
-        // If false (e.g., D2D-only renderer), the decode pipeline should return CPU-displayable BGRA8 pixels.
+        // If true, allow returning GPU-compressed DDS blocks (BCn) for GPU-native rendering.
+        // If false (e.g., D2D-only renderer), the decode pipeline returns CPU-displayable BGRA8 pixels.
         bool allowGpuCompressedDDS;
 
         ImageRequest()
