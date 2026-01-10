@@ -437,6 +437,16 @@ namespace ImageCore
                 // If canceled while sitting in the queue, skip the task.
                 if (ConsumeCanceled_NoLock(task.handle))
                 {
+                    // IMPORTANT:
+                    // Thumbnail/Preview requests may have already prefetched bytes into FileByteCache.
+                    // If we drop the task here (before decode), we must free any unshared prefetched bytes,
+                    // otherwise the prefetch thread can deadlock on cache backpressure and thumbnails
+                    // will get stuck "loading" forever after rapid folder navigation.
+                    if (task.request.purpose != ImagePurpose::FullResolution)
+                    {
+                        FileByteCache::Instance().EraseIfUnshared(task.request.source);
+                        m_queueCondition.notify_all();
+                    }
                     continue;
                 }
             }
