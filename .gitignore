@@ -12,4 +12,5 @@ ImageCore/
 *.sdf
 *.VC.db
 *.VC.VC.opendb
+*.vcxproj.user
 
