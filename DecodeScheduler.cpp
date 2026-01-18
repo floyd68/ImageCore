@@ -2,6 +2,8 @@
 #include "ImageDecodeDispatcher.h"
 #include "FileByteCache.h"
 #include "ImageFormatDetector.h"
+#include "../VirtualPath.h"
+#include "../VirtualFileSystem.h"
 #include <algorithm>
 #include <objbase.h>
 #include <windows.h>
@@ -24,12 +26,16 @@ namespace ImageCore
 
         static std::wstring GetVolumePathForFilePath(const std::wstring& path)
         {
+            // Parse as VirtualPath to handle archive files
+            auto vpath = VirtualPath::Parse(path);
+            std::wstring actualPath = vpath ? vpath->hostPath.wstring() : path;
+
             // Prefer "C:" style volume handle for IOCTL queries.
             // For UNC paths, fall back to empty (unknown -> conservative).
-            if (path.size() >= 2 && path[1] == L':')
+            if (actualPath.size() >= 2 && actualPath[1] == L':')
             {
                 std::wstring vol;
-                vol.push_back(path[0]);
+                vol.push_back(actualPath[0]);
                 vol.push_back(L':');
                 return vol;
             }
@@ -117,53 +123,27 @@ namespace ImageCore
 
         static std::shared_ptr<std::vector<uint8_t>> ReadWholeFileBytes(const std::wstring& path)
         {
-            HANDLE h = CreateFileW(
-                path.c_str(),
-                GENERIC_READ,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                nullptr,
-                OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
-                nullptr);
-
-            if (h == INVALID_HANDLE_VALUE)
+            // Parse the path as VirtualPath to support archive files
+            auto vpath = VirtualPath::Parse(path);
+            if (!vpath)
             {
                 return nullptr;
             }
 
-            LARGE_INTEGER size {};
-            if (!GetFileSizeEx(h, &size) || size.QuadPart <= 0)
+            // Use VirtualFileSystem to read the file (supports both regular files and archive contents)
+            std::vector<uint8_t> data = VirtualFileSystem::ReadFile(*vpath);
+            if (data.empty())
             {
-                CloseHandle(h);
                 return nullptr;
             }
 
-            if (size.QuadPart > static_cast<LONGLONG>(1024LL * 1024LL * 1024LL))
+            // Safety: don't prefetch >1GB into memory.
+            if (data.size() > 1024LL * 1024LL * 1024LL)
             {
-                // Safety: don't prefetch >1GB into memory.
-                CloseHandle(h);
                 return nullptr;
             }
 
-            auto bytes = std::make_shared<std::vector<uint8_t>>();
-            bytes->resize(static_cast<size_t>(size.QuadPart));
-
-            DWORD totalRead = 0;
-            uint8_t* dst = bytes->data();
-            DWORD remaining = static_cast<DWORD>(bytes->size());
-            while (remaining > 0)
-            {
-                DWORD readNow = 0;
-                if (!ReadFile(h, dst + totalRead, remaining, &readNow, nullptr) || readNow == 0)
-                {
-                    CloseHandle(h);
-                    return nullptr;
-                }
-                totalRead += readNow;
-                remaining -= readNow;
-            }
-
-            CloseHandle(h);
+            auto bytes = std::make_shared<std::vector<uint8_t>>(std::move(data));
             return bytes;
         }
 
@@ -456,11 +436,31 @@ namespace ImageCore
             std::shared_ptr<const std::vector<uint8_t>> bytesHold {};
             {
                 DecodeInput input {};
+                
+                // Check if this is an archive path (contains backslash after archive extension)
+                const std::wstring& src = task.request.source;
+                bool isArchivePath = (src.find(L".7z\\") != std::wstring::npos ||
+                                     src.find(L".zip\\") != std::wstring::npos ||
+                                     src.find(L".rar\\") != std::wstring::npos);
+                
                 if (task.request.purpose != ImagePurpose::FullResolution)
                 {
+                    // Thumbnail/Preview: try cache first
                     bytesHold = FileByteCache::Instance().Get(task.request.source);
                     if (bytesHold && !bytesHold->empty())
                     {
+                        input.bytes = std::span<const uint8_t>(bytesHold->data(), bytesHold->size());
+                        const size_t headerSize = (std::min)(bytesHold->size(), ImageFormatDetector::kProbeSize);
+                        input.header = std::span<const uint8_t>(bytesHold->data(), headerSize);
+                    }
+                }
+                else if (isArchivePath)
+                {
+                    // FullResolution from archive: must read via VirtualFileSystem
+                    auto bytes = ReadWholeFileBytes(task.request.source);
+                    if (bytes && !bytes->empty())
+                    {
+                        bytesHold = bytes;
                         input.bytes = std::span<const uint8_t>(bytesHold->data(), bytesHold->size());
                         const size_t headerSize = (std::min)(bytesHold->size(), ImageFormatDetector::kProbeSize);
                         input.header = std::span<const uint8_t>(bytesHold->data(), headerSize);
