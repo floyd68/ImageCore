@@ -437,11 +437,13 @@ namespace ImageCore
             {
                 DecodeInput input {};
                 
-                // Check if this is an archive path (contains backslash after archive extension)
                 const std::wstring& src = task.request.source;
-                bool isArchivePath = (src.find(L".7z\\") != std::wstring::npos ||
-                                     src.find(L".zip\\") != std::wstring::npos ||
-                                     src.find(L".rar\\") != std::wstring::npos);
+                bool isArchivePath = false;
+                if (!src.empty())
+                {
+                    auto vpath = VirtualPath::Parse(src);
+                    isArchivePath = (vpath && vpath->IsInArchive());
+                }
                 
                 if (task.request.purpose != ImagePurpose::FullResolution)
                 {
@@ -465,6 +467,10 @@ namespace ImageCore
                         const size_t headerSize = (std::min)(bytesHold->size(), ImageFormatDetector::kProbeSize);
                         input.header = std::span<const uint8_t>(bytesHold->data(), headerSize);
                     }
+                    else
+                    {
+                        OutputDebugStringW(L"[DecodeScheduler] Full-res archive read returned empty bytes.\n");
+                    }
                 }
 
                 try
@@ -475,6 +481,15 @@ namespace ImageCore
                 {
                     // Never let an exception kill the worker thread.
                     result = PipelineResult(E_FAIL);
+                }
+
+                if (FAILED(result.hr))
+                {
+                    wchar_t buf[512] {};
+                    swprintf_s(buf, L"[DecodeScheduler] Decode failed (%s): 0x%08X\n",
+                        src.c_str(),
+                        static_cast<unsigned>(result.hr));
+                    OutputDebugStringW(buf);
                 }
             }
 
