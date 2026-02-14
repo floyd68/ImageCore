@@ -31,6 +31,7 @@ namespace ImageCore
 
         // 확장자(예: L".dds") 지원 여부 판단
         bool IsSupportedExtension(std::wstring_view ext) const;
+        std::vector<std::wstring> GetSupportedExtensions() const;
 
         // 이 요청에 대해 시도할 factory 목록 (우선순위 순)
         std::vector<std::shared_ptr<IImageDecoderFactory>> GetCandidateFactories(const ImageRequest& request) const;

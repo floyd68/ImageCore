@@ -137,6 +137,24 @@ namespace ImageCore
         return it != m_factoriesByExtension.end() && !it->second.empty();
     }
 
+    std::vector<std::wstring> DecoderRegistry::GetSupportedExtensions() const
+    {
+        std::vector<std::wstring> exts {};
+        std::lock_guard<std::mutex> lock(m_mutex);
+        exts.reserve(m_factoriesByExtension.size());
+
+        for (const auto& kv : m_factoriesByExtension)
+        {
+            if (!kv.second.empty())
+            {
+                exts.push_back(kv.first);
+            }
+        }
+
+        std::sort(exts.begin(), exts.end());
+        return exts;
+    }
+
     std::vector<std::shared_ptr<IImageDecoderFactory>> DecoderRegistry::GetCandidateFactories(const ImageRequest& request) const
     {
         return GetCandidateFactories(request, {});

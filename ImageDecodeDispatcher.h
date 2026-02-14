@@ -2,6 +2,8 @@
 
 #include "DecodeTypes.h"
 #include <wincodec.h>
+#include <string>
+#include <vector>
 
 namespace ImageCore
 {
@@ -9,6 +11,7 @@ namespace ImageCore
     class ImageDecodeDispatcher final
     {
     public:
+        static std::vector<std::wstring> GetSupportedExtensions();
         PipelineResult Decode(const ImageRequest& request, IWICImagingFactory* wicFactory, const DecodeInput& input);
     };
 }

@@ -902,6 +902,12 @@ namespace ImageCore
         });
     }
 
+    std::vector<std::wstring> ImageDecodeDispatcher::GetSupportedExtensions()
+    {
+        RegisterBuiltInDecoders();
+        return DecoderRegistry::Instance().GetSupportedExtensions();
+    }
+
     PipelineResult ImageDecodeDispatcher::Decode(const ImageRequest& request, IWICImagingFactory* wicFactory, const DecodeInput& input)
     {
         if (request.source.empty())
