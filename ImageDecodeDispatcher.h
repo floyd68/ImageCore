@@ -7,7 +7,7 @@
 
 namespace ImageCore
 {
-    // Dispatcher: registry에게 "이 요청은 어떤 decoder?"를 묻고 실행한다.
+    // Dispatcher: asks the registry "which decoder handles this request?" and executes it.
     class ImageDecodeDispatcher final
     {
     public:

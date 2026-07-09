@@ -187,7 +187,7 @@ namespace ImageCore
 
             if (it->second->SupportsPurpose(request.purpose))
             {
-                // header/magic 기반 probe에서 제외될 수 있게 한다.
+                // Allow it to be excluded in header/magic-based probing.
                 if (it->second->Probe(header, ext))
                 {
                     result.push_back(it->second);

@@ -789,7 +789,7 @@ namespace ImageCore
                 case ImageFormat::WEBP:
                     return true;
                 default:
-                    // Unknown이면 확장자 기반 후보로는 남겨둔다 (Decode 실패 시 다른 디코더 시도)
+                    // If Unknown, keep it as an extension-based candidate (try another decoder on Decode failure)
                     return true;
                 }
             }
@@ -843,7 +843,7 @@ namespace ImageCore
 
             bool Probe(std::span<const uint8_t> header, std::wstring_view extensionLower) const override
             {
-                // Magic number가 강하게 DXTex 포맷을 가리키면 우선 후보로 남긴다.
+                // If the magic number strongly indicates a DXTex format, keep it as a priority candidate.
                 const ImageFormatInfo info = ImageFormatDetector::DetectByMagic(header);
                 switch (info.format)
                 {
@@ -856,8 +856,8 @@ namespace ImageCore
                     break;
                 }
 
-                // Magic이 Unknown이면 확장자 기반으로만 후보에 남긴다.
-                // (TGA/HDR 같은 케이스)
+                // If Magic is Unknown, keep it as a candidate based on extension only.
+                // (Cases like TGA/HDR)
                 UNREFERENCED_PARAMETER(extensionLower);
                 return true;
             }

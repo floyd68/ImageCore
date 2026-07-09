@@ -15,7 +15,7 @@ namespace ImageCore
     class ImageCache;
     class DecodeScheduler;
 
-    // ImageHandle: 비동기 요청 핸들
+    // ImageHandle: async request handle
     using ImageHandle = uint64_t;
 
     // Unified decoded payload callback (worker thread).
@@ -29,25 +29,25 @@ namespace ImageCore
     public:
         static ImageLoader& Instance();
 
-        // 명시적 종료 (FD2D::Core::Shutdown / CoUninitialize 전에 호출)
+        // Explicit shutdown (call before FD2D::Core::Shutdown / CoUninitialize)
         void Shutdown();
 
-        // 이미지 로딩 요청 (비동기)
-        // 이미지 로딩 요청 (비동기) - unified payload
+        // Image load request (async)
+        // Image load request (async) - unified payload
         ImageHandle RequestDecoded(
             const ImageRequest& request,
             DecodedImageLoadCallback callback);
 
-        // 요청 취소
+        // Cancel request
         void Cancel(ImageHandle handle);
 
-        // 캐시 정리
+        // Clear cache
         void ClearCache();
 
-        // 캐시 크기 제한 설정
+        // Set cache size limit
         void SetCacheSizeLimit(size_t maxMemoryBytes);
 
-        // Worker thread 개수 설정
+        // Set worker thread count
         void SetWorkerThreadCount(size_t count);
 
     private:
@@ -64,4 +64,3 @@ namespace ImageCore
         std::atomic<ImageHandle> m_nextHandle;
     };
 }
-

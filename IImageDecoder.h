@@ -6,7 +6,7 @@ struct IWICImagingFactory;
 
 namespace ImageCore
 {
-    // 사용자 확장 디코더가 구현하는 최소 인터페이스
+    // Minimal interface implemented by user-defined extension decoders
     class IImageDecoder
     {
     public:

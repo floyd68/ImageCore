@@ -10,9 +10,9 @@
 
 namespace ImageCore
 {
-    // 디코더 팩토리/디스크립터
-    // - id는 GUID 문자열 등(예: L"{...}")을 권장하지만, 단순 문자열도 허용
-    // - ImageCore 소스 수정 없이 앱에서 RegisterFactory로 확장 가능
+    // Decoder factory/descriptor
+    // - id is recommended to be a GUID string (e.g., L"{...}"), but plain strings are also allowed
+    // - Extensible from the app via RegisterFactory without modifying ImageCore source
     class IImageDecoderFactory
     {
     public:
@@ -21,14 +21,14 @@ namespace ImageCore
         virtual std::wstring_view Id() const = 0;
         virtual std::wstring_view DisplayName() const = 0;
 
-        // 우선순위: 높을수록 먼저 시도
+        // Priority: higher values are tried first
         virtual int Priority() const = 0;
 
-        // 지원 확장자 목록 (".dds" 형태, 소문자 권장)
+        // List of supported extensions (in ".dds" format, lowercase recommended)
         virtual std::span<const std::wstring_view> SupportedExtensions() const = 0;
 
-        // Magic/header 기반 힌트로 지원 여부를 더 정밀하게 판별.
-        // 기본 구현은 true(=후보에서 제외하지 않음). 커스텀 디코더는 필요하면 override.
+        // Determines support more precisely using magic/header-based hints.
+        // Default implementation returns true (= not excluded from candidates). Custom decoders may override if needed.
         virtual bool Probe(std::span<const uint8_t> header, std::wstring_view extensionLower) const
         {
             UNREFERENCED_PARAMETER(header);
@@ -36,10 +36,10 @@ namespace ImageCore
             return true;
         }
 
-        // Thumbnail/Preview/FullResolution 중 지원 여부
+        // Whether Thumbnail/Preview/FullResolution is supported
         virtual bool SupportsPurpose(ImagePurpose purpose) const = 0;
 
-        // 요청 목적에 맞는 디코더 생성
+        // Create a decoder suited to the requested purpose
         virtual std::unique_ptr<IImageDecoder> Create(ImagePurpose purpose) const = 0;
     };
 }

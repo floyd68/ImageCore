@@ -154,7 +154,7 @@ namespace ImageCore
         : m_shutdown(false)
         , m_threadCount(0)
     {
-        // 기본: CPU 코어 수 - 1 (최소 1개)
+        // Default: CPU core count - 1 (minimum 1)
         size_t coreCount = std::max<size_t>(1, std::thread::hardware_concurrency() - 1);
         SetThreadCount(coreCount);
     }
@@ -431,7 +431,7 @@ namespace ImageCore
                 }
             }
 
-            // 디스패처를 통해 디코드 실행 (포맷 라우팅 + 디코더 선택 포함)
+            // Run decode through the dispatcher (includes format routing + decoder selection)
             PipelineResult result;
             std::shared_ptr<const std::vector<uint8_t>> bytesHold {};
             {
@@ -493,7 +493,7 @@ namespace ImageCore
                 }
             }
 
-            // 콜백 호출 (DecodedImage 결과 전달)
+            // Invoke callback (deliver DecodedImage result)
             if (task.callback)
             {
                 // If canceled while decoding, suppress callback.
@@ -505,7 +505,7 @@ namespace ImageCore
                         goto after_decode;
                     }
                 }
-                task.callback(std::move(result));  // move로 전달
+                task.callback(std::move(result));  // delivered via move
             }
 after_decode:
 

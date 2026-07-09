@@ -39,8 +39,8 @@ namespace ImageCore
     struct FormatProbe
     {
         ImageFormatInfo info {};
-        std::wstring extensionLower {};         // ".dds" 같은 소문자 확장자(없으면 "")
-        std::vector<uint8_t> header {};         // 최대 kProbeSize bytes
+        std::wstring extensionLower {};         // Lowercase extension like ".dds" (empty string if none)
+        std::vector<uint8_t> header {};         // Up to kProbeSize bytes
     };
 
     class ImageFormatDetector final
@@ -48,8 +48,8 @@ namespace ImageCore
     public:
         static constexpr size_t kProbeSize = 64;
 
-        // path에서 헤더를 읽고, magic->extension 순으로 판별
-        // (캐시 포함: last_write_time 기반)
+        // Reads header from path, detects by magic -> extension order
+        // (includes cache: based on last_write_time)
         FormatProbe ProbeFile(const std::wstring& path);
 
         static ImageFormatInfo DetectByMagic(std::span<const uint8_t> header);

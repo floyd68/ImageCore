@@ -4,7 +4,7 @@
 
 namespace ImageCore
 {
-    // Size 구조체 (FD2D Layout.h 의존성 제거)
+    // Size struct (removes dependency on FD2D Layout.h)
     struct Size
     {
         float w, h;
@@ -12,17 +12,17 @@ namespace ImageCore
 
     enum class ImagePurpose
     {
-        Thumbnail,      // 썸네일 (작은 크기)
-        Preview,        // 미리보기 (중간 크기)
-        FullResolution  // 원본 해상도
+        Thumbnail,      // Thumbnail (small size)
+        Preview,        // Preview (medium size)
+        FullResolution  // Original resolution
     };
 
     struct ImageRequest
     {
-        std::wstring source;        // 파일 경로
-        ImagePurpose purpose;       // 로딩 목적
-        Size targetSize;            // 썸네일/미리보기용 목표 크기
-        bool srgb;                  // sRGB 색공간 사용 여부
+        std::wstring source;        // File path
+        ImagePurpose purpose;       // Loading purpose
+        Size targetSize;            // Target size for thumbnail/preview
+        bool srgb;                  // Whether to use sRGB color space
         // If true, allow returning GPU-compressed DDS blocks (BCn) for GPU-native rendering.
         // If false (e.g., D2D-only renderer), the decode pipeline returns CPU-displayable BGRA8 pixels.
         bool allowGpuCompressedDDS;
@@ -45,7 +45,7 @@ namespace ImageCore
         }
     };
 
-    // 캐시 키 생성용
+    // For cache key generation
     inline bool operator==(const ImageRequest& a, const ImageRequest& b)
     {
         return a.source == b.source &&
@@ -82,7 +82,7 @@ namespace ImageCore
     }
 }
 
-// ImageRequest 해시 함수 (std 네임스페이스에 특수화)
+// Hash function for ImageRequest (specialization in std namespace)
 namespace std
 {
     template<>
@@ -100,4 +100,3 @@ namespace std
         }
     };
 }
-

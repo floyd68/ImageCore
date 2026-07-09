@@ -4,7 +4,7 @@
 namespace ImageCore
 {
     ImageCache::ImageCache()
-        : m_maxMemoryBytes(256 * 1024 * 1024)  // 기본 256MB
+        : m_maxMemoryBytes(256 * 1024 * 1024)  // Default 256MB
         , m_currentMemoryBytes(0)
     {
     }
@@ -24,7 +24,7 @@ namespace ImageCore
             return false;
         }
 
-        // LRU 업데이트: 리스트 끝으로 이동
+        // LRU update: move to end of list
         m_lruList.erase(it->second.lruIterator);
         m_lruList.push_back(request);
         it->second.lruIterator = std::prev(m_lruList.end());
@@ -42,7 +42,7 @@ namespace ImageCore
 
         std::lock_guard<std::mutex> lock(m_mutex);
 
-        // 이미 존재하면 제거
+        // Remove if already exists
         auto it = m_cache.find(request);
         if (it != m_cache.end())
         {
@@ -51,18 +51,18 @@ namespace ImageCore
             m_cache.erase(it);
         }
 
-        // 메모리 크기 계산
+        // Calculate memory size
         D2D1_SIZE_F size = bitmap->GetSize();
         D2D1_SIZE_U pixelSize = bitmap->GetPixelSize();
         size_t memorySize = static_cast<size_t>(pixelSize.width * pixelSize.height * 4);  // BGRA = 4 bytes
 
-        // 메모리 제한 확인 및 LRU 제거
+        // Check memory limit and evict LRU
         while (m_currentMemoryBytes + memorySize > m_maxMemoryBytes && !m_cache.empty())
         {
             EvictLRU();
         }
 
-        // 새 엔트리 추가
+        // Add new entry
         ImageCacheEntry entry;
         entry.bitmap = bitmap;
         entry.memorySize = memorySize;
@@ -86,7 +86,7 @@ namespace ImageCore
         std::lock_guard<std::mutex> lock(m_mutex);
         m_maxMemoryBytes = maxBytes;
 
-        // 제한을 줄였으면 초과분 제거
+        // If the limit was reduced, evict excess entries
         while (m_currentMemoryBytes > m_maxMemoryBytes && !m_cache.empty())
         {
             EvictLRU();
@@ -106,7 +106,7 @@ namespace ImageCore
             return;
         }
 
-        // 가장 오래된 항목 제거
+        // Remove the oldest entry
         const ImageRequest& oldest = m_lruList.front();
         auto it = m_cache.find(oldest);
         if (it != m_cache.end())

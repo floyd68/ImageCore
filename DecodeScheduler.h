@@ -15,11 +15,11 @@
 
 namespace ImageCore
 {
-    // 디코드 작업
+    // Decode task
     struct DecodeTask
     {
         ImageRequest request;
-        std::function<void(PipelineResult&&)> callback;  // DecodedImage 결과를 받는 콜백 (move semantics)
+        std::function<void(PipelineResult&&)> callback;  // Callback that receives the DecodedImage result (move semantics)
         uint64_t handle;
 
         DecodeTask()
@@ -34,19 +34,19 @@ namespace ImageCore
         DecodeScheduler();
         ~DecodeScheduler();
 
-        // Worker thread 개수 설정
+        // Set the number of worker threads
         void SetThreadCount(size_t count);
 
-        // 작업 큐에 추가
+        // Add to the task queue
         void Enqueue(DecodeTask task);
 
         // 요청 취소 (best-effort: in-flight decode can't be interrupted, but callback will be suppressed)
         void Cancel(uint64_t handle);
 
-        // 모든 작업 완료 대기
+        // Wait for all tasks to complete
         void WaitForCompletion();
 
-        // 종료
+        // Shutdown
         void Shutdown();
 
     private:
