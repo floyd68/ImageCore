@@ -1,4 +1,4 @@
-#include "ImageDecodeDispatcher.h"
+﻿#include "ImageDecodeDispatcher.h"
 #include "DecoderRegistry.h"
 #include "IImageDecoderFactory.h"
 #include "ImageCore.h"
@@ -29,14 +29,6 @@ namespace ImageCore
 {
     namespace
     {
-        static std::wstring GetLowerExtension(const std::wstring& path)
-        {
-            std::filesystem::path p(path);
-            std::wstring ext = p.extension().wstring();
-            std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
-            return ext;
-        }
-
         // ---------- WIC common ----------
         class WICDecoderCommon
         {
@@ -373,7 +365,7 @@ namespace ImageCore
                 DirectX::TexMetadata& metadata)
             {
                 const std::wstring& path = request.source;
-                const std::wstring ext = GetLowerExtension(path);
+                const std::wstring ext = ImageFormatDetector::GetLowerExtension(path);
                 if (ext == L".dds")
                 {
                     // NOTE:
@@ -572,7 +564,7 @@ namespace ImageCore
 
                 // Prefer decoding from a smaller mip for thumbnails (huge CPU win for 8K BCn DDS).
                 size_t mipIndex = 0;
-                if (GetLowerExtension(request.source) == L".dds" && metadata.mipLevels > 1 &&
+                if (ImageFormatDetector::GetLowerExtension(request.source) == L".dds" && metadata.mipLevels > 1 &&
                     request.targetSize.w > 0.0f && request.targetSize.h > 0.0f)
                 {
                     const float targetMax = (std::max)(request.targetSize.w, request.targetSize.h);
@@ -697,7 +689,7 @@ namespace ImageCore
 
                 // Performance / GPU path: if the DDS is GPU-compressed, return the original BCn blocks (mip0)
                 // so the renderer can upload it as a GPU texture without CPU Decompress.
-                const std::wstring ext = GetLowerExtension(request.source);
+                const std::wstring ext = ImageFormatDetector::GetLowerExtension(request.source);
                 const DirectX::Image* loadedImage = scratchImage.GetImage(0, 0, 0);
                 if (request.allowGpuCompressedDDS && ext == L".dds" && loadedImage && DirectX::IsCompressed(loadedImage->format))
                 {
@@ -925,7 +917,7 @@ namespace ImageCore
         if (!input.header.empty())
         {
             probe.header.assign(input.header.begin(), input.header.end());
-            probe.extensionLower = GetLowerExtension(request.source);
+            probe.extensionLower = ImageFormatDetector::GetLowerExtension(request.source);
             probe.info = ImageFormatDetector::DetectByMagic(probe.header);
             if (probe.info.format == ImageFormat::Unknown && !probe.extensionLower.empty())
             {

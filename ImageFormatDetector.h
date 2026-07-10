@@ -55,6 +55,10 @@ namespace ImageCore
         static ImageFormatInfo DetectByMagic(std::span<const uint8_t> header);
         static ImageFormatInfo DetectByExtension(const std::wstring& extensionLower);
 
+        // Shared helper: returns the lowercase extension of a path (e.g. L".dds"),
+        // or an empty string when the path has no extension.
+        static std::wstring GetLowerExtension(const std::wstring& path);
+
     private:
         struct CacheEntry
         {
@@ -65,7 +69,6 @@ namespace ImageCore
         std::mutex m_mutex {};
         std::unordered_map<std::wstring, CacheEntry> m_cache {};
 
-        static std::wstring GetLowerExtension(const std::wstring& path);
         static std::vector<uint8_t> ReadHeader(const std::wstring& path, size_t maxBytes);
         static bool StartsWith(std::span<const uint8_t> header, std::span<const uint8_t> magic);
     };

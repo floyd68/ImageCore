@@ -28,18 +28,11 @@ namespace ImageCore
         {
             // Parse as VirtualPath to handle archive files
             auto vpath = VirtualPath::Parse(path);
-            std::wstring actualPath = vpath ? vpath->hostPath.wstring() : path;
+            const std::wstring actualPath = vpath ? vpath->hostPath.wstring() : path;
 
             // Prefer "C:" style volume handle for IOCTL queries.
             // For UNC paths, fall back to empty (unknown -> conservative).
-            if (actualPath.size() >= 2 && actualPath[1] == L':')
-            {
-                std::wstring vol;
-                vol.push_back(actualPath[0]);
-                vol.push_back(L':');
-                return vol;
-            }
-            return L"";
+            return FileByteCache::GetVolumeForPath(actualPath);
         }
 
         static bool QueryIncursSeekPenaltyForVolume(const std::wstring& volume)

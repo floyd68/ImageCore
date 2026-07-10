@@ -1,5 +1,6 @@
 #include "DecoderRegistry.h"
 #include "IImageDecoderFactory.h"
+#include "ImageFormatDetector.h"
 #include <algorithm>
 #include <filesystem>
 
@@ -25,8 +26,9 @@ namespace ImageCore
 
     std::wstring DecoderRegistry::GetLowerExtensionFromPath(const std::wstring& path)
     {
-        std::filesystem::path p(path);
-        return NormalizeExtension(p.extension().wstring());
+        // path.extension() already includes the leading dot when present,
+        // so the shared lowercase helper is sufficient here.
+        return ImageFormatDetector::GetLowerExtension(path);
     }
 
     bool DecoderRegistry::RegisterFactory(const std::shared_ptr<IImageDecoderFactory>& factory)
