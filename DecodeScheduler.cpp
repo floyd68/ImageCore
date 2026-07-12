@@ -2,9 +2,11 @@
 #include "ImageDecodeDispatcher.h"
 #include "FileByteCache.h"
 #include "ImageFormatDetector.h"
-#include "../VirtualPath.h"
-#include "../VirtualFileSystem.h"
+#include "IPathByteSource.h"
+#include "ImageCoreLog.h"
 #include <algorithm>
+#include <cstdio>
+#include <filesystem>
 #include <objbase.h>
 #include <windows.h>
 #include <winioctl.h>
@@ -26,9 +28,12 @@ namespace ImageCore
 
         static std::wstring GetVolumePathForFilePath(const std::wstring& path)
         {
-            // Parse as VirtualPath to handle archive files
-            auto vpath = VirtualPath::Parse(path);
-            const std::wstring actualPath = vpath ? vpath->hostPath.wstring() : path;
+            // Resolve archive display paths to the host archive file for volume queries.
+            std::wstring actualPath = path;
+            if (IPathByteSource* source = GetPathByteSource())
+            {
+                actualPath = source->ResolveHostPath(path);
+            }
 
             // Prefer "C:" style volume handle for IOCTL queries.
             // For UNC paths, fall back to empty (unknown -> conservative).
@@ -116,15 +121,14 @@ namespace ImageCore
 
         static std::shared_ptr<std::vector<uint8_t>> ReadWholeFileBytes(const std::wstring& path)
         {
-            // Parse the path as VirtualPath to support archive files
-            auto vpath = VirtualPath::Parse(path);
-            if (!vpath)
+            IPathByteSource* source = GetPathByteSource();
+            if (!source)
             {
                 return nullptr;
             }
 
-            // Use VirtualFileSystem to read the file (supports both regular files and archive contents)
-            std::vector<uint8_t> data = VirtualFileSystem::ReadFile(*vpath);
+            // Host adapter reads disk files and archive entries.
+            std::vector<uint8_t> data = source->ReadAll(path);
             if (data.empty())
             {
                 return nullptr;
@@ -138,6 +142,18 @@ namespace ImageCore
 
             auto bytes = std::make_shared<std::vector<uint8_t>>(std::move(data));
             return bytes;
+        }
+
+        static bool IsArchiveBackedPath(const std::wstring& path)
+        {
+            IPathByteSource* source = GetPathByteSource();
+            if (!source || path.empty())
+            {
+                return false;
+            }
+
+            const std::wstring host = source->ResolveHostPath(path);
+            return !host.empty() && host != path;
         }
 
         // (debug-only tracing removed)
@@ -431,13 +447,8 @@ namespace ImageCore
                 DecodeInput input {};
                 
                 const std::wstring& src = task.request.source;
-                bool isArchivePath = false;
-                if (!src.empty())
-                {
-                    auto vpath = VirtualPath::Parse(src);
-                    isArchivePath = (vpath && vpath->IsInArchive());
-                }
-                
+                const bool isArchivePath = IsArchiveBackedPath(src);
+
                 if (task.request.purpose != ImagePurpose::FullResolution)
                 {
                     // Thumbnail/Preview: try cache first
@@ -451,7 +462,7 @@ namespace ImageCore
                 }
                 else if (isArchivePath)
                 {
-                    // FullResolution from archive: must read via VirtualFileSystem
+                    // FullResolution from archive: must read via the host byte source
                     auto bytes = ReadWholeFileBytes(task.request.source);
                     if (bytes && !bytes->empty())
                     {
@@ -462,7 +473,7 @@ namespace ImageCore
                     }
                     else
                     {
-                        OutputDebugStringW(L"[DecodeScheduler] Full-res archive read returned empty bytes.\n");
+                        IC_LOG_WARN("[DecodeScheduler] Full-res archive read returned empty bytes.");
                     }
                 }
 
@@ -478,11 +489,11 @@ namespace ImageCore
 
                 if (FAILED(result.hr))
                 {
-                    wchar_t buf[512] {};
-                    swprintf_s(buf, L"[DecodeScheduler] Decode failed (%s): 0x%08X\n",
-                        src.c_str(),
-                        static_cast<unsigned>(result.hr));
-                    OutputDebugStringW(buf);
+                    char hrBuf[16] {};
+                    sprintf_s(hrBuf, "0x%08X", static_cast<unsigned>(result.hr));
+                    IC_LOG_ERROR("[DecodeScheduler] Decode failed ({}): {}",
+                        std::filesystem::path(src).string(),
+                        hrBuf);
                 }
             }
 

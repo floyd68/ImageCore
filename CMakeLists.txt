@@ -5,9 +5,11 @@ target_sources(ImageCore PRIVATE
     DecodeScheduler.cpp
     FileByteCache.cpp
     ImageCache.cpp
+    ImageCoreLog.cpp
     ImageDecodeDispatcher.cpp
     ImageFormatDetector.cpp
     ImageLoader.cpp
+    IPathByteSource.cpp
 )
 
 target_include_directories(ImageCore PUBLIC
