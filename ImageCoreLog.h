@@ -3,10 +3,12 @@
 // ImageCoreLog.h - self-contained logging macros for ImageCore internals.
 // With no sink installed, every IC_LOG_* call is a silent no-op.
 // Host apps call ImageCore::Log::SetSink() once at startup.
+// Format strings use C++20 std::format.
 
 #include <chrono>
-#include <sstream>
+#include <format>
 #include <string>
+#include <utility>
 
 namespace ImageCore
 {
@@ -22,37 +24,10 @@ namespace Log
     {
         void Dispatch(Level level, std::string message);
 
-        template <typename T>
-        void FormatArg(std::ostringstream& out, const T& value)
-        {
-            out << value;
-        }
-
-        inline void FormatArg(std::ostringstream& out, bool value)
-        {
-            out << (value ? "true" : "false");
-        }
-
         template <typename... Args>
-        std::string Format(const char* fmt, const Args&... args)
+        std::string Format(std::format_string<Args...> fmt, Args&&... args)
         {
-            std::ostringstream out;
-            const char* p = fmt;
-            auto emitOne = [&](const auto& value)
-            {
-                while (*p != '\0' && !(p[0] == '{' && p[1] == '}'))
-                {
-                    out << *p++;
-                }
-                if (*p != '\0')
-                {
-                    p += 2;
-                }
-                FormatArg(out, value);
-            };
-            (emitOne(args), ...);
-            out << p;
-            return out.str();
+            return std::format(fmt, std::forward<Args>(args)...);
         }
     }
 }

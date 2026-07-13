@@ -5,7 +5,6 @@
 #include "IPathByteSource.h"
 #include "ImageCoreLog.h"
 #include <algorithm>
-#include <cstdio>
 #include <filesystem>
 #include <objbase.h>
 #include <windows.h>
@@ -489,11 +488,9 @@ namespace ImageCore
 
                 if (FAILED(result.hr))
                 {
-                    char hrBuf[16] {};
-                    sprintf_s(hrBuf, "0x%08X", static_cast<unsigned>(result.hr));
-                    IC_LOG_ERROR("[DecodeScheduler] Decode failed ({}): {}",
+                    IC_LOG_ERROR("[DecodeScheduler] Decode failed ({}): 0x{:08X}",
                         std::filesystem::path(src).string(),
-                        hrBuf);
+                        static_cast<unsigned>(result.hr));
                 }
             }
 
