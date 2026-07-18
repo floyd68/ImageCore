@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 
 namespace ImageCore
@@ -26,12 +27,14 @@ namespace ImageCore
         // If true, allow returning GPU-compressed DDS blocks (BCn) for GPU-native rendering.
         // If false (e.g., D2D-only renderer), the decode pipeline returns CPU-displayable BGRA8 pixels.
         bool allowGpuCompressedDDS;
+        uint32_t mipLevel;          // Source mip to decode (DDS only)
 
         ImageRequest()
             : purpose(ImagePurpose::FullResolution)
             , targetSize{ 0.0f, 0.0f }
             , srgb(true)
             , allowGpuCompressedDDS(true)
+            , mipLevel(0)
         {
         }
 
@@ -41,6 +44,7 @@ namespace ImageCore
             , targetSize{ 0.0f, 0.0f }
             , srgb(true)
             , allowGpuCompressedDDS(true)
+            , mipLevel(0)
         {
         }
     };
@@ -53,7 +57,8 @@ namespace ImageCore
             a.targetSize.w == b.targetSize.w &&
             a.targetSize.h == b.targetSize.h &&
             a.srgb == b.srgb &&
-            a.allowGpuCompressedDDS == b.allowGpuCompressedDDS;
+            a.allowGpuCompressedDDS == b.allowGpuCompressedDDS &&
+            a.mipLevel == b.mipLevel;
     }
 
     inline bool operator<(const ImageRequest& a, const ImageRequest& b)
@@ -78,7 +83,11 @@ namespace ImageCore
         {
             return a.srgb < b.srgb;
         }
-        return a.allowGpuCompressedDDS < b.allowGpuCompressedDDS;
+        if (a.allowGpuCompressedDDS != b.allowGpuCompressedDDS)
+        {
+            return a.allowGpuCompressedDDS < b.allowGpuCompressedDDS;
+        }
+        return a.mipLevel < b.mipLevel;
     }
 }
 
@@ -96,7 +105,8 @@ namespace std
             size_t h4 = hash<float>{}(req.targetSize.h);
             size_t h5 = hash<bool>{}(req.srgb);
             size_t h6 = hash<bool>{}(req.allowGpuCompressedDDS);
-            return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^ (h5 << 4) ^ (h6 << 5);
+            size_t h7 = hash<uint32_t>{}(req.mipLevel);
+            return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^ (h5 << 4) ^ (h6 << 5) ^ (h7 << 6);
         }
     };
 }

@@ -393,20 +393,58 @@ namespace ImageCore
                 const std::wstring ext = ImageFormatDetector::GetLowerExtension(path);
                 if (ext == L".dds")
                 {
-                    // NOTE:
-                    // - FullResolution(main image): top mip is enough for viewing; avoid loading mip chains.
-                    // - Thumbnail/Preview: prefer loading mip chains so we can decode from a small mip
-                    //   (huge speedup for 8K BCn textures).
+                    DirectX::TexMetadata sourceMetadata {};
+                    HRESULT hr = S_OK;
+                    if (!bytes.empty())
+                    {
+                        hr = DirectX::GetMetadataFromDDSMemory(
+                            bytes.data(),
+                            bytes.size(),
+                            DirectX::DDS_FLAGS_NONE,
+                            sourceMetadata);
+                    }
+                    else
+                    {
+                        hr = DirectX::GetMetadataFromDDSFile(
+                            path.c_str(),
+                            DirectX::DDS_FLAGS_NONE,
+                            sourceMetadata);
+                    }
+                    if (FAILED(hr))
+                    {
+                        return hr;
+                    }
+                    if (request.mipLevel >= sourceMetadata.mipLevels)
+                    {
+                        return E_INVALIDARG;
+                    }
+
+                    // Keep the full-resolution mip-0 fast path, but retain source
+                    // metadata obtained from the header-only query above.
                     DirectX::DDS_FLAGS flags = DirectX::DDS_FLAGS_NONE;
-                    if (request.purpose == ImagePurpose::FullResolution)
+                    if (request.purpose == ImagePurpose::FullResolution && request.mipLevel == 0)
                     {
                         flags = static_cast<DirectX::DDS_FLAGS>(DirectX::DDS_FLAGS_NONE | DirectX::DDS_FLAGS_IGNORE_MIPS);
                     }
+
+                    DirectX::TexMetadata loadedMetadata {};
                     if (!bytes.empty())
                     {
-                        return DirectX::LoadFromDDSMemory(bytes.data(), bytes.size(), flags, &metadata, scratchImage);
+                        hr = DirectX::LoadFromDDSMemory(bytes.data(), bytes.size(), flags, &loadedMetadata, scratchImage);
                     }
-                    return DirectX::LoadFromDDSFile(path.c_str(), flags, &metadata, scratchImage);
+                    else
+                    {
+                        hr = DirectX::LoadFromDDSFile(path.c_str(), flags, &loadedMetadata, scratchImage);
+                    }
+                    if (SUCCEEDED(hr))
+                    {
+                        metadata = sourceMetadata;
+                    }
+                    return hr;
+                }
+                if (request.mipLevel != 0)
+                {
+                    return E_INVALIDARG;
                 }
                 if (ext == L".hdr")
                 {
@@ -470,16 +508,6 @@ namespace ImageCore
                     outScratchImage);
             }
 
-            static HRESULT ConvertScratchImageToBGRA8(const DirectX::ScratchImage& scratchImage, DirectX::ScratchImage& outScratchImage)
-            {
-                const DirectX::Image* image = scratchImage.GetImage(0, 0, 0);
-                if (!image)
-                {
-                    return E_FAIL;
-                }
-
-                return ConvertImageToBGRA8(*image, outScratchImage);
-            }
         };
 
         // ---------- Built-in decoders ----------
@@ -588,8 +616,9 @@ namespace ImageCore
                 }
 
                 // Prefer decoding from a smaller mip for thumbnails (huge CPU win for 8K BCn DDS).
-                size_t mipIndex = 0;
-                if (ImageFormatDetector::GetLowerExtension(request.source) == L".dds" && metadata.mipLevels > 1 &&
+                size_t mipIndex = request.mipLevel;
+                if (request.mipLevel == 0 &&
+                    ImageFormatDetector::GetLowerExtension(request.source) == L".dds" && metadata.mipLevels > 1 &&
                     request.targetSize.w > 0.0f && request.targetSize.h > 0.0f)
                 {
                     const float targetMax = (std::max)(request.targetSize.w, request.targetSize.h);
@@ -689,6 +718,8 @@ namespace ImageCore
                     return PipelineResult(hr);
                 }
                 SetDdsAlphaInfo(decoded, metadata.GetAlphaMode(), srcCompressed);
+                decoded.sourceMipLevels = static_cast<uint32_t>(metadata.mipLevels);
+                decoded.sourceMipIndex = static_cast<uint32_t>(mipIndex);
 
                 result.hr = S_OK;
                 result.image = std::move(decoded);
@@ -716,10 +747,15 @@ namespace ImageCore
                     return PipelineResult(hr);
                 }
 
-                // Performance / GPU path: if the DDS is GPU-compressed, return the original BCn blocks (mip0)
+                // Performance / GPU path: if the DDS is GPU-compressed, return the selected BCn blocks
                 // so the renderer can upload it as a GPU texture without CPU Decompress.
                 const std::wstring ext = ImageFormatDetector::GetLowerExtension(request.source);
-                const DirectX::Image* loadedImage = scratchImage.GetImage(0, 0, 0);
+                const size_t mipIndex = request.mipLevel;
+                const DirectX::Image* loadedImage = scratchImage.GetImage(mipIndex, 0, 0);
+                if (!loadedImage)
+                {
+                    return PipelineResult(E_FAIL);
+                }
                 if (request.allowGpuCompressedDDS && ext == L".dds" && loadedImage && DirectX::IsCompressed(loadedImage->format))
                 {
                     DecodedImage decoded {};
@@ -731,11 +767,13 @@ namespace ImageCore
                     // Compressed passthrough keeps the DDS's declared alpha encoding
                     // (BC2/BC3 may be premultiplied; most BCn is straight) + provenance.
                     SetDdsAlphaInfo(decoded, metadata.GetAlphaMode(), /*wasBlockCompressed=*/true);
+                    decoded.sourceMipLevels = static_cast<uint32_t>(metadata.mipLevels);
+                    decoded.sourceMipIndex = static_cast<uint32_t>(mipIndex);
 
                     PipelineResult result;
                     result.hr = S_OK;
                     result.image = std::move(decoded);
-                    result.imageSize = { static_cast<float>(metadata.width), static_cast<float>(metadata.height) };
+                    result.imageSize = { static_cast<float>(loadedImage->width), static_cast<float>(loadedImage->height) };
                     return result;
                 }
 
@@ -746,15 +784,15 @@ namespace ImageCore
                 if (loadedImage && !DirectX::IsCompressed(loadedImage->format) && loadedImage->format == DXGI_FORMAT_B8G8R8A8_UNORM)
                 {
                     // Avoid unnecessary Convert/copy when DDS is already BGRA8.
-                    *convertedScratch = std::move(scratchImage);
+                    hr = convertedScratch->InitializeFromImage(*loadedImage, false);
                 }
                 else
                 {
-                    hr = ConvertScratchImageToBGRA8(scratchImage, *convertedScratch);
-                    if (FAILED(hr))
-                    {
-                        return PipelineResult(hr);
-                    }
+                    hr = ConvertImageToBGRA8(*loadedImage, *convertedScratch);
+                }
+                if (FAILED(hr))
+                {
+                    return PipelineResult(hr);
                 }
 
                 // Straight BGRA8 kept as-is (original channels preserved); premultiply,
@@ -773,6 +811,8 @@ namespace ImageCore
                     return PipelineResult(hr);
                 }
                 SetDdsAlphaInfo(decoded, metadata.GetAlphaMode(), srcCompressed);
+                decoded.sourceMipLevels = static_cast<uint32_t>(metadata.mipLevels);
+                decoded.sourceMipIndex = static_cast<uint32_t>(mipIndex);
 
                 result.hr = S_OK;
                 result.image = std::move(decoded);
@@ -943,6 +983,45 @@ namespace ImageCore
         if (request.source.empty())
         {
             return PipelineResult(E_INVALIDARG);
+        }
+        const std::wstring extension =
+            ImageFormatDetector::GetLowerExtension(
+                request.source);
+        if (request.mipLevel != 0 &&
+            extension != L".dds")
+        {
+            return PipelineResult(E_INVALIDARG);
+        }
+        if (request.mipLevel != 0 &&
+            extension == L".dds")
+        {
+            DirectX::TexMetadata metadata {};
+            HRESULT metadataResult = E_FAIL;
+            if (!input.bytes.empty())
+            {
+                metadataResult =
+                    DirectX::GetMetadataFromDDSMemory(
+                        input.bytes.data(),
+                        input.bytes.size(),
+                        DirectX::DDS_FLAGS_NONE,
+                        metadata);
+            }
+            else
+            {
+                metadataResult =
+                    DirectX::GetMetadataFromDDSFile(
+                        request.source.c_str(),
+                        DirectX::DDS_FLAGS_NONE,
+                        metadata);
+            }
+            if (SUCCEEDED(metadataResult) &&
+                request.mipLevel >= metadata.mipLevels)
+            {
+                // This is a request-contract error, not a decoder failure.
+                // Reject it before fallback candidates can replace E_INVALIDARG
+                // with an unrelated format-specific error.
+                return PipelineResult(E_INVALIDARG);
+            }
         }
 
         // safe even if app already called it

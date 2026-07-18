@@ -38,7 +38,7 @@ namespace ImageCore
     // - Pixels are decoded to STRAIGHT alpha and left unmodified (premultiply, if
     //   needed, happens only at presentation). Only a genuinely premultiplied
     //   source reports AlphaEncoding::Premultiplied.
-    // - Mipmaps are not included (mip0 only).
+    // - Only the selected mip is included.
     struct DecodedImage final
     {
         uint32_t width { 0 };
@@ -56,15 +56,19 @@ namespace ImageCore
         // usually data in Bethesda assets).
         bool sourceWasBlockCompressed { false };
 
-        // Bytes per row for mip0.
+        // Bytes per row for the selected mip.
         // - BGRA8: width * 4
         // - BCn: block-row pitch in bytes
         uint32_t rowPitchBytes { 0 };
 
-        // Total bytes in `blocks` (mip0 only).
+        // Total bytes in `blocks` (selected mip only).
         uint32_t blockBytes { 0 };
 
         // One contiguous blob holding pixels/blocks.
         std::shared_ptr<std::vector<uint8_t>> blocks {};
+
+        // Mip provenance from the source. Non-mipmapped formats expose one level.
+        uint32_t sourceMipLevels { 1 };
+        uint32_t sourceMipIndex { 0 };
     };
 }
