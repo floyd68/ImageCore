@@ -53,8 +53,10 @@ namespace ImageCore
                 outImage.width = width;
                 outImage.height = height;
                 outImage.dxgiFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
-                // WIC decodes to GUID_WICPixelFormat32bppPBGRA (premultiplied).
-                outImage.alphaMode = AlphaMode::Premultiplied;
+                // WIC decodes to GUID_WICPixelFormat32bppBGRA (straight); the
+                // original channels are preserved (no premultiply on decode).
+                outImage.alphaEncoding = AlphaEncoding::Straight;
+                outImage.sourceWasBlockCompressed = false;
                 outImage.rowPitchBytes = width * 4u;
                 outImage.blockBytes = outImage.rowPitchBytes * outImage.height;
 
@@ -164,7 +166,7 @@ namespace ImageCore
 
                 hr = converter->Initialize(
                     thumbnail.Get(),
-                    GUID_WICPixelFormat32bppPBGRA,
+                    GUID_WICPixelFormat32bppBGRA,
                     WICBitmapDitherTypeNone,
                     nullptr,
                     0.0f,
@@ -257,7 +259,7 @@ namespace ImageCore
 
                 hr = converter->Initialize(
                     source.Get(),
-                    GUID_WICPixelFormat32bppPBGRA,
+                    GUID_WICPixelFormat32bppBGRA,
                     WICBitmapDitherTypeNone,
                     nullptr,
                     0.0f,
@@ -313,7 +315,7 @@ namespace ImageCore
 
                 hr = converter->Initialize(
                     frame.Get(),
-                    GUID_WICPixelFormat32bppPBGRA,
+                    GUID_WICPixelFormat32bppBGRA,
                     WICBitmapDitherTypeNone,
                     nullptr,
                     0.0f,
@@ -360,44 +362,25 @@ namespace ImageCore
                 return S_OK;
             }
 
-            static AlphaMode MapDdsAlphaMode(DirectX::TEX_ALPHA_MODE m)
+            // Record a DDS source's alpha ENCODING (how color relates to alpha)
+            // plus a usage HINT and compression provenance - WITHOUT touching the
+            // pixels (the original channels are preserved so a consumer override
+            // can always recover them). DDS CUSTOM is straight-encoded but declares
+            // its alpha app-defined, so it becomes a Data usage hint.
+            static void SetDdsAlphaInfo(DecodedImage& out, DirectX::TEX_ALPHA_MODE m, bool wasBlockCompressed)
             {
+                out.sourceWasBlockCompressed = wasBlockCompressed;
                 switch (m)
                 {
-                case DirectX::TEX_ALPHA_MODE_STRAIGHT:      return AlphaMode::Straight;
-                case DirectX::TEX_ALPHA_MODE_PREMULTIPLIED: return AlphaMode::Premultiplied;
-                case DirectX::TEX_ALPHA_MODE_OPAQUE:        return AlphaMode::Opaque;
-                case DirectX::TEX_ALPHA_MODE_CUSTOM:        return AlphaMode::Custom;
-                default:                                    return AlphaMode::Unknown;
+                case DirectX::TEX_ALPHA_MODE_STRAIGHT:      out.alphaEncoding = AlphaEncoding::Straight; break;
+                case DirectX::TEX_ALPHA_MODE_PREMULTIPLIED: out.alphaEncoding = AlphaEncoding::Premultiplied; break;
+                case DirectX::TEX_ALPHA_MODE_OPAQUE:        out.alphaEncoding = AlphaEncoding::Opaque; break;
+                case DirectX::TEX_ALPHA_MODE_CUSTOM:
+                    out.alphaEncoding = AlphaEncoding::Straight; // RGB is straight
+                    out.alphaUsageHint = AlphaUsage::Data;       // ...but alpha is app-defined data
+                    break;
+                default:                                    out.alphaEncoding = AlphaEncoding::Unknown; break;
                 }
-            }
-
-            // Normalize a decoded BGRA8 scratch image to premultiplied alpha (the
-            // CPU-output invariant), guided by the source's declared alpha mode so
-            // an already-premultiplied source is never premultiplied twice, and a
-            // Custom-alpha source (alpha carries data, not coverage) is left as-is.
-            // Returns the alpha mode to record on the DecodedImage.
-            static AlphaMode NormalizeCpuBgra8ToPremultiplied(
-                DirectX::ScratchImage& scratch, DirectX::TEX_ALPHA_MODE srcMode)
-            {
-                const AlphaMode mapped = MapDdsAlphaMode(srcMode);
-                if (mapped == AlphaMode::Premultiplied)
-                    return AlphaMode::Premultiplied; // already premultiplied
-                if (mapped == AlphaMode::Opaque)
-                    return AlphaMode::Opaque;        // alpha==1: premult == straight
-                if (mapped == AlphaMode::Custom)
-                    return AlphaMode::Custom;        // don't corrupt data-bearing alpha
-
-                const DirectX::Image* img = scratch.GetImage(0, 0, 0);
-                if (!img)
-                    return AlphaMode::Straight;
-                DirectX::ScratchImage pm;
-                if (SUCCEEDED(DirectX::PremultiplyAlpha(*img, DirectX::TEX_PMALPHA_DEFAULT, pm)))
-                {
-                    scratch = std::move(pm);
-                    return AlphaMode::Premultiplied;
-                }
-                return AlphaMode::Straight; // best effort: leave straight (shader handles it)
             }
 
             static HRESULT LoadWithDirectXTex(
@@ -646,6 +629,9 @@ namespace ImageCore
 
                 auto convertedScratch = std::make_unique<DirectX::ScratchImage>();
                 const DirectX::Image* loadedImage = scratchImage.GetImage(mipIndex, 0, 0);
+                // Provenance: was the SOURCE block-compressed? (Captured before the
+                // BGRA8 conversion below erases that from the final dxgiFormat.)
+                const bool srcCompressed = loadedImage && DirectX::IsCompressed(loadedImage->format);
                 if (loadedImage && !DirectX::IsCompressed(loadedImage->format) && loadedImage->format == DXGI_FORMAT_B8G8R8A8_UNORM)
                 {
                     // Avoid unnecessary Convert/copy when DDS is already BGRA8.
@@ -663,13 +649,6 @@ namespace ImageCore
                         return PipelineResult(hr);
                     }
                 }
-
-                // Normalize to premultiplied alpha BEFORE resizing (CPU-output
-                // invariant): the resize filter must not bleed color from fully
-                // transparent texels into visible ones, and the thumbnail must
-                // composite correctly. Replaces convertedScratch, so re-fetch below.
-                const AlphaMode thumbAlphaMode =
-                    NormalizeCpuBgra8ToPremultiplied(*convertedScratch, metadata.GetAlphaMode());
 
                 const DirectX::Image* convertedImage = convertedScratch->GetImage(0, 0, 0);
                 if (!convertedImage)
@@ -709,7 +688,7 @@ namespace ImageCore
                 {
                     return PipelineResult(hr);
                 }
-                decoded.alphaMode = thumbAlphaMode;
+                SetDdsAlphaInfo(decoded, metadata.GetAlphaMode(), srcCompressed);
 
                 result.hr = S_OK;
                 result.image = std::move(decoded);
@@ -749,9 +728,9 @@ namespace ImageCore
                     {
                         return PipelineResult(hr);
                     }
-                    // Compressed passthrough keeps the DDS's declared alpha mode
-                    // (BC2/BC3 may be premultiplied; most BCn is straight).
-                    decoded.alphaMode = MapDdsAlphaMode(metadata.GetAlphaMode());
+                    // Compressed passthrough keeps the DDS's declared alpha encoding
+                    // (BC2/BC3 may be premultiplied; most BCn is straight) + provenance.
+                    SetDdsAlphaInfo(decoded, metadata.GetAlphaMode(), /*wasBlockCompressed=*/true);
 
                     PipelineResult result;
                     result.hr = S_OK;
@@ -760,6 +739,9 @@ namespace ImageCore
                     return result;
                 }
 
+                // Provenance: was the source block-compressed (decompressed to BGRA8
+                // below)? Captured before the conversion erases it from dxgiFormat.
+                const bool srcCompressed = loadedImage && DirectX::IsCompressed(loadedImage->format);
                 auto convertedScratch = std::make_unique<DirectX::ScratchImage>();
                 if (loadedImage && !DirectX::IsCompressed(loadedImage->format) && loadedImage->format == DXGI_FORMAT_B8G8R8A8_UNORM)
                 {
@@ -775,13 +757,8 @@ namespace ImageCore
                     }
                 }
 
-                // Normalize the CPU BGRA8 output to premultiplied alpha (guided by
-                // the DDS alpha mode; TGA/EXR report Unknown -> treated as straight
-                // and premultiplied here). Replaces convertedScratch, so grab the
-                // image pointer AFTER.
-                const AlphaMode cpuAlphaMode =
-                    NormalizeCpuBgra8ToPremultiplied(*convertedScratch, metadata.GetAlphaMode());
-
+                // Straight BGRA8 kept as-is (original channels preserved); premultiply,
+                // if ever needed, happens only at presentation.
                 const DirectX::Image* image = convertedScratch->GetImage(0, 0, 0);
                 if (!image)
                 {
@@ -795,7 +772,7 @@ namespace ImageCore
                 {
                     return PipelineResult(hr);
                 }
-                decoded.alphaMode = cpuAlphaMode;
+                SetDdsAlphaInfo(decoded, metadata.GetAlphaMode(), srcCompressed);
 
                 result.hr = S_OK;
                 result.image = std::move(decoded);
