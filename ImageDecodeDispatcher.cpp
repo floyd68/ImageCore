@@ -53,6 +53,8 @@ namespace ImageCore
                 outImage.width = width;
                 outImage.height = height;
                 outImage.dxgiFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
+                // WIC decodes to GUID_WICPixelFormat32bppPBGRA (premultiplied).
+                outImage.alphaMode = AlphaMode::Premultiplied;
                 outImage.rowPitchBytes = width * 4u;
                 outImage.blockBytes = outImage.rowPitchBytes * outImage.height;
 
@@ -356,6 +358,46 @@ namespace ImageCore
                 outImage.blocks->resize(outImage.blockBytes);
                 std::memcpy(outImage.blocks->data(), image.pixels, outImage.blockBytes);
                 return S_OK;
+            }
+
+            static AlphaMode MapDdsAlphaMode(DirectX::TEX_ALPHA_MODE m)
+            {
+                switch (m)
+                {
+                case DirectX::TEX_ALPHA_MODE_STRAIGHT:      return AlphaMode::Straight;
+                case DirectX::TEX_ALPHA_MODE_PREMULTIPLIED: return AlphaMode::Premultiplied;
+                case DirectX::TEX_ALPHA_MODE_OPAQUE:        return AlphaMode::Opaque;
+                case DirectX::TEX_ALPHA_MODE_CUSTOM:        return AlphaMode::Custom;
+                default:                                    return AlphaMode::Unknown;
+                }
+            }
+
+            // Normalize a decoded BGRA8 scratch image to premultiplied alpha (the
+            // CPU-output invariant), guided by the source's declared alpha mode so
+            // an already-premultiplied source is never premultiplied twice, and a
+            // Custom-alpha source (alpha carries data, not coverage) is left as-is.
+            // Returns the alpha mode to record on the DecodedImage.
+            static AlphaMode NormalizeCpuBgra8ToPremultiplied(
+                DirectX::ScratchImage& scratch, DirectX::TEX_ALPHA_MODE srcMode)
+            {
+                const AlphaMode mapped = MapDdsAlphaMode(srcMode);
+                if (mapped == AlphaMode::Premultiplied)
+                    return AlphaMode::Premultiplied; // already premultiplied
+                if (mapped == AlphaMode::Opaque)
+                    return AlphaMode::Opaque;        // alpha==1: premult == straight
+                if (mapped == AlphaMode::Custom)
+                    return AlphaMode::Custom;        // don't corrupt data-bearing alpha
+
+                const DirectX::Image* img = scratch.GetImage(0, 0, 0);
+                if (!img)
+                    return AlphaMode::Straight;
+                DirectX::ScratchImage pm;
+                if (SUCCEEDED(DirectX::PremultiplyAlpha(*img, DirectX::TEX_PMALPHA_DEFAULT, pm)))
+                {
+                    scratch = std::move(pm);
+                    return AlphaMode::Premultiplied;
+                }
+                return AlphaMode::Straight; // best effort: leave straight (shader handles it)
             }
 
             static HRESULT LoadWithDirectXTex(
@@ -699,6 +741,9 @@ namespace ImageCore
                     {
                         return PipelineResult(hr);
                     }
+                    // Compressed passthrough keeps the DDS's declared alpha mode
+                    // (BC2/BC3 may be premultiplied; most BCn is straight).
+                    decoded.alphaMode = MapDdsAlphaMode(metadata.GetAlphaMode());
 
                     PipelineResult result;
                     result.hr = S_OK;
@@ -722,6 +767,13 @@ namespace ImageCore
                     }
                 }
 
+                // Normalize the CPU BGRA8 output to premultiplied alpha (guided by
+                // the DDS alpha mode; TGA/EXR report Unknown -> treated as straight
+                // and premultiplied here). Replaces convertedScratch, so grab the
+                // image pointer AFTER.
+                const AlphaMode cpuAlphaMode =
+                    NormalizeCpuBgra8ToPremultiplied(*convertedScratch, metadata.GetAlphaMode());
+
                 const DirectX::Image* image = convertedScratch->GetImage(0, 0, 0);
                 if (!image)
                 {
@@ -735,6 +787,7 @@ namespace ImageCore
                 {
                     return PipelineResult(hr);
                 }
+                decoded.alphaMode = cpuAlphaMode;
 
                 result.hr = S_OK;
                 result.image = std::move(decoded);
