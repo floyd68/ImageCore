@@ -664,6 +664,13 @@ namespace ImageCore
                     }
                 }
 
+                // Normalize to premultiplied alpha BEFORE resizing (CPU-output
+                // invariant): the resize filter must not bleed color from fully
+                // transparent texels into visible ones, and the thumbnail must
+                // composite correctly. Replaces convertedScratch, so re-fetch below.
+                const AlphaMode thumbAlphaMode =
+                    NormalizeCpuBgra8ToPremultiplied(*convertedScratch, metadata.GetAlphaMode());
+
                 const DirectX::Image* convertedImage = convertedScratch->GetImage(0, 0, 0);
                 if (!convertedImage)
                 {
@@ -702,6 +709,7 @@ namespace ImageCore
                 {
                     return PipelineResult(hr);
                 }
+                decoded.alphaMode = thumbAlphaMode;
 
                 result.hr = S_OK;
                 result.image = std::move(decoded);
