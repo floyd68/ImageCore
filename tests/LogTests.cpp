@@ -9,9 +9,11 @@
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 // ImageCore logging: laziness without a sink, UTF-8 conversion, and that a
@@ -74,31 +76,57 @@ namespace
         return (std::filesystem::path(tempPath) / kNonAcpName).wstring();
     }
 
-    // Decodes `path` at full resolution with one worker and waits (bounded) for
-    // the callback; returns the HRESULT, or S_FALSE if no callback arrived.
-    HRESULT DecodeOnce(DecodeScheduler& scheduler, const std::wstring& path, uint64_t handle)
+    // Completion state shared between a test and the scheduler callback. The
+    // callback owns a reference, so the state stays valid even when the test's
+    // bounded wait times out and the completion arrives later.
+    struct Completion
     {
         std::mutex mutex;
         std::condition_variable cv;
         bool done = false;
         HRESULT hr = S_FALSE;
+    };
+
+    // Enqueues a full-resolution decode of `path`. `callbackDelay` postpones the
+    // callback's write to the shared state (to simulate a late completion).
+    std::shared_ptr<Completion> StartDecode(
+        DecodeScheduler& scheduler,
+        const std::wstring& path,
+        uint64_t handle,
+        std::chrono::milliseconds callbackDelay = std::chrono::milliseconds(0))
+    {
+        auto completion = std::make_shared<Completion>();
 
         DecodeTask task;
         task.request = ImageRequest(path, ImagePurpose::FullResolution);
         task.request.allowGpuCompressedDDS = false;
         task.handle = handle;
-        task.callback = [&](PipelineResult&& result)
+        task.callback = [completion, callbackDelay](PipelineResult&& result)
         {
-            std::lock_guard<std::mutex> lock(mutex);
-            hr = result.hr;
-            done = true;
-            cv.notify_all();
+            if (callbackDelay.count() > 0)
+            {
+                std::this_thread::sleep_for(callbackDelay);
+            }
+            std::lock_guard<std::mutex> lock(completion->mutex);
+            completion->hr = result.hr;
+            completion->done = true;
+            completion->cv.notify_all();
         };
         scheduler.Enqueue(std::move(task));
+        return completion;
+    }
 
-        std::unique_lock<std::mutex> lock(mutex);
-        cv.wait_for(lock, std::chrono::seconds(10), [&]() { return done; });
-        return done ? hr : S_FALSE;
+    // Waits (bounded) for the callback; returns its HRESULT, or S_FALSE on timeout.
+    HRESULT WaitDecode(const std::shared_ptr<Completion>& completion, std::chrono::milliseconds timeout)
+    {
+        std::unique_lock<std::mutex> lock(completion->mutex);
+        completion->cv.wait_for(lock, timeout, [&]() { return completion->done; });
+        return completion->done ? completion->hr : S_FALSE;
+    }
+
+    HRESULT DecodeOnce(DecodeScheduler& scheduler, const std::wstring& path, uint64_t handle)
+    {
+        return WaitDecode(StartDecode(scheduler, path, handle), std::chrono::seconds(10));
     }
 }
 
@@ -166,4 +194,31 @@ IC_TEST(Log_ThrowingSinkCannotStopTheScheduler)
     const std::wstring path = MissingNonAcpPath();
     IC_CHECK(FAILED(DecodeOnce(scheduler, path, 1)));
     IC_CHECK(FAILED(DecodeOnce(scheduler, path, 2)));
+}
+
+IC_TEST(Log_TimedOutWaitKeepsCompletionStateAlive)
+{
+    // A completion that arrives after the test stopped waiting must land in
+    // state that is still alive (shared with the callback), not in a destroyed
+    // stack frame. The callback is delayed past a deliberately short wait.
+    RegisterBuiltInDecoders();
+    DecodeScheduler scheduler;
+    scheduler.SetThreadCount(1);
+
+    auto late = StartDecode(scheduler, MissingNonAcpPath(), 1, std::chrono::milliseconds(300));
+    IC_CHECK(WaitDecode(late, std::chrono::milliseconds(20)) == S_FALSE);   // timed out
+    // The helper's caller moves on; the callback still holds the state.
+    IC_CHECK(late.use_count() >= 2);
+
+    // The late completion arrives and is recorded in the shared state.
+    IC_CHECK(FAILED(WaitDecode(late, std::chrono::seconds(10))));
+
+    // The worker is unaffected and the callback released its reference.
+    IC_CHECK(FAILED(DecodeOnce(scheduler, MissingNonAcpPath(), 2)));
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (late.use_count() != 1 && std::chrono::steady_clock::now() < deadline)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    IC_CHECK(late.use_count() == 1);
 }
