@@ -11,7 +11,9 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <cstdio>
 #include <string>
+#include <thread>
 #include <vector>
 
 // DecodeScheduler worker-count and single-worker progress tests. They decode
@@ -66,7 +68,10 @@ namespace
                 (L"ImageCoreTests_" + std::to_wstring(GetCurrentProcessId()));
             std::filesystem::create_directories(dir);
 
-            for (int i = 0; i < 6; ++i)
+            // Enough distinct files to exceed the prefetch cap (at most 8) several
+            // times over; same-path tasks share one FileByteCache entry and would
+            // not exercise backpressure.
+            for (int i = 0; i < 40; ++i)
             {
                 const auto path = dir / (L"thumb" + std::to_wstring(i) + L".bmp");
                 WriteBmp(path, 32, 32);
@@ -120,6 +125,40 @@ namespace
             std::unique_lock<std::mutex> lock(mutex);
             return cv.wait_for(lock, kWaitTimeout, [&]() { return entries.size() >= count; });
         }
+    };
+
+    // Fails the process with a message if a scope outlives `limit`. Scheduler
+    // destruction joins its threads, which cannot be bounded from the test; a
+    // regression of the shutdown wakeup would otherwise hang until the CTest
+    // timeout with no diagnostic.
+    class Watchdog
+    {
+    public:
+        Watchdog(const char* what, std::chrono::seconds limit)
+            : m_done(CreateEventW(nullptr, TRUE, FALSE, nullptr))
+            , m_thread([this, what, limit]()
+            {
+                if (WaitForSingleObject(m_done, static_cast<DWORD>(limit.count() * 1000)) != WAIT_OBJECT_0)
+                {
+                    std::fprintf(stderr, "  watchdog: %s did not finish within %lld s; terminating\n",
+                        what, static_cast<long long>(limit.count()));
+                    std::fflush(stderr);
+                    TerminateProcess(GetCurrentProcess(), 3);
+                }
+            })
+        {
+        }
+
+        ~Watchdog()
+        {
+            SetEvent(m_done);
+            m_thread.join();
+            CloseHandle(m_done);
+        }
+
+    private:
+        HANDLE m_done;
+        std::thread m_thread;
     };
 
     DecodeTask MakeTask(const std::wstring& path, ImagePurpose purpose, uint64_t handle,
@@ -298,4 +337,68 @@ IC_TEST(DecodeScheduler_SingleWorkerPrefersQueuedFullResolution)
     {
         IC_CHECK(SUCCEEDED(entry.hr));
     }
+}
+
+IC_TEST(DecodeScheduler_BackpressureBeyondPrefetchCapCompletes)
+{
+    // More thumbnails than the prefetch cap, one worker: the prefetch thread must
+    // be woken every time a decode frees cache space. A lost wakeup leaves it
+    // asleep with queued work, which shows up here as a bounded-wait failure.
+    const auto& files = Files();
+    Completions done;
+    {
+        Watchdog watchdog("backpressure test", std::chrono::seconds(60));
+        DecodeScheduler scheduler;
+        scheduler.SetThreadCount(1);
+
+        uint64_t handle = 0;
+        for (const auto& path : files.thumbs)
+        {
+            ++handle;
+            scheduler.Enqueue(MakeTask(path, ImagePurpose::Thumbnail, handle, done.Callback(handle)));
+        }
+        IC_REQUIRE(done.WaitFor(files.thumbs.size()));
+    }
+
+    IC_CHECK(done.entries.size() == files.thumbs.size());
+    for (const auto& entry : done.entries)
+    {
+        IC_CHECK(SUCCEEDED(entry.hr));
+    }
+}
+
+// Kept last: it creates and destroys many schedulers.
+IC_TEST(DecodeScheduler_ShutdownCyclesNeverHang)
+{
+    // Shutdown with idle workers (the case that hung: a waiter that evaluated
+    // its predicate just before the flag flipped) and with queued and in-flight
+    // full-resolution work. Full-resolution tasks bypass the FileByteCache, so
+    // dropped tasks leave no stale cache entries behind for later cycles.
+    const auto& files = Files();
+    constexpr int kCycles = 1000;
+    Watchdog watchdog("shutdown cycles", std::chrono::seconds(90));
+
+    int completed = 0;
+    for (int cycle = 0; cycle < kCycles; ++cycle)
+    {
+        Completions done;
+        DecodeScheduler scheduler;
+        scheduler.SetThreadCount(1 + (cycle % 2));
+
+        const int mode = cycle % 3;
+        if (mode != 0)
+        {
+            // Queued work at shutdown (mode 1) or work allowed to complete (mode 2).
+            scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 1, done.Callback(1)));
+            scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 2, done.Callback(2)));
+            if (mode == 2)
+            {
+                IC_REQUIRE(done.WaitFor(2));
+                completed += 2;
+            }
+        }
+        // mode 0: idle shutdown, every thread blocked in its wait.
+    }
+
+    IC_CHECK(completed == 2 * (kCycles / 3));
 }

@@ -29,6 +29,14 @@ namespace ImageCore
 {
     namespace
     {
+        // The calling thread's cached WIC factory. Kept behind an accessor so a
+        // worker can reset it before CoUninitialize() (see ReleaseThreadResources).
+        Microsoft::WRL::ComPtr<IWICImagingFactory>& ThreadWicFactorySlot()
+        {
+            thread_local Microsoft::WRL::ComPtr<IWICImagingFactory> s_factory {};
+            return s_factory;
+        }
+
         // ---------- WIC common ----------
         class WICDecoderCommon
         {
@@ -119,16 +127,18 @@ namespace ImageCore
             static Microsoft::WRL::ComPtr<IWICImagingFactory> GetWicFactory()
             {
                 // Per-thread WIC factory (DecodeScheduler worker threads already CoInitializeEx'd).
-                thread_local Microsoft::WRL::ComPtr<IWICImagingFactory> s_factory {};
-                if (!s_factory)
+                // Released explicitly through ImageDecodeDispatcher::ReleaseThreadResources()
+                // before the worker uninitializes COM.
+                Microsoft::WRL::ComPtr<IWICImagingFactory>& factory = ThreadWicFactorySlot();
+                if (!factory)
                 {
                     (void)CoCreateInstance(
                         CLSID_WICImagingFactory,
                         nullptr,
                         CLSCTX_INPROC_SERVER,
-                        IID_PPV_ARGS(&s_factory));
+                        IID_PPV_ARGS(&factory));
                 }
-                return s_factory;
+                return factory;
             }
 
             static bool TryEmbeddedThumbnail(
@@ -1075,3 +1085,8 @@ namespace ImageCore
 }
 
 
+
+void ImageCore::ImageDecodeDispatcher::ReleaseThreadResources()
+{
+    ThreadWicFactorySlot().Reset();
+}
