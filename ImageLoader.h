@@ -55,6 +55,9 @@ namespace ImageCore
         // Set worker thread count
         void SetWorkerThreadCount(size_t count);
 
+        // Tests/diagnostics: requests currently queued or decoding (0 after Shutdown).
+        size_t LiveRequestCount() const;
+
     private:
         ImageLoader();
         ~ImageLoader();

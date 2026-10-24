@@ -137,5 +137,10 @@ namespace ImageCore
             scheduler->SetThreadCount(count);
         }
     }
-}
 
+    size_t ImageLoader::LiveRequestCount() const
+    {
+        std::shared_ptr<DecodeScheduler> scheduler = Scheduler();
+        return scheduler ? scheduler->LiveRequestCount() : 0;
+    }
+}

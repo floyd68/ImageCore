@@ -90,6 +90,7 @@ IC_TEST(ImageLoader_RequestsAfterShutdownFailSafely)
         IC_REQUIRE(cv.wait_for(lock, std::chrono::seconds(10), [&]() { return delivered; }));
     }
     IC_CHECK(SUCCEEDED(deliveredHr));
+    IC_CHECK(loader.LiveRequestCount() == 0);
 
     // Concurrent requests while Shutdown runs: each is either accepted (and may
     // or may not complete) or rejected with 0; nothing crashes or hangs.
@@ -129,6 +130,7 @@ IC_TEST(ImageLoader_RequestsAfterShutdownFailSafely)
         lateCallback.store(true);
     });
     IC_CHECK(late == 0);
+    IC_CHECK(loader.LiveRequestCount() == 0);
     loader.Cancel(first);
     loader.Cancel(12345);
     loader.SetWorkerThreadCount(2);
