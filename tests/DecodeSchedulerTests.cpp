@@ -208,12 +208,34 @@ namespace
 
         std::vector<uint8_t> ReadAll(const std::wstring& path) const override
         {
+            {
+                std::lock_guard<std::mutex> lock(m_readMutex);
+                m_reads.push_back(path);
+            }
             std::ifstream in(std::filesystem::path(path), std::ios::binary);
             return std::vector<uint8_t>(std::istreambuf_iterator<char>(in), {});
         }
 
+        // Read-side history: the prefetch stage is the only caller for
+        // thumbnail requests, so this observes exactly when prefetch stops and
+        // resumes, independently of FileByteCache (which evicts at its limit and
+        // so cannot show whether prefetch waited).
+        size_t ReadCount() const
+        {
+            std::lock_guard<std::mutex> lock(m_readMutex);
+            return m_reads.size();
+        }
+
+        std::vector<std::wstring> Reads() const
+        {
+            std::lock_guard<std::mutex> lock(m_readMutex);
+            return m_reads;
+        }
+
     private:
         IPathByteSource* m_previous;
+        mutable std::mutex m_readMutex;
+        mutable std::vector<std::wstring> m_reads;
     };
 
     DecodeTask MakeTask(const std::wstring& path, ImagePurpose purpose, uint64_t handle,
@@ -377,12 +399,21 @@ IC_TEST(DecodeScheduler_SingleWorkerPrefersQueuedFullResolution)
 
 IC_TEST(DecodeScheduler_BackpressureBlocksAtCapAndResumes)
 {
-    // The prefetch thread fills FileByteCache up to the effective cap and then
-    // blocks until a decode frees space. With the only decode worker held inside
-    // a callback, the cache must fill to the cap and stay there (blocked); once
-    // the worker is released, every decode must wake the prefetch thread. A lost
-    // cache-space wakeup leaves the remaining thumbnails queued forever, which
-    // shows up here as a bounded-wait failure.
+    // The prefetch thread reads thumbnail bytes into FileByteCache and must stop
+    // reading when the cache holds the effective cap, until a decode frees space.
+    // The test observes the read side directly (ScopedFileByteSource history):
+    // FileByteCache::Put evicts at its limit, so a flat cache count alone would
+    // also appear if prefetch never waited. With the only decode worker held
+    // inside a callback:
+    //   fill   - reads stop at exactly the effective cap and do not continue;
+    //            nothing was evicted (cache count == reads), nothing decoded;
+    //   resume - after the worker is released, reads continue until every file
+    //            has been read exactly once, in enqueue order, and all decodes
+    //            complete. A lost cache-space wakeup leaves reads stuck, which
+    //            fails the bounded wait.
+    // With all inputs on one volume, the effective cap is FileByteCache's limit:
+    // the global cap is min(8, that volume's prefetch depth) and the per-volume
+    // cap is that depth, so the smaller of the two is the global value.
     const auto& files = Files();
     FileByteCache& cache = FileByteCache::Instance();
     Completions done;
@@ -391,8 +422,10 @@ IC_TEST(DecodeScheduler_BackpressureBlocksAtCapAndResumes)
     std::condition_variable gateCv;
     bool entered = false;
     bool released = false;
-    size_t plateau = 0;
-    size_t maxEntries = 0;
+    size_t readsWhileHeld = 0;
+    size_t cacheWhileHeld = 0;
+    size_t effectiveCap = 0;
+    std::vector<std::wstring> reads;
 
     {
         Watchdog watchdog("backpressure test", std::chrono::seconds(60));
@@ -417,23 +450,25 @@ IC_TEST(DecodeScheduler_BackpressureBlocksAtCapAndResumes)
             const uint64_t handle = static_cast<uint64_t>(i) + 1;
             scheduler.Enqueue(MakeTask(files.thumbs[i], ImagePurpose::Thumbnail, handle, done.Callback(handle)));
         }
-        maxEntries = cache.MaxEntries();
+        // Enqueue retunes the cap synchronously; read it after the last enqueue.
+        effectiveCap = cache.MaxEntries();
+        IC_REQUIRE(effectiveCap >= 1);
+        IC_REQUIRE(effectiveCap < files.thumbs.size());
 
         {
             std::unique_lock<std::mutex> lock(gateMutex);
             IC_REQUIRE(gateCv.wait_for(lock, kWaitTimeout, [&]() { return entered; }));
         }
 
-        // Fill phase: the count must rise to at least one entry (the byte source
-        // is in effect) and then stay flat for 500 ms while 38 thumbnails are
-        // still queued, i.e. the prefetch thread is blocked on capacity.
+        // Fill phase: wait until the read count stops changing for 500 ms.
         {
             const auto deadline = std::chrono::steady_clock::now() + kWaitTimeout;
-            size_t last = 0;
+            size_t last = byteSource.ReadCount();
             auto lastChange = std::chrono::steady_clock::now();
             for (;;)
             {
-                const size_t count = cache.Count();
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                const size_t count = byteSource.ReadCount();
                 const auto now = std::chrono::steady_clock::now();
                 if (count != last)
                 {
@@ -445,20 +480,26 @@ IC_TEST(DecodeScheduler_BackpressureBlocksAtCapAndResumes)
                     break;
                 }
                 IC_REQUIRE(now < deadline);
-                std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
-            plateau = last;
+            readsWhileHeld = last;
         }
-        IC_CHECK(plateau >= 1);
-        IC_CHECK(plateau <= maxEntries);              // held by the capacity check,
-        IC_CHECK(plateau < files.thumbs.size());      // not by running out of work
+        cacheWhileHeld = cache.Count();
+
+        // Prefetch stopped at the cap: exactly `effectiveCap` files read, all of
+        // them still cached (no eviction happened), 39 thumbnails still queued,
+        // and nothing decoded while the worker was held.
+        IC_CHECK(readsWhileHeld == effectiveCap);
+        IC_CHECK(cacheWhileHeld == readsWhileHeld);
         {
             std::lock_guard<std::mutex> lock(done.mutex);
-            IC_CHECK(done.entries.empty());           // nothing decoded while held
+            IC_CHECK(done.entries.empty());
         }
+        // ...and it stays stopped: no further read starts before the release.
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        IC_CHECK(byteSource.ReadCount() == readsWhileHeld);
 
-        // Resume phase: release the worker; each completed decode erases its
-        // bytes and must wake the blocked prefetch thread.
+        // Resume phase: release the worker; each completed decode frees cache
+        // space and must wake the prefetch thread for the next read.
         {
             std::lock_guard<std::mutex> lock(gateMutex);
             released = true;
@@ -466,17 +507,28 @@ IC_TEST(DecodeScheduler_BackpressureBlocksAtCapAndResumes)
         gateCv.notify_all();
         IC_REQUIRE(done.WaitFor(files.thumbs.size()));
 
-        // Every prefetched entry is released once its decode finished.
-        const auto deadline = std::chrono::steady_clock::now() + kWaitTimeout;
-        while (cache.Count() != 0 && std::chrono::steady_clock::now() < deadline)
         {
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            const auto deadline = std::chrono::steady_clock::now() + kWaitTimeout;
+            while (cache.Count() != 0 && std::chrono::steady_clock::now() < deadline)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
         }
         IC_CHECK(cache.Count() == 0);
+        reads = byteSource.Reads();
     }
 
-    std::printf("  backpressure: cache plateaued at %zu entries (cap %zu) with %zu thumbnails queued\n",
-        plateau, maxEntries, files.thumbs.size() - 1);
+    std::printf("  backpressure: reads stopped at %zu (effective cap %zu, cached %zu) with %zu thumbnails queued; %zu reads after resume\n",
+        readsWhileHeld, effectiveCap, cacheWhileHeld, files.thumbs.size() - readsWhileHeld,
+        reads.size() - readsWhileHeld);
+
+    // Reads resumed after release and covered every file exactly once, in
+    // enqueue order (the prefetch stage is FIFO).
+    IC_REQUIRE(reads.size() == files.thumbs.size());
+    for (size_t i = 0; i < reads.size(); ++i)
+    {
+        IC_CHECK(reads[i] == files.thumbs[i]);
+    }
     IC_CHECK(done.entries.size() == files.thumbs.size());
     for (const auto& entry : done.entries)
     {
