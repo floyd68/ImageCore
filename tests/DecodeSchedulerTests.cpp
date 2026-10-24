@@ -1010,6 +1010,340 @@ IC_TEST(DecodeScheduler_TuningQueryRunsOutsideQueueMutex)
     }
 }
 
+namespace
+{
+    // Archive-like byte source: paths under `<dir>\pack.zip\` do not exist on
+    // disk and resolve to the host `<dir>\pack.zip` (which does not exist
+    // either), so a thumbnail decode can only succeed with the bytes the
+    // prefetch stage attached to its task. ReadAll maps `pack.zip\name` to the
+    // real `<dir>\name` and records every read.
+    class VirtualArchiveSource : public IPathByteSource
+    {
+    public:
+        explicit VirtualArchiveSource(const std::filesystem::path& dir)
+            : m_previous(GetPathByteSource())
+            , m_dir(dir)
+            , m_host((dir / L"pack.zip").wstring())
+        {
+            SetPathByteSource(this);
+        }
+
+        ~VirtualArchiveSource() override
+        {
+            SetPathByteSource(m_previous);
+        }
+
+        std::wstring Entry(const std::wstring& realPath) const
+        {
+            return m_host + L"\\" + std::filesystem::path(realPath).filename().wstring();
+        }
+
+        std::wstring ResolveHostPath(const std::wstring& path) const override
+        {
+            return IsVirtual(path) ? m_host : path;
+        }
+
+        std::vector<uint8_t> ReadAll(const std::wstring& path) const override
+        {
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_reads.push_back(path);
+            }
+            const std::filesystem::path real = IsVirtual(path)
+                ? m_dir / std::filesystem::path(path).filename()
+                : std::filesystem::path(path);
+            std::ifstream in(real, std::ios::binary);
+            return std::vector<uint8_t>(std::istreambuf_iterator<char>(in), {});
+        }
+
+        size_t ReadCount() const
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            return m_reads.size();
+        }
+
+    private:
+        bool IsVirtual(const std::wstring& path) const
+        {
+            return path.size() > m_host.size() && path.compare(0, m_host.size(), m_host) == 0;
+        }
+
+        IPathByteSource* m_previous;
+        std::filesystem::path m_dir;
+        std::wstring m_host;
+        mutable std::mutex m_mutex;
+        mutable std::vector<std::wstring> m_reads;
+    };
+
+    // Holds the only worker inside a full-resolution callback (no prefetch slot).
+    struct WorkerGate
+    {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool entered = false;
+        bool released = false;
+
+        std::function<void(PipelineResult&&)> Callback(Completions& done, uint64_t handle)
+        {
+            return [this, inner = done.Callback(handle)](PipelineResult&& result) mutable
+            {
+                {
+                    std::unique_lock<std::mutex> lock(mutex);
+                    entered = true;
+                    cv.notify_all();
+                    cv.wait(lock, [&]() { return released; });
+                }
+                inner(std::move(result));
+            };
+        }
+
+        bool WaitEntered()
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            return cv.wait_for(lock, kWaitTimeout, [&]() { return entered; });
+        }
+
+        void Release()
+        {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                released = true;
+            }
+            cv.notify_all();
+        }
+    };
+
+    HRESULT DeliveredHr(Completions& done, uint64_t handle)
+    {
+        std::lock_guard<std::mutex> lock(done.mutex);
+        for (const auto& entry : done.entries)
+        {
+            if (entry.handle == handle)
+            {
+                return entry.hr;
+            }
+        }
+        return E_PENDING;
+    }
+}
+
+IC_TEST(DecodeScheduler_CanceledSamePathTaskKeepsNewerArchiveBytes)
+{
+    // Regression: two queued thumbnail tasks for the same archive entry shared
+    // one path-keyed cache entry. Dropping the canceled older task erased it,
+    // so the newer task's decode found no bytes and failed on the virtual path.
+    const auto& files = Files();
+    FileByteCache& cache = FileByteCache::Instance();
+    Completions done;
+    WorkerGate gate;
+    {
+        Watchdog watchdog("same-path archive bytes", std::chrono::seconds(60));
+        VirtualArchiveSource source(files.dir);
+        DecodeScheduler scheduler;
+        scheduler.SetThreadCount(1);
+        struct ReleaseOnExit { WorkerGate& g; ~ReleaseOnExit() { g.Release(); } } releaseOnExit { gate };
+
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 1, gate.Callback(done, 1))));
+        IC_REQUIRE(gate.WaitEntered());
+
+        const std::wstring entry = source.Entry(files.thumbs[5]);
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(entry, ImagePurpose::Thumbnail, 2, done.Callback(2))));
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(entry, ImagePurpose::Thumbnail, 3, done.Callback(3))));
+        // Both tasks have been prefetched (the second reused the first one's bytes).
+        IC_REQUIRE(WaitUntil([&]() { return scheduler.PrefetchedTaskCount() == 2; }));
+        IC_CHECK(source.ReadCount() == 1);
+
+        scheduler.Cancel(2);
+        IC_CHECK(scheduler.PrefetchedTaskCount() == 1);
+        gate.Release();
+
+        IC_REQUIRE(WaitUntil([&]() { return DeliveredHr(done, 3) != E_PENDING; }));
+        IC_CHECK(SUCCEEDED(DeliveredHr(done, 3)));
+        IC_REQUIRE(WaitUntil([&]() { return scheduler.LiveRequestCount() == 0 && scheduler.PrefetchedTaskCount() == 0; }));
+        IC_REQUIRE(WaitUntil([&]() { return cache.Count() == 0; }));
+    }
+    IC_CHECK(DeliveredHr(done, 2) == E_PENDING);
+}
+
+IC_TEST(DecodeScheduler_CancelReleasesPrefetchSlotsImmediately)
+{
+    // With the only worker busy, prefetch fills its slots and stops. Canceling
+    // the prefetched tasks must free their slots at once, so prefetch continues
+    // without waiting for a worker to reach and drop the canceled tasks.
+    const auto& files = Files();
+    Completions done;
+    WorkerGate gate;
+    size_t held = 0;
+    {
+        Watchdog watchdog("cancel releases slots", std::chrono::seconds(60));
+        ScopedFileByteSource byteSource;
+        DecodeScheduler scheduler;
+        scheduler.SetThreadCount(1);
+        struct ReleaseOnExit { WorkerGate& g; ~ReleaseOnExit() { g.Release(); } } releaseOnExit { gate };
+
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 1, gate.Callback(done, 1))));
+        IC_REQUIRE(gate.WaitEntered());
+
+        constexpr uint64_t kFirst = 10;
+        constexpr uint64_t kCount = 20;
+        for (uint64_t i = 0; i < kCount; ++i)
+        {
+            IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[i], ImagePurpose::Thumbnail, kFirst + i,
+                done.Callback(kFirst + i))));
+        }
+
+        // Wait until prefetch stops at its cap (no read for 300 ms).
+        {
+            size_t last = byteSource.ReadCount();
+            auto lastChange = std::chrono::steady_clock::now();
+            IC_REQUIRE(WaitUntil([&]()
+            {
+                const size_t count = byteSource.ReadCount();
+                const auto now = std::chrono::steady_clock::now();
+                if (count != last)
+                {
+                    last = count;
+                    lastChange = now;
+                }
+                return last >= 1 && now - lastChange >= std::chrono::milliseconds(300);
+            }));
+            held = last;
+        }
+        IC_REQUIRE(held < kCount);
+        IC_CHECK(scheduler.PrefetchedTaskCount() == held);
+
+        // Cancel the prefetched tasks; the worker is still held.
+        for (uint64_t i = 0; i < held; ++i)
+        {
+            scheduler.Cancel(kFirst + i);
+        }
+        // (No slot-count check here: the freed slots wake prefetch, which may
+        // legitimately refill them before any count could be observed.)
+        IC_CHECK(WaitUntil([&]() { return byteSource.ReadCount() >= (std::min)(2 * held, static_cast<size_t>(kCount)); }));
+
+        gate.Release();
+        IC_REQUIRE(done.WaitFor(1 + kCount - held));
+        IC_REQUIRE(WaitUntil([&]() { return scheduler.LiveRequestCount() == 0 && scheduler.PrefetchedTaskCount() == 0; }));
+    }
+
+    std::lock_guard<std::mutex> lock(done.mutex);
+    IC_CHECK(done.entries.size() == 1 + 20 - held);
+    for (const auto& entry : done.entries)
+    {
+        IC_CHECK(entry.handle == 1 || entry.handle >= 10 + held);
+        IC_CHECK(SUCCEEDED(entry.hr));
+    }
+}
+
+IC_TEST(DecodeScheduler_SamePathCancelRequeueStressKeepsArchiveBytes)
+{
+    // Rapid cancel/re-request of a few archive entries on several workers, like
+    // thumbnail tiles being reused while scrolling. Every delivered result must
+    // succeed (a lost-bytes decode fails on the virtual path), and all request,
+    // prefetch and cache state must drain.
+    const auto& files = Files();
+    FileByteCache& cache = FileByteCache::Instance();
+    Completions done;
+    {
+        Watchdog watchdog("same-path stress", std::chrono::seconds(90));
+        VirtualArchiveSource source(files.dir);
+        DecodeScheduler scheduler;
+        scheduler.SetThreadCount(3);
+
+        constexpr uint64_t kRounds = 400;
+        std::vector<uint64_t> lastFor(4, 0);
+        for (uint64_t round = 0; round < kRounds; ++round)
+        {
+            const size_t slot = static_cast<size_t>(round % 4);
+            const uint64_t handle = round + 1;
+            IC_REQUIRE(scheduler.Enqueue(MakeTask(source.Entry(files.thumbs[slot]), ImagePurpose::Thumbnail, handle,
+                done.Callback(handle))));
+            // Tile reuse: usually cancel the previous request for this entry.
+            if (lastFor[slot] != 0 && round % 3 != 0)
+            {
+                scheduler.Cancel(lastFor[slot]);
+            }
+            lastFor[slot] = handle;
+            if (round % 8 == 0)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+
+        // The last request per entry was never canceled and must arrive.
+        for (const uint64_t handle : lastFor)
+        {
+            IC_REQUIRE(WaitUntil([&]() { return DeliveredHr(done, handle) != E_PENDING; }));
+        }
+        IC_REQUIRE(WaitUntil([&]() { return scheduler.LiveRequestCount() == 0 && scheduler.PrefetchedTaskCount() == 0; }));
+        IC_REQUIRE(WaitUntil([&]() { return cache.Count() == 0; }));
+    }
+
+    std::lock_guard<std::mutex> lock(done.mutex);
+    size_t failures = 0;
+    for (const auto& entry : done.entries)
+    {
+        if (FAILED(entry.hr))
+        {
+            ++failures;
+        }
+    }
+    std::printf("  same-path stress: %zu results delivered, %zu failed\n", done.entries.size(), failures);
+    IC_CHECK(failures == 0);
+}
+
+IC_TEST(DecodeScheduler_BulkCancelOfLargeBacklogIsLinear)
+{
+    // A consumer that queues a request per folder entry (thousands) and cancels
+    // them on navigation must not pay a queue scan per Cancel. With the only
+    // worker held and prefetch stopped at its cap, the backlog stays queued while
+    // it is canceled; 8x more requests must cost about 8x more time, far from the
+    // 64x of a per-Cancel scan.
+    const auto& files = Files();
+    Completions done;
+    WorkerGate gate;
+    double smallMs = 0.0;
+    double largeMs = 0.0;
+    {
+        Watchdog watchdog("bulk cancel", std::chrono::seconds(120));
+        DecodeScheduler scheduler;
+        scheduler.SetThreadCount(1);
+        struct ReleaseOnExit { WorkerGate& g; ~ReleaseOnExit() { g.Release(); } } releaseOnExit { gate };
+
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 1, gate.Callback(done, 1))));
+        IC_REQUIRE(gate.WaitEntered());
+
+        auto cancelBacklog = [&](uint64_t first, uint64_t count) -> double
+        {
+            for (uint64_t i = 0; i < count; ++i)
+            {
+                scheduler.Enqueue(MakeTask(files.thumbs[i % files.thumbs.size()], ImagePurpose::Thumbnail,
+                    first + i, done.Callback(first + i)));
+            }
+            const auto start = std::chrono::steady_clock::now();
+            for (uint64_t i = 0; i < count; ++i)
+            {
+                scheduler.Cancel(first + i);
+            }
+            return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        };
+
+        smallMs = cancelBacklog(100, 4000);
+        largeMs = cancelBacklog(100000, 32000);
+        IC_CHECK(scheduler.LiveRequestCount() == 0);
+
+        gate.Release();
+        IC_REQUIRE(done.WaitFor(1));
+        IC_REQUIRE(WaitUntil([&]() { return scheduler.PrefetchedTaskCount() == 0; }));
+    }
+
+    std::printf("  bulk cancel: 4000 queued in %.2f ms, 32000 queued in %.2f ms\n", smallMs, largeMs);
+    // Generous linear bound with a floor for timer noise on tiny durations.
+    IC_CHECK(largeMs < (std::max)(24.0 * smallMs, 50.0));
+    std::lock_guard<std::mutex> lock(done.mutex);
+    IC_CHECK(done.entries.size() == 1);
+}
+
 // Kept last: it creates and destroys many schedulers.
 IC_TEST(DecodeScheduler_ShutdownCyclesNeverHang)
 {

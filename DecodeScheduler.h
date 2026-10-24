@@ -5,6 +5,7 @@
 #include <thread>
 #include <vector>
 #include <queue>
+#include <cstdint>
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
@@ -14,11 +15,20 @@
 
 namespace ImageCore
 {
-    // Per-request cancellation state, owned by the task (and by the scheduler's
-    // live-request table while the task is queued or decoding).
+    // Per-request state, owned by the task (and by the scheduler's live-request
+    // table while the task is queued or decoding). The prefetch fields are guarded
+    // by the scheduler's queue mutex.
     struct DecodeRequestState
     {
         std::atomic<bool> canceled { false };
+
+        // Thumbnail/preview bytes read by the prefetch stage. Owned by this request,
+        // so no other request (canceled, finished, or same-path) can take them away.
+        std::shared_ptr<const std::vector<uint8_t>> prefetched;
+        bool holdsPrefetchSlot { false };  // counted for prefetch backpressure
+        bool decoding { false };           // taken by a worker
+        std::wstring prefetchVolume;
+        std::wstring prefetchPath;
     };
 
     // Decode task
@@ -69,7 +79,9 @@ namespace ImageCore
         // once the scheduler has been shut down.
         bool Enqueue(DecodeTask task);
 
-        // Best-effort cancel. A queued task is dropped without a callback; a
+        // Best-effort cancel, O(1). A queued task releases its prefetched bytes
+        // and prefetch slot at once and is dropped without a callback when a
+        // thread reaches it; a
         // decode in progress cannot be interrupted, but its callback is suppressed
         // if the cancel is observed before delivery starts. A callback that has
         // already been selected for delivery can still run concurrently with, or
@@ -90,6 +102,10 @@ namespace ImageCore
         // Tests/diagnostics: volumes with recorded prefetch tuning.
         size_t VolumeProfileCount() const;
 
+        // Tests/diagnostics: tasks currently holding prefetched bytes (the
+        // quantity bounded by prefetch backpressure).
+        size_t PrefetchedTaskCount() const;
+
     private:
         enum class WorkerKind
         {
@@ -104,6 +120,11 @@ namespace ImageCore
         // Removes `task` from the live-request table (if it is still the entry
         // for its handle). Requires m_queueMutex.
         void Finish_NoLock(const DecodeTask& task);
+
+        // Gives back the request's prefetch slot (backpressure count) and drops
+        // its bytes. Returns true if a slot was released; the caller then notifies
+        // m_queueCondition after unlocking. Requires m_queueMutex.
+        bool ReleasePrefetch_NoLock(DecodeRequestState& state);
 
         // Cached per-volume seek-penalty query. Called without m_queueMutex: the
         // storage query opens the volume device and can block.
@@ -131,6 +152,11 @@ namespace ImageCore
         // Guarded by m_queueMutex.
         std::unordered_map<std::wstring, VolumeIoProfile> m_volumeProfiles {};
         size_t m_globalPrefetchCap { 4 };
+
+        // Tasks holding prefetched bytes, in total and per volume (guarded by
+        // m_queueMutex). The prefetch stage waits while these are at their caps.
+        size_t m_prefetchedTotal { 0 };
+        std::unordered_map<std::wstring, size_t> m_prefetchedByVolume {};
 
         // Queued or decoding requests by handle (guarded by m_queueMutex).
         std::unordered_map<uint64_t, std::shared_ptr<DecodeRequestState>> m_liveRequests {};
