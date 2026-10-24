@@ -58,9 +58,11 @@ It focuses on high-throughput DDS workloads (thumbnails + full-resolution) while
 ### Thumbnail / Preview
 
 1) Request goes through `ThumbPrefetchThread`
-2) File bytes are prefetched (sequential disk reads), stored in `FileByteCache`
+2) File bytes are prefetched (sequential disk reads) and attached to the task, which owns them; `FileByteCache` only de-duplicates reads for same-path tasks
 3) Task is pushed to background queue
-4) Background worker decodes using the prefetched bytes when available
+4) Background worker decodes using the task's prefetched bytes when available
+
+Backpressure counts tasks holding prefetched bytes (global and per-volume caps). Canceling a queued task removes it immediately and releases its bytes and slot.
 
 ## DDS specifics
 

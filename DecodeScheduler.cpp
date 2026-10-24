@@ -199,6 +199,32 @@ namespace ImageCore
         }
     }
 
+    bool DecodeScheduler::ReleasePrefetch_NoLock(DecodeTask& task)
+    {
+        task.prefetched.reset();
+        if (!task.holdsPrefetchSlot)
+        {
+            return false;
+        }
+        task.holdsPrefetchSlot = false;
+        if (m_prefetchedTotal > 0)
+        {
+            --m_prefetchedTotal;
+        }
+        auto it = m_prefetchedByVolume.find(task.prefetchVolume);
+        if (it != m_prefetchedByVolume.end() && --it->second == 0)
+        {
+            m_prefetchedByVolume.erase(it);
+        }
+        return true;
+    }
+
+    size_t DecodeScheduler::PrefetchedTaskCount() const
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        return m_prefetchedTotal;
+    }
+
     DecodeScheduler::~DecodeScheduler()
     {
         Shutdown();
@@ -280,7 +306,7 @@ namespace ImageCore
             // FullResolution is user-interactive (main image). Prioritize it.
             if (fullResolution)
             {
-                m_highQueue.push(std::move(task));
+                m_highQueue.push_back(std::move(task));
             }
             else
             {
@@ -301,7 +327,7 @@ namespace ImageCore
                 FileByteCache::Instance().SetMaxEntries(m_globalPrefetchCap);
 
                 // Thumbnail/Preview: go through serialized I/O prefetch stage first.
-                m_thumbIoQueue.push(std::move(task));
+                m_thumbIoQueue.push_back(std::move(task));
             }
         }
         // Multiple threads wait on the same condition_variable with different queue predicates
@@ -320,13 +346,53 @@ namespace ImageCore
 
         // The flag lives with the task; the live-request entry is dropped now, so
         // a cancel after completion (or of an unknown handle) never accumulates.
-        // The task itself leaves its queue when a thread next reaches it.
-        std::lock_guard<std::mutex> lock(m_queueMutex);
-        auto it = m_liveRequests.find(handle);
-        if (it != m_liveRequests.end())
+        // A task still waiting in a queue is removed at once: its prefetched bytes
+        // and prefetch slot are released immediately instead of when a worker
+        // eventually reaches it, so canceled work cannot hold back prefetch. A
+        // task already being read or decoded sees the flag when it finishes.
+        std::vector<DecodeTask> removed;
+        bool releasedSlot = false;
         {
-            it->second->canceled.store(true);
+            std::lock_guard<std::mutex> lock(m_queueMutex);
+            auto it = m_liveRequests.find(handle);
+            if (it == m_liveRequests.end())
+            {
+                return;
+            }
+            const std::shared_ptr<DecodeRequestState> state = it->second;
+            state->canceled.store(true);
             m_liveRequests.erase(it);
+
+            for (auto* queue : { &m_highQueue, &m_thumbIoQueue, &m_backgroundQueue })
+            {
+                for (auto q = queue->begin(); q != queue->end();)
+                {
+                    if (q->state == state)
+                    {
+                        releasedSlot = ReleasePrefetch_NoLock(*q) || releasedSlot;
+                        removed.push_back(std::move(*q));
+                        q = queue->erase(q);
+                    }
+                    else
+                    {
+                        ++q;
+                    }
+                }
+            }
+        }
+
+        // The removed tasks no longer hold their bytes; drop shared cache entries
+        // that nothing else uses, then wake the prefetch stage if a slot opened.
+        for (const DecodeTask& task : removed)
+        {
+            if (task.request.purpose != ImagePurpose::FullResolution)
+            {
+                FileByteCache::Instance().EraseIfUnshared(task.request.source);
+            }
+        }
+        if (releasedSlot)
+        {
+            m_queueCondition.notify_all();
         }
     }
 
@@ -374,9 +440,11 @@ namespace ImageCore
         // cannot inherit stale volume tuning or orphaned prefetched bytes.
         {
             std::lock_guard<std::mutex> lock(m_queueMutex);
-            m_highQueue = {};
-            m_thumbIoQueue = {};
-            m_backgroundQueue = {};
+            m_highQueue.clear();
+            m_thumbIoQueue.clear();
+            m_backgroundQueue.clear();
+            m_prefetchedTotal = 0;
+            m_prefetchedByVolume.clear();
             m_liveRequests.clear();
             m_volumeProfiles.clear();
             m_globalPrefetchCap = 4;
@@ -475,7 +543,7 @@ namespace ImageCore
                         continue;
                     }
                     task = std::move(m_highQueue.front());
-                    m_highQueue.pop();
+                    m_highQueue.pop_front();
                 }
                 else
                 {
@@ -485,12 +553,12 @@ namespace ImageCore
                     if (!m_highQueue.empty())
                     {
                         task = std::move(m_highQueue.front());
-                        m_highQueue.pop();
+                        m_highQueue.pop_front();
                     }
                     else if (!m_backgroundQueue.empty())
                     {
                         task = std::move(m_backgroundQueue.front());
-                        m_backgroundQueue.pop();
+                        m_backgroundQueue.pop_front();
                         tookBackgroundTask = true;
                     }
                     else
@@ -502,16 +570,16 @@ namespace ImageCore
                 // If canceled while sitting in the queue, skip the task.
                 if (task.state && task.state->canceled.load())
                 {
+                    // Normally removed by Cancel already; release the bytes and the
+                    // prefetch slot so backpressure cannot stall on dropped work.
                     Finish_NoLock(task);
-                    // IMPORTANT:
-                    // Thumbnail/Preview requests may have already prefetched bytes into FileByteCache.
-                    // If we drop the task here (before decode), we must free any unshared prefetched bytes,
-                    // otherwise the prefetch thread can deadlock on cache backpressure and thumbnails
-                    // will get stuck "loading" forever after rapid folder navigation.
+                    if (ReleasePrefetch_NoLock(task))
+                    {
+                        m_queueCondition.notify_all();
+                    }
                     if (task.request.purpose != ImagePurpose::FullResolution)
                     {
                         FileByteCache::Instance().EraseIfUnshared(task.request.source);
-                        m_queueCondition.notify_all();
                     }
                     continue;
                 }
@@ -531,8 +599,10 @@ namespace ImageCore
 
                 if (task.request.purpose != ImagePurpose::FullResolution)
                 {
-                    // Thumbnail/Preview: try cache first
-                    bytesHold = FileByteCache::Instance().Get(task.request.source);
+                    // Thumbnail/Preview: the bytes the prefetch stage attached to this
+                    // task (never re-looked-up by path, so a same-path task that was
+                    // canceled or finished cannot have taken them away).
+                    bytesHold = task.prefetched;
                     if (bytesHold && !bytesHold->empty())
                     {
                         input.bytes = std::span<const uint8_t>(bytesHold->data(), bytesHold->size());
@@ -589,21 +659,23 @@ namespace ImageCore
                 task.callback(std::move(result));  // delivered via move
             }
 
-            // Thumbnail/Preview prefetched bytes are transient; free them once decode finishes if unshared.
+            // Thumbnail/Preview prefetched bytes are transient: give back the
+            // prefetch slot and drop the shared cache entry if nothing else uses it.
             if (task.request.purpose != ImagePurpose::FullResolution)
             {
-                // Release our local hold before attempting EraseIfUnshared.
                 bytesHold.reset();
-                FileByteCache::Instance().EraseIfUnshared(task.request.source);
-                // Wake the prefetch thread if it was waiting for cache space. Its
-                // predicate reads the cache counts under m_queueMutex, so take the
-                // mutex before notifying; otherwise the notification can land while
-                // the prefetch thread still holds the mutex between evaluating the
-                // predicate and blocking, and is lost.
+                bool released = false;
                 {
+                    // The prefetch stage's wait predicate reads the slot counts under
+                    // m_queueMutex, so they change under it and the notify follows.
                     std::lock_guard<std::mutex> lock(m_queueMutex);
+                    released = ReleasePrefetch_NoLock(task);
                 }
-                m_queueCondition.notify_all();
+                FileByteCache::Instance().EraseIfUnshared(task.request.source);
+                if (released)
+                {
+                    m_queueCondition.notify_all();
+                }
             }
 
             setBackgroundMode(idleInBackground);
@@ -653,7 +725,7 @@ namespace ImageCore
                 }
 
                 task = std::move(m_thumbIoQueue.front());
-                m_thumbIoQueue.pop();
+                m_thumbIoQueue.pop_front();
 
                 if (task.state && task.state->canceled.load())
                 {
@@ -666,8 +738,10 @@ namespace ImageCore
             if (task.request.purpose == ImagePurpose::FullResolution)
             {
                 // Should never happen, but push to high queue just in case.
-                std::lock_guard<std::mutex> lock(m_queueMutex);
-                m_highQueue.push(std::move(task));
+                {
+                    std::lock_guard<std::mutex> lock(m_queueMutex);
+                    m_highQueue.push_back(std::move(task));
+                }
                 m_queueCondition.notify_all();
                 continue;
             }
@@ -684,7 +758,8 @@ namespace ImageCore
                 }
             }
 
-            // Backpressure without Sleep: wait until cache has room for this volume.
+            // Backpressure without Sleep: wait until fewer tasks hold prefetched bytes
+            // than the global and per-volume caps allow.
             {
                 std::unique_lock<std::mutex> lock(m_queueMutex);
                 m_queueCondition.wait(lock, [this, vol, volCap]
@@ -693,9 +768,9 @@ namespace ImageCore
                     {
                         return true;
                     }
-                    const size_t total = FileByteCache::Instance().Count();
-                    const size_t volCount = FileByteCache::Instance().CountForVolume(vol);
-                    return total < m_globalPrefetchCap && volCount < volCap;
+                    auto it = m_prefetchedByVolume.find(vol);
+                    const size_t volCount = (it != m_prefetchedByVolume.end()) ? it->second : 0;
+                    return m_prefetchedTotal < m_globalPrefetchCap && volCount < volCap;
                 });
                 if (m_shutdown)
                 {
@@ -703,21 +778,49 @@ namespace ImageCore
                 }
             }
 
-            // Read file bytes sequentially on this single thread.
-            // If already prefetched (e.g., duplicate task), skip disk I/O.
-            if (!FileByteCache::Instance().Get(task.request.source))
+            // Read file bytes sequentially on this single thread. The shared cache
+            // only de-duplicates reads for same-path tasks; the bytes are attached
+            // to this task, which owns them from here on.
+            std::shared_ptr<const std::vector<uint8_t>> bytes = FileByteCache::Instance().Get(task.request.source);
+            if (!bytes)
             {
-                auto bytes = ReadWholeFileBytes(task.request.source);
-                if (bytes)
+                auto read = ReadWholeFileBytes(task.request.source);
+                if (read)
                 {
-                    FileByteCache::Instance().Put(task.request.source, bytes);
+                    FileByteCache::Instance().Put(task.request.source, read);
+                    bytes = std::move(read);
                 }
             }
 
-            // Schedule CPU decode work regardless; decoder can fall back to file path if prefetch failed.
+            // Schedule CPU decode work regardless; the decoder falls back to the file
+            // path if the prefetch failed.
+            bool canceled = false;
             {
                 std::lock_guard<std::mutex> lock(m_queueMutex);
-                m_backgroundQueue.push(std::move(task));
+                canceled = task.state && task.state->canceled.load();
+                if (canceled)
+                {
+                    // Canceled while its bytes were being read (it was in no queue).
+                    Finish_NoLock(task);
+                }
+                else
+                {
+                    if (bytes)
+                    {
+                        task.prefetched = std::move(bytes);
+                        task.holdsPrefetchSlot = true;
+                        task.prefetchVolume = vol;
+                        ++m_prefetchedTotal;
+                        ++m_prefetchedByVolume[vol];
+                    }
+                    m_backgroundQueue.push_back(std::move(task));
+                }
+            }
+            if (canceled)
+            {
+                bytes.reset();
+                FileByteCache::Instance().EraseIfUnshared(task.request.source);
+                continue;
             }
             m_queueCondition.notify_all();
         }
