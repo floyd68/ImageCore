@@ -87,13 +87,45 @@ namespace
         HRESULT hr = S_FALSE;
     };
 
-    // Enqueues a full-resolution decode of `path`. `callbackDelay` postpones the
-    // callback's write to the shared state (to simulate a late completion).
+    // Holds a callback closed until the test opens it, so a "late completion"
+    // is ordered explicitly rather than by timing. Shared with the callback.
+    struct Gate
+    {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool open = false;
+        bool callbackWaiting = false;
+
+        void Open()
+        {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                open = true;
+            }
+            cv.notify_all();
+        }
+    };
+
+    // Opens the gate on every exit path. Declare it after the scheduler so it
+    // runs before the scheduler destructor joins the worker; otherwise a failed
+    // IC_REQUIRE would leave the worker blocked in the callback and the join
+    // would never return.
+    struct GateOpener
+    {
+        std::shared_ptr<Gate> gate;
+        ~GateOpener()
+        {
+            gate->Open();
+        }
+    };
+
+    // Enqueues a full-resolution decode of `path`. With a `gate`, the callback
+    // blocks until the gate is opened before it records the result.
     std::shared_ptr<Completion> StartDecode(
         DecodeScheduler& scheduler,
         const std::wstring& path,
         uint64_t handle,
-        std::chrono::milliseconds callbackDelay = std::chrono::milliseconds(0))
+        std::shared_ptr<Gate> gate = nullptr)
     {
         auto completion = std::make_shared<Completion>();
 
@@ -101,11 +133,14 @@ namespace
         task.request = ImageRequest(path, ImagePurpose::FullResolution);
         task.request.allowGpuCompressedDDS = false;
         task.handle = handle;
-        task.callback = [completion, callbackDelay](PipelineResult&& result)
+        task.callback = [completion, gate](PipelineResult&& result)
         {
-            if (callbackDelay.count() > 0)
+            if (gate)
             {
-                std::this_thread::sleep_for(callbackDelay);
+                std::unique_lock<std::mutex> lock(gate->mutex);
+                gate->callbackWaiting = true;
+                gate->cv.notify_all();
+                gate->cv.wait(lock, [&]() { return gate->open; });
             }
             std::lock_guard<std::mutex> lock(completion->mutex);
             completion->hr = result.hr;
@@ -200,17 +235,27 @@ IC_TEST(Log_TimedOutWaitKeepsCompletionStateAlive)
 {
     // A completion that arrives after the test stopped waiting must land in
     // state that is still alive (shared with the callback), not in a destroyed
-    // stack frame. The callback is delayed past a deliberately short wait.
+    // stack frame. The callback is held at a gate, so the wait is guaranteed to
+    // time out first; the gate is opened only after the timeout assertions.
     RegisterBuiltInDecoders();
+    auto gate = std::make_shared<Gate>();
     DecodeScheduler scheduler;
     scheduler.SetThreadCount(1);
+    GateOpener openOnExit { gate };
 
-    auto late = StartDecode(scheduler, MissingNonAcpPath(), 1, std::chrono::milliseconds(300));
+    auto late = StartDecode(scheduler, MissingNonAcpPath(), 1, gate);
+
+    // The callback has started and is parked at the gate.
+    {
+        std::unique_lock<std::mutex> lock(gate->mutex);
+        IC_REQUIRE(gate->cv.wait_for(lock, std::chrono::seconds(10), [&]() { return gate->callbackWaiting; }));
+    }
     IC_CHECK(WaitDecode(late, std::chrono::milliseconds(20)) == S_FALSE);   // timed out
-    // The helper's caller moves on; the callback still holds the state.
+    // The caller has given up waiting; the parked callback still holds the state.
     IC_CHECK(late.use_count() >= 2);
 
     // The late completion arrives and is recorded in the shared state.
+    gate->Open();
     IC_CHECK(FAILED(WaitDecode(late, std::chrono::seconds(10))));
 
     // The worker is unaffected and the callback released its reference.
