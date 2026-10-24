@@ -185,7 +185,7 @@ namespace ImageCore
     {
         Shutdown();
 
-        m_threadCount = std::max<size_t>(1, count);
+        m_threadCount = std::clamp<size_t>(count, 1, kMaxDecodeWorkers);
         m_shutdown = false;
 
         if (m_threadCount == 1)
@@ -200,10 +200,8 @@ namespace ImageCore
             // Start 1 high-priority worker (interactive full-res), rest background (thumbnails).
             // This prevents thumbnail backlogs from blocking main image loads.
             const size_t highCount = 1;
-            // Background workers are CPU-bound in the thumbnail pipeline (I/O is serialized separately).
-            // Keep a reasonable cap to avoid over-subscribing on decode-heavy workloads.
-            const size_t maxBgCount = 4;
-            const size_t bgCount = (std::min)(m_threadCount - highCount, maxBgCount);
+            // m_threadCount is already clamped to kMaxDecodeWorkers (1 high + 4 background).
+            const size_t bgCount = m_threadCount - highCount;
 
             for (size_t i = 0; i < highCount; ++i)
             {

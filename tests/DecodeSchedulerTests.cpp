@@ -156,9 +156,12 @@ IC_TEST(DecodeScheduler_WorkerCountMatchesConfiguration)
     scheduler.SetThreadCount(3);
     IC_CHECK(scheduler.WorkerCount() == 3);
 
-    // One dedicated high-priority worker plus at most four background workers.
-    scheduler.SetThreadCount(10);
-    IC_CHECK(scheduler.WorkerCount() == 5);
+    // Requests above the cap are clamped (one dedicated high-priority worker plus
+    // at most four background workers).
+    scheduler.SetThreadCount(DecodeScheduler::kMaxDecodeWorkers);
+    IC_CHECK(scheduler.WorkerCount() == DecodeScheduler::kMaxDecodeWorkers);
+    scheduler.SetThreadCount(DecodeScheduler::kMaxDecodeWorkers + 5);
+    IC_CHECK(scheduler.WorkerCount() == DecodeScheduler::kMaxDecodeWorkers);
 
     scheduler.SetThreadCount(0);
     IC_CHECK(scheduler.WorkerCount() == 1);
@@ -229,9 +232,29 @@ IC_TEST(DecodeScheduler_SingleWorkerPrefersQueuedFullResolution)
     bool entered = false;
     bool released = false;
 
+    // Opens the gate on every exit path. Declared after `scheduler` so it runs
+    // before the scheduler destructor joins the worker; otherwise a failed
+    // IC_REQUIRE would leave the worker blocked in gatedCallback and the join
+    // would never return.
+    struct GateRelease
+    {
+        std::mutex& mutex;
+        std::condition_variable& cv;
+        bool& flag;
+        ~GateRelease()
+        {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                flag = true;
+            }
+            cv.notify_all();
+        }
+    };
+
     {
         DecodeScheduler scheduler;
         scheduler.SetThreadCount(1);
+        GateRelease releaseOnExit { gateMutex, gateCv, released };
 
         auto gatedCallback = [&, inner = done.Callback(1)](PipelineResult&& result) mutable
         {

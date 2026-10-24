@@ -25,3 +25,5 @@ if(MSVC)
 endif()
 
 add_test(NAME ImageCore.DecodeScheduler COMMAND ImageCoreTests DecodeScheduler_)
+# Safety net only: every wait inside the tests is bounded at 10 s.
+set_tests_properties(ImageCore.DecodeScheduler PROPERTIES TIMEOUT 120)
