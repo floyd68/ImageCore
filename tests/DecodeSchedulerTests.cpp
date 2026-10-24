@@ -1,6 +1,8 @@
 #include "TestHarness.h"
 
 #include "DecodeScheduler.h"
+#include "FileByteCache.h"
+#include "IPathByteSource.h"
 #include "ImageCore.h"
 
 #include <windows.h>
@@ -10,6 +12,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <mutex>
 #include <cstdio>
 #include <string>
@@ -161,6 +164,58 @@ namespace
         std::thread m_thread;
     };
 
+    // Opens a worker gate on every exit path. Declare it after the scheduler so
+    // it runs before the scheduler destructor joins the worker; otherwise a
+    // failed IC_REQUIRE would leave the worker blocked in the gated callback and
+    // the join would never return.
+    struct GateRelease
+    {
+        std::mutex& mutex;
+        std::condition_variable& cv;
+        bool& flag;
+        ~GateRelease()
+        {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                flag = true;
+            }
+            cv.notify_all();
+        }
+    };
+
+    // Filesystem byte source for the tests. Without one, the prefetch stage reads
+    // nothing (ReadWholeFileBytes returns null), FileByteCache stays empty and the
+    // capacity wait never blocks. Declare it before the scheduler so it outlives
+    // every scheduler thread; the previous source is restored on destruction.
+    class ScopedFileByteSource : public IPathByteSource
+    {
+    public:
+        ScopedFileByteSource()
+            : m_previous(GetPathByteSource())
+        {
+            SetPathByteSource(this);
+        }
+
+        ~ScopedFileByteSource() override
+        {
+            SetPathByteSource(m_previous);
+        }
+
+        std::wstring ResolveHostPath(const std::wstring& path) const override
+        {
+            return path;
+        }
+
+        std::vector<uint8_t> ReadAll(const std::wstring& path) const override
+        {
+            std::ifstream in(std::filesystem::path(path), std::ios::binary);
+            return std::vector<uint8_t>(std::istreambuf_iterator<char>(in), {});
+        }
+
+    private:
+        IPathByteSource* m_previous;
+    };
+
     DecodeTask MakeTask(const std::wstring& path, ImagePurpose purpose, uint64_t handle,
         std::function<void(PipelineResult&&)> callback)
     {
@@ -271,25 +326,6 @@ IC_TEST(DecodeScheduler_SingleWorkerPrefersQueuedFullResolution)
     bool entered = false;
     bool released = false;
 
-    // Opens the gate on every exit path. Declared after `scheduler` so it runs
-    // before the scheduler destructor joins the worker; otherwise a failed
-    // IC_REQUIRE would leave the worker blocked in gatedCallback and the join
-    // would never return.
-    struct GateRelease
-    {
-        std::mutex& mutex;
-        std::condition_variable& cv;
-        bool& flag;
-        ~GateRelease()
-        {
-            {
-                std::lock_guard<std::mutex> lock(mutex);
-                flag = true;
-            }
-            cv.notify_all();
-        }
-    };
-
     {
         DecodeScheduler scheduler;
         scheduler.SetThreadCount(1);
@@ -339,27 +375,108 @@ IC_TEST(DecodeScheduler_SingleWorkerPrefersQueuedFullResolution)
     }
 }
 
-IC_TEST(DecodeScheduler_BackpressureBeyondPrefetchCapCompletes)
+IC_TEST(DecodeScheduler_BackpressureBlocksAtCapAndResumes)
 {
-    // More thumbnails than the prefetch cap, one worker: the prefetch thread must
-    // be woken every time a decode frees cache space. A lost wakeup leaves it
-    // asleep with queued work, which shows up here as a bounded-wait failure.
+    // The prefetch thread fills FileByteCache up to the effective cap and then
+    // blocks until a decode frees space. With the only decode worker held inside
+    // a callback, the cache must fill to the cap and stay there (blocked); once
+    // the worker is released, every decode must wake the prefetch thread. A lost
+    // cache-space wakeup leaves the remaining thumbnails queued forever, which
+    // shows up here as a bounded-wait failure.
     const auto& files = Files();
+    FileByteCache& cache = FileByteCache::Instance();
     Completions done;
+
+    std::mutex gateMutex;
+    std::condition_variable gateCv;
+    bool entered = false;
+    bool released = false;
+    size_t plateau = 0;
+    size_t maxEntries = 0;
+
     {
         Watchdog watchdog("backpressure test", std::chrono::seconds(60));
+        ScopedFileByteSource byteSource;
         DecodeScheduler scheduler;
         scheduler.SetThreadCount(1);
+        GateRelease releaseOnExit { gateMutex, gateCv, released };
 
-        uint64_t handle = 0;
-        for (const auto& path : files.thumbs)
+        auto gatedCallback = [&, inner = done.Callback(1)](PipelineResult&& result) mutable
         {
-            ++handle;
-            scheduler.Enqueue(MakeTask(path, ImagePurpose::Thumbnail, handle, done.Callback(handle)));
+            {
+                std::unique_lock<std::mutex> lock(gateMutex);
+                entered = true;
+                gateCv.notify_all();
+                gateCv.wait(lock, [&]() { return released; });
+            }
+            inner(std::move(result));
+        };
+        scheduler.Enqueue(MakeTask(files.thumbs[0], ImagePurpose::Thumbnail, 1, gatedCallback));
+        for (size_t i = 1; i < files.thumbs.size(); ++i)
+        {
+            const uint64_t handle = static_cast<uint64_t>(i) + 1;
+            scheduler.Enqueue(MakeTask(files.thumbs[i], ImagePurpose::Thumbnail, handle, done.Callback(handle)));
         }
+        maxEntries = cache.MaxEntries();
+
+        {
+            std::unique_lock<std::mutex> lock(gateMutex);
+            IC_REQUIRE(gateCv.wait_for(lock, kWaitTimeout, [&]() { return entered; }));
+        }
+
+        // Fill phase: the count must rise to at least one entry (the byte source
+        // is in effect) and then stay flat for 500 ms while 38 thumbnails are
+        // still queued, i.e. the prefetch thread is blocked on capacity.
+        {
+            const auto deadline = std::chrono::steady_clock::now() + kWaitTimeout;
+            size_t last = 0;
+            auto lastChange = std::chrono::steady_clock::now();
+            for (;;)
+            {
+                const size_t count = cache.Count();
+                const auto now = std::chrono::steady_clock::now();
+                if (count != last)
+                {
+                    last = count;
+                    lastChange = now;
+                }
+                if (last >= 1 && now - lastChange >= std::chrono::milliseconds(500))
+                {
+                    break;
+                }
+                IC_REQUIRE(now < deadline);
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            plateau = last;
+        }
+        IC_CHECK(plateau >= 1);
+        IC_CHECK(plateau <= maxEntries);              // held by the capacity check,
+        IC_CHECK(plateau < files.thumbs.size());      // not by running out of work
+        {
+            std::lock_guard<std::mutex> lock(done.mutex);
+            IC_CHECK(done.entries.empty());           // nothing decoded while held
+        }
+
+        // Resume phase: release the worker; each completed decode erases its
+        // bytes and must wake the blocked prefetch thread.
+        {
+            std::lock_guard<std::mutex> lock(gateMutex);
+            released = true;
+        }
+        gateCv.notify_all();
         IC_REQUIRE(done.WaitFor(files.thumbs.size()));
+
+        // Every prefetched entry is released once its decode finished.
+        const auto deadline = std::chrono::steady_clock::now() + kWaitTimeout;
+        while (cache.Count() != 0 && std::chrono::steady_clock::now() < deadline)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        IC_CHECK(cache.Count() == 0);
     }
 
+    std::printf("  backpressure: cache plateaued at %zu entries (cap %zu) with %zu thumbnails queued\n",
+        plateau, maxEntries, files.thumbs.size() - 1);
     IC_CHECK(done.entries.size() == files.thumbs.size());
     for (const auto& entry : done.entries)
     {
