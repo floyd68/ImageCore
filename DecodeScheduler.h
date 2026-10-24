@@ -34,8 +34,24 @@ namespace ImageCore
         DecodeScheduler();
         ~DecodeScheduler();
 
-        // Set the number of worker threads
+        // Upper bound on decode workers: one dedicated full-resolution worker plus
+        // up to four background (thumbnail) workers. Thumbnail I/O is serialized on a
+        // separate prefetch thread, so more decode workers only add CPU contention.
+        static constexpr size_t kMaxDecodeWorkers = 5;
+
+        // Set the number of decode worker threads (the serialized thumbnail prefetch
+        // thread is separate). The count is clamped to [1, kMaxDecodeWorkers];
+        // WorkerCount() reports the number actually started. With 1, a single shared
+        // worker serves full-resolution work first and background work when no
+        // full-resolution work is queued; with 2 or more, one worker is dedicated to
+        // full-resolution work and the rest serve background work.
         void SetThreadCount(size_t count);
+
+        // Default decode worker count for a machine: hardware threads - 1, minimum 1.
+        static size_t DefaultWorkerCount(unsigned hardwareThreads);
+
+        // Number of running decode worker threads (excludes the prefetch thread).
+        size_t WorkerCount() const;
 
         // Add to the task queue
         void Enqueue(DecodeTask task);
@@ -53,7 +69,8 @@ namespace ImageCore
         enum class WorkerKind
         {
             HighPriority,
-            Background
+            Background,
+            Shared      // sole worker: high queue first, then background queue
         };
 
         void WorkerThread(WorkerKind kind);

@@ -162,9 +162,18 @@ namespace ImageCore
         : m_shutdown(false)
         , m_threadCount(0)
     {
-        // Default: CPU core count - 1 (minimum 1)
-        size_t coreCount = std::max<size_t>(1, std::thread::hardware_concurrency() - 1);
-        SetThreadCount(coreCount);
+        SetThreadCount(DefaultWorkerCount(std::thread::hardware_concurrency()));
+    }
+
+    size_t DecodeScheduler::DefaultWorkerCount(unsigned hardwareThreads)
+    {
+        // CPU core count - 1, minimum 1. hardware_concurrency() may report 0.
+        return (hardwareThreads > 1) ? static_cast<size_t>(hardwareThreads - 1) : 1;
+    }
+
+    size_t DecodeScheduler::WorkerCount() const
+    {
+        return m_highWorkers.size() + m_backgroundWorkers.size();
     }
 
     DecodeScheduler::~DecodeScheduler()
@@ -176,25 +185,32 @@ namespace ImageCore
     {
         Shutdown();
 
-        m_threadCount = std::max<size_t>(1, count);
+        m_threadCount = std::clamp<size_t>(count, 1, kMaxDecodeWorkers);
         m_shutdown = false;
 
-        // Start 1 high-priority worker (interactive full-res), rest background (thumbnails).
-        // This prevents thumbnail backlogs from blocking main image loads.
-        const size_t highCount = 1;
-        // Background workers are CPU-bound in the thumbnail pipeline (I/O is serialized separately).
-        // Keep a reasonable cap to avoid over-subscribing on decode-heavy workloads.
-        const size_t maxBgCount = 4;
-        const size_t bgCountUnclamped = (m_threadCount > highCount) ? (m_threadCount - highCount) : 0;
-        const size_t bgCount = (std::min)(bgCountUnclamped, maxBgCount);
-
-        for (size_t i = 0; i < highCount; ++i)
+        if (m_threadCount == 1)
         {
-            m_highWorkers.emplace_back(&DecodeScheduler::WorkerThread, this, WorkerKind::HighPriority);
+            // A single worker must serve both queues: full-res first, background work only
+            // when the high queue is empty. Worst-case main-image latency is therefore one
+            // in-flight thumbnail decode, never the queued backlog.
+            m_highWorkers.emplace_back(&DecodeScheduler::WorkerThread, this, WorkerKind::Shared);
         }
-        for (size_t i = 0; i < bgCount; ++i)
+        else
         {
-            m_backgroundWorkers.emplace_back(&DecodeScheduler::WorkerThread, this, WorkerKind::Background);
+            // Start 1 high-priority worker (interactive full-res), rest background (thumbnails).
+            // This prevents thumbnail backlogs from blocking main image loads.
+            const size_t highCount = 1;
+            // m_threadCount is already clamped to kMaxDecodeWorkers (1 high + 4 background).
+            const size_t bgCount = m_threadCount - highCount;
+
+            for (size_t i = 0; i < highCount; ++i)
+            {
+                m_highWorkers.emplace_back(&DecodeScheduler::WorkerThread, this, WorkerKind::HighPriority);
+            }
+            for (size_t i = 0; i < bgCount; ++i)
+            {
+                m_backgroundWorkers.emplace_back(&DecodeScheduler::WorkerThread, this, WorkerKind::Background);
+            }
         }
 
         // One serialized thumbnail I/O thread: reads files sequentially into memory, then schedules CPU work.
@@ -340,9 +356,10 @@ namespace ImageCore
     void DecodeScheduler::WorkerThread(WorkerKind kind)
     {
         // Thread scheduling priority:
-        // - HighPriority: faster response for main image loads
+        // - HighPriority / Shared: faster response for main image loads
+        //   (Shared drops to background mode while it runs background work)
         // - Background: lower CPU + lower I/O priority (important for HDD bottlenecks)
-        if (kind == WorkerKind::HighPriority)
+        if (kind == WorkerKind::HighPriority || kind == WorkerKind::Shared)
         {
             (void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
         }
@@ -369,6 +386,7 @@ namespace ImageCore
         while (!m_shutdown)
         {
             DecodeTask task;
+            bool tookBackgroundTask = false;
 
             {
                 std::unique_lock<std::mutex> lock(m_queueMutex);
@@ -404,8 +422,9 @@ namespace ImageCore
                 }
                 else
                 {
-                    // Background workers service high queue first (work-steal),
-                    // but won't starve the main image because we also have a dedicated high worker.
+                    // Background and shared workers service the high queue first. Background
+                    // workers work-steal (a dedicated high worker also exists); the shared
+                    // worker is the only worker and must prefer the main image.
                     if (!m_highQueue.empty())
                     {
                         task = std::move(m_highQueue.front());
@@ -415,6 +434,7 @@ namespace ImageCore
                     {
                         task = std::move(m_backgroundQueue.front());
                         m_backgroundQueue.pop();
+                        tookBackgroundTask = true;
                     }
                     else
                     {
@@ -437,6 +457,14 @@ namespace ImageCore
                     }
                     continue;
                 }
+            }
+
+            // The shared worker runs at above-normal priority for the main image; background
+            // work must not inherit that, so it runs in background mode for this task only.
+            const bool sharedBackgroundMode = (kind == WorkerKind::Shared) && tookBackgroundTask;
+            if (sharedBackgroundMode)
+            {
+                (void)SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
             }
 
             // Run decode through the dispatcher (includes format routing + decoder selection)
@@ -517,6 +545,12 @@ after_decode:
                 bytesHold.reset();
                 FileByteCache::Instance().EraseIfUnshared(task.request.source);
                 m_queueCondition.notify_all(); // wake prefetch thread if it was waiting for cache space
+            }
+
+            if (sharedBackgroundMode)
+            {
+                (void)SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
+                (void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
             }
         }
 
