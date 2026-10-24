@@ -5,6 +5,7 @@ add_executable(ImageCoreTests
     TestHarness.h
     TestMain.cpp
     DecodeSchedulerTests.cpp
+    LogTests.cpp
 )
 
 target_include_directories(ImageCoreTests PRIVATE
@@ -25,5 +26,6 @@ if(MSVC)
 endif()
 
 add_test(NAME ImageCore.DecodeScheduler COMMAND ImageCoreTests DecodeScheduler_)
+add_test(NAME ImageCore.Log COMMAND ImageCoreTests Log_)
 # Safety net only: every wait inside the tests is bounded at 10 s.
-set_tests_properties(ImageCore.DecodeScheduler PROPERTIES TIMEOUT 120)
+set_tests_properties(ImageCore.DecodeScheduler ImageCore.Log PROPERTIES TIMEOUT 120)
