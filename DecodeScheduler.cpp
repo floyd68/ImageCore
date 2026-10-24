@@ -304,12 +304,19 @@ namespace ImageCore
 
     void DecodeScheduler::Shutdown()
     {
-        if (m_shutdown)
+        // The shutdown flag is part of every wait predicate, so it must change
+        // under m_queueMutex: a waiter that has just evaluated its predicate still
+        // holds the mutex until it blocks, and a notification sent before that
+        // point is lost. Setting the flag outside the lock let notify_all() race
+        // that window, leaving a worker asleep forever and the join below hanging.
         {
-            return;
+            std::lock_guard<std::mutex> lock(m_queueMutex);
+            if (m_shutdown)
+            {
+                return;
+            }
+            m_shutdown = true;
         }
-
-        m_shutdown = true;
         m_queueCondition.notify_all();
 
         for (auto& worker : m_highWorkers)
@@ -544,7 +551,15 @@ after_decode:
                 // Release our local hold before attempting EraseIfUnshared.
                 bytesHold.reset();
                 FileByteCache::Instance().EraseIfUnshared(task.request.source);
-                m_queueCondition.notify_all(); // wake prefetch thread if it was waiting for cache space
+                // Wake the prefetch thread if it was waiting for cache space. Its
+                // predicate reads the cache counts under m_queueMutex, so take the
+                // mutex before notifying; otherwise the notification can land while
+                // the prefetch thread still holds the mutex between evaluating the
+                // predicate and blocking, and is lost.
+                {
+                    std::lock_guard<std::mutex> lock(m_queueMutex);
+                }
+                m_queueCondition.notify_all();
             }
 
             if (sharedBackgroundMode)
@@ -553,6 +568,11 @@ after_decode:
                 (void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
             }
         }
+
+        // Drop this thread's cached COM objects while the apartment is still alive.
+        // Letting the thread_local WIC factory release at thread exit (after
+        // CoUninitialize) crashed intermittently once thousands of workers had exited.
+        ImageDecodeDispatcher::ReleaseThreadResources();
 
         if (coInitialized)
         {
