@@ -524,7 +524,7 @@ namespace ImageCore
                 if (FAILED(result.hr))
                 {
                     IC_LOG_ERROR("[DecodeScheduler] Decode failed ({}): 0x{:08X}",
-                        std::filesystem::path(src).string(),
+                        Log::ToUtf8(src),
                         static_cast<unsigned>(result.hr));
                 }
             }
