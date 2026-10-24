@@ -90,34 +90,6 @@ namespace ImageCore
             return desc.IncursSeekPenalty ? true : false;
         }
 
-        static size_t PrefetchDepthForPath(const std::wstring& path)
-        {
-            // Cache per-volume result since querying storage properties is relatively expensive.
-            static std::mutex s_mutex;
-            static std::unordered_map<std::wstring, bool> s_seekPenaltyByVolume;
-
-            const std::wstring vol = GetVolumePathForFilePath(path);
-            bool incursSeek = true;
-
-            {
-                std::lock_guard<std::mutex> lock(s_mutex);
-                auto it = s_seekPenaltyByVolume.find(vol);
-                if (it != s_seekPenaltyByVolume.end())
-                {
-                    incursSeek = it->second;
-                }
-                else
-                {
-                    incursSeek = QueryIncursSeekPenaltyForVolume(vol);
-                    s_seekPenaltyByVolume.emplace(vol, incursSeek);
-                }
-            }
-
-            // SSD/NVMe (no seek penalty) -> deeper prefetch helps hide latency.
-            // HDD (seek penalty) -> keep shallow to avoid memory + avoid extra I/O pressure.
-            return incursSeek ? 2 : 4;
-        }
-
         static std::shared_ptr<std::vector<uint8_t>> ReadWholeFileBytes(const std::wstring& path)
         {
             IPathByteSource* source = GetPathByteSource();
@@ -176,6 +148,57 @@ namespace ImageCore
         return m_highWorkers.size() + m_backgroundWorkers.size();
     }
 
+    size_t DecodeScheduler::LiveRequestCount() const
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        return m_liveRequests.size();
+    }
+
+    size_t DecodeScheduler::VolumeProfileCount() const
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        return m_volumeProfiles.size();
+    }
+
+    size_t DecodeScheduler::PrefetchDepthForPath(const std::wstring& path)
+    {
+        // Resolving the host path and querying storage properties can block (host
+        // byte source, volume device open), so neither runs under a lock; the
+        // per-volume result is cached because the query is relatively expensive.
+        const std::wstring vol = GetVolumePathForFilePath(path);
+
+        bool known = false;
+        bool incursSeek = true;
+        {
+            std::lock_guard<std::mutex> lock(m_seekPenaltyMutex);
+            auto it = m_seekPenaltyByVolume.find(vol);
+            if (it != m_seekPenaltyByVolume.end())
+            {
+                known = true;
+                incursSeek = it->second;
+            }
+        }
+        if (!known)
+        {
+            incursSeek = QueryIncursSeekPenaltyForVolume(vol);
+            std::lock_guard<std::mutex> lock(m_seekPenaltyMutex);
+            m_seekPenaltyByVolume.emplace(vol, incursSeek);
+        }
+
+        // SSD/NVMe (no seek penalty) -> deeper prefetch helps hide latency.
+        // HDD (seek penalty) -> keep shallow to avoid memory + avoid extra I/O pressure.
+        return incursSeek ? 2 : 4;
+    }
+
+    void DecodeScheduler::Finish_NoLock(const DecodeTask& task)
+    {
+        auto it = m_liveRequests.find(task.handle);
+        if (it != m_liveRequests.end() && it->second == task.state)
+        {
+            m_liveRequests.erase(it);
+        }
+    }
+
     DecodeScheduler::~DecodeScheduler()
     {
         Shutdown();
@@ -183,10 +206,14 @@ namespace ImageCore
 
     void DecodeScheduler::SetThreadCount(size_t count)
     {
+        // Shutdown also resets volume tuning and FileByteCache (restart semantics).
         Shutdown();
 
         m_threadCount = std::clamp<size_t>(count, 1, kMaxDecodeWorkers);
-        m_shutdown = false;
+        {
+            std::lock_guard<std::mutex> lock(m_queueMutex);
+            m_shutdown = false;
+        }
 
         if (m_threadCount == 1)
         {
@@ -222,20 +249,42 @@ namespace ImageCore
         FileByteCache::Instance().SetMaxEntries(m_globalPrefetchCap);
     }
 
-    void DecodeScheduler::Enqueue(DecodeTask task)
+    bool DecodeScheduler::Enqueue(DecodeTask task)
     {
+        const bool fullResolution = (task.request.purpose == ImagePurpose::FullResolution);
+
+        // Storage tuning for thumbnail/preview work is resolved before taking the
+        // queue mutex: it can block on the host byte source or a volume query,
+        // which would otherwise stall every worker, Cancel and Enqueue.
+        std::wstring vol;
+        size_t desiredDepth = 0;
+        if (!fullResolution)
+        {
+            vol = FileByteCache::GetVolumeForPath(task.request.source);
+            desiredDepth = PrefetchDepthForPath(task.request.source);
+        }
+
+        task.state = std::make_shared<DecodeRequestState>();
+
         {
             std::lock_guard<std::mutex> lock(m_queueMutex);
+            if (m_shutdown)
+            {
+                return false;
+            }
+            if (task.handle != 0)
+            {
+                m_liveRequests[task.handle] = task.state;
+            }
+
             // FullResolution is user-interactive (main image). Prioritize it.
-            if (task.request.purpose == ImagePurpose::FullResolution)
+            if (fullResolution)
             {
                 m_highQueue.push(std::move(task));
             }
             else
             {
                 // Auto-tune per-volume thumbnail prefetch depth based on storage seek penalty.
-                const std::wstring vol = FileByteCache::GetVolumeForPath(task.request.source);
-                const size_t desiredDepth = PrefetchDepthForPath(task.request.source);
                 VolumeIoProfile profile {};
                 profile.incursSeek = (desiredDepth <= 2);
                 profile.prefetchDepth = desiredDepth;
@@ -259,6 +308,7 @@ namespace ImageCore
         // (high/background/thumb-IO). Using notify_all avoids a missed wakeup where we wake a thread
         // whose predicate is false, leaving the correct worker asleep even though work is available.
         m_queueCondition.notify_all();
+        return true;
     }
 
     void DecodeScheduler::Cancel(uint64_t handle)
@@ -268,38 +318,16 @@ namespace ImageCore
             return;
         }
 
+        // The flag lives with the task; the live-request entry is dropped now, so
+        // a cancel after completion (or of an unknown handle) never accumulates.
+        // The task itself leaves its queue when a thread next reaches it.
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        auto it = m_liveRequests.find(handle);
+        if (it != m_liveRequests.end())
         {
-            std::lock_guard<std::mutex> lock(m_queueMutex);
-            m_canceledHandles.insert(handle);
+            it->second->canceled.store(true);
+            m_liveRequests.erase(it);
         }
-
-        // Wake all waiters so any thread blocked on empty queues can re-check cancel state.
-        m_queueCondition.notify_all();
-    }
-
-    bool DecodeScheduler::IsCanceled_NoLock(uint64_t handle) const
-    {
-        return m_canceledHandles.find(handle) != m_canceledHandles.end();
-    }
-
-    bool DecodeScheduler::ConsumeCanceled_NoLock(uint64_t handle)
-    {
-        auto it = m_canceledHandles.find(handle);
-        if (it == m_canceledHandles.end())
-        {
-            return false;
-        }
-        m_canceledHandles.erase(it);
-        return true;
-    }
-
-    void DecodeScheduler::WaitForCompletion()
-    {
-        std::unique_lock<std::mutex> lock(m_queueMutex);
-        m_queueCondition.wait(lock, [this]
-        {
-            return m_highQueue.empty() && m_thumbIoQueue.empty() && m_backgroundQueue.empty();
-        });
     }
 
     void DecodeScheduler::Shutdown()
@@ -342,38 +370,60 @@ namespace ImageCore
         m_highWorkers.clear();
         m_backgroundWorkers.clear();
 
-        // Drain queues
+        // Drop queued work (no callbacks) and reset per-run state, so a restart
+        // cannot inherit stale volume tuning or orphaned prefetched bytes.
         {
             std::lock_guard<std::mutex> lock(m_queueMutex);
-            while (!m_highQueue.empty())
-            {
-                m_highQueue.pop();
-            }
-            while (!m_thumbIoQueue.empty())
-            {
-                m_thumbIoQueue.pop();
-            }
-            while (!m_backgroundQueue.empty())
-            {
-                m_backgroundQueue.pop();
-            }
+            m_highQueue = {};
+            m_thumbIoQueue = {};
+            m_backgroundQueue = {};
+            m_liveRequests.clear();
+            m_volumeProfiles.clear();
+            m_globalPrefetchCap = 4;
         }
+        {
+            std::lock_guard<std::mutex> lock(m_seekPenaltyMutex);
+            m_seekPenaltyByVolume.clear();
+        }
+        FileByteCache::Instance().Clear();
+        FileByteCache::Instance().SetMaxEntries(m_globalPrefetchCap);
     }
 
     void DecodeScheduler::WorkerThread(WorkerKind kind)
     {
-        // Thread scheduling priority:
-        // - HighPriority / Shared: faster response for main image loads
-        //   (Shared drops to background mode while it runs background work)
-        // - Background: lower CPU + lower I/O priority (important for HDD bottlenecks)
-        if (kind == WorkerKind::HighPriority || kind == WorkerKind::Shared)
+        // Thread scheduling priority follows the task, not the worker:
+        // - full-resolution (high queue) work runs above normal for main-image response;
+        // - background (thumbnail) work runs in background mode, which lowers CPU and
+        //   I/O priority (important for HDD bottlenecks).
+        // Background workers idle in background mode and leave it while they run a
+        // stolen full-resolution task; the high-priority and shared workers idle above
+        // normal and enter background mode only for a background task.
+        bool inBackgroundMode = false;
+        auto setBackgroundMode = [&inBackgroundMode](bool background)
         {
-            (void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+            if (background == inBackgroundMode)
+            {
+                return;
+            }
+            if (background)
+            {
+                (void)SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+            }
+            else
+            {
+                (void)SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
+                (void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+            }
+            inBackgroundMode = background;
+        };
+        const bool idleInBackground = (kind == WorkerKind::Background);
+        if (idleInBackground)
+        {
+            setBackgroundMode(true);
         }
         else
         {
-            // Background mode lowers CPU scheduling and I/O priority.
-            (void)SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+            (void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
         }
 
         // Each worker thread must initialize COM to use WIC/COM components safely.
@@ -450,8 +500,9 @@ namespace ImageCore
                 }
 
                 // If canceled while sitting in the queue, skip the task.
-                if (ConsumeCanceled_NoLock(task.handle))
+                if (task.state && task.state->canceled.load())
                 {
+                    Finish_NoLock(task);
                     // IMPORTANT:
                     // Thumbnail/Preview requests may have already prefetched bytes into FileByteCache.
                     // If we drop the task here (before decode), we must free any unshared prefetched bytes,
@@ -466,13 +517,8 @@ namespace ImageCore
                 }
             }
 
-            // The shared worker runs at above-normal priority for the main image; background
-            // work must not inherit that, so it runs in background mode for this task only.
-            const bool sharedBackgroundMode = (kind == WorkerKind::Shared) && tookBackgroundTask;
-            if (sharedBackgroundMode)
-            {
-                (void)SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
-            }
+            // Run this task at its own priority (see above).
+            setBackgroundMode(tookBackgroundTask);
 
             // Run decode through the dispatcher (includes format routing + decoder selection)
             PipelineResult result;
@@ -529,21 +575,19 @@ namespace ImageCore
                 }
             }
 
-            // Invoke callback (deliver DecodedImage result)
-            if (task.callback)
+            // Deliver the result unless canceled while decoding. The request leaves the
+            // live-request table before delivery, so a Cancel that arrives from here on
+            // is a no-op and the callback may run after that Cancel returns.
+            bool deliver = false;
             {
-                // If canceled while decoding, suppress callback.
-                {
-                    std::lock_guard<std::mutex> lock(m_queueMutex);
-                    if (ConsumeCanceled_NoLock(task.handle))
-                    {
-                        // Intentionally drop.
-                        goto after_decode;
-                    }
-                }
+                std::lock_guard<std::mutex> lock(m_queueMutex);
+                deliver = !(task.state && task.state->canceled.load());
+                Finish_NoLock(task);
+            }
+            if (deliver && task.callback)
+            {
                 task.callback(std::move(result));  // delivered via move
             }
-after_decode:
 
             // Thumbnail/Preview prefetched bytes are transient; free them once decode finishes if unshared.
             if (task.request.purpose != ImagePurpose::FullResolution)
@@ -562,11 +606,7 @@ after_decode:
                 m_queueCondition.notify_all();
             }
 
-            if (sharedBackgroundMode)
-            {
-                (void)SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
-                (void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
-            }
+            setBackgroundMode(idleInBackground);
         }
 
         // Drop this thread's cached COM objects while the apartment is still alive.
@@ -580,7 +620,7 @@ after_decode:
         }
 
         // End background mode if set (best-effort).
-        if (kind == WorkerKind::Background)
+        if (inBackgroundMode)
         {
             (void)SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
         }
@@ -615,8 +655,9 @@ after_decode:
                 task = std::move(m_thumbIoQueue.front());
                 m_thumbIoQueue.pop();
 
-                if (ConsumeCanceled_NoLock(task.handle))
+                if (task.state && task.state->canceled.load())
                 {
+                    Finish_NoLock(task);
                     continue;
                 }
             }

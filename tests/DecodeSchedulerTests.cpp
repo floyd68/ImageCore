@@ -18,6 +18,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <algorithm>
 
 // DecodeScheduler worker-count and single-worker progress tests. They decode
 // tiny BMP files from a temporary directory through the real dispatcher.
@@ -533,6 +534,479 @@ IC_TEST(DecodeScheduler_BackpressureBlocksAtCapAndResumes)
     for (const auto& entry : done.entries)
     {
         IC_CHECK(SUCCEEDED(entry.hr));
+    }
+}
+
+namespace
+{
+    // Byte source with controllable timing. `archivePath` resolves to a
+    // different host path, so the scheduler treats it as archive-backed and a
+    // full-resolution decode reads it through ReadAll (inside the decode step).
+    // `gatedRead` blocks ReadAll and `gatedResolve` blocks ResolveHostPath for one
+    // path until Release(); every wait is bounded.
+    class GatedByteSource : public IPathByteSource
+    {
+    public:
+        GatedByteSource()
+            : m_previous(GetPathByteSource())
+        {
+            SetPathByteSource(this);
+        }
+
+        ~GatedByteSource() override
+        {
+            Release();
+            SetPathByteSource(m_previous);
+        }
+
+        std::wstring archivePath;
+        std::wstring gatedRead;
+        std::wstring gatedResolve;
+
+        std::wstring ResolveHostPath(const std::wstring& path) const override
+        {
+            if (!gatedResolve.empty() && path == gatedResolve)
+            {
+                Block();
+            }
+            return (!archivePath.empty() && path == archivePath) ? path + L".host" : path;
+        }
+
+        std::vector<uint8_t> ReadAll(const std::wstring& path) const override
+        {
+            if (!gatedRead.empty() && path == gatedRead)
+            {
+                Block();
+            }
+            std::ifstream in(std::filesystem::path(path), std::ios::binary);
+            return std::vector<uint8_t>(std::istreambuf_iterator<char>(in), {});
+        }
+
+        bool WaitEntered() const
+        {
+            std::unique_lock<std::mutex> lock(m_mutex);
+            return m_cv.wait_for(lock, kWaitTimeout, [&]() { return m_entered; });
+        }
+
+        void Release() const
+        {
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_released = true;
+            }
+            m_cv.notify_all();
+        }
+
+    private:
+        void Block() const
+        {
+            std::unique_lock<std::mutex> lock(m_mutex);
+            m_entered = true;
+            m_cv.notify_all();
+            m_cv.wait_for(lock, kWaitTimeout, [&]() { return m_released; });
+        }
+
+        IPathByteSource* m_previous;
+        mutable std::mutex m_mutex;
+        mutable std::condition_variable m_cv;
+        mutable bool m_entered = false;
+        mutable bool m_released = false;
+    };
+
+    // Waits (bounded) until `predicate` holds.
+    template <typename Predicate>
+    bool WaitUntil(Predicate predicate)
+    {
+        const auto deadline = std::chrono::steady_clock::now() + kWaitTimeout;
+        while (!predicate())
+        {
+            if (std::chrono::steady_clock::now() >= deadline)
+            {
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        return true;
+    }
+
+    bool Delivered(Completions& done, uint64_t handle)
+    {
+        std::lock_guard<std::mutex> lock(done.mutex);
+        for (const auto& entry : done.entries)
+        {
+            if (entry.handle == handle)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
+IC_TEST(DecodeScheduler_LateCancelLeavesNoState)
+{
+    // Cancel after completion and of unknown handles is a no-op; finished
+    // requests leave nothing in the live-request table.
+    const auto& files = Files();
+    Completions done;
+    DecodeScheduler scheduler;
+    scheduler.SetThreadCount(2);
+
+    constexpr uint64_t kCount = 20;
+    for (uint64_t handle = 1; handle <= kCount; ++handle)
+    {
+        const bool full = (handle % 2) == 0;
+        const std::wstring& path = full ? files.fullRes : files.thumbs[handle % files.thumbs.size()];
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(path, full ? ImagePurpose::FullResolution : ImagePurpose::Thumbnail,
+            handle, done.Callback(handle))));
+    }
+    IC_REQUIRE(done.WaitFor(kCount));
+    IC_REQUIRE(WaitUntil([&]() { return scheduler.LiveRequestCount() == 0; }));
+
+    for (uint64_t handle = 1; handle <= kCount; ++handle)
+    {
+        scheduler.Cancel(handle);
+    }
+    for (uint64_t handle = 1000; handle < 3000; ++handle)
+    {
+        scheduler.Cancel(handle);
+    }
+    IC_CHECK(scheduler.LiveRequestCount() == 0);
+}
+
+IC_TEST(DecodeScheduler_CancelReloadStressStaysBounded)
+{
+    // Rapid request/cancel/re-request, like fast main-image navigation with
+    // thumbnails in flight. Cancellation state must drain to zero, and every
+    // delivered callback must belong to a request that was issued.
+    const auto& files = Files();
+    Watchdog watchdog("cancel/reload stress", std::chrono::seconds(60));
+    Completions done;
+    DecodeScheduler scheduler;
+    scheduler.SetThreadCount(3);
+
+    constexpr uint64_t kRounds = 300;
+    size_t peakLive = 0;
+    for (uint64_t round = 0; round < kRounds; ++round)
+    {
+        const uint64_t full = round * 2 + 1;
+        const uint64_t thumb = round * 2 + 2;
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, full, done.Callback(full))));
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[round % files.thumbs.size()], ImagePurpose::Thumbnail,
+            thumb, done.Callback(thumb))));
+        // Supersede the previous main image (sometimes this one immediately) and
+        // some thumbnails; an occasional pause lets cancels land on queued, decoding,
+        // and already-delivered requests alike.
+        if (round > 0)
+        {
+            scheduler.Cancel(full - 2);
+            if (round % 2 == 0)
+            {
+                scheduler.Cancel(thumb - 2);
+            }
+        }
+        if (round % 3 == 0)
+        {
+            scheduler.Cancel(full);
+        }
+        peakLive = (std::max)(peakLive, scheduler.LiveRequestCount());
+        if (round % 4 == 0)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
+    IC_REQUIRE(WaitUntil([&]() { return scheduler.LiveRequestCount() == 0; }));
+    // The final round's thumbnail was never canceled and must be delivered.
+    IC_REQUIRE(WaitUntil([&]() { return Delivered(done, kRounds * 2); }));
+
+    std::lock_guard<std::mutex> lock(done.mutex);
+    IC_CHECK(done.entries.size() <= kRounds * 2);
+    for (const auto& entry : done.entries)
+    {
+        IC_CHECK(entry.handle >= 1 && entry.handle <= kRounds * 2);
+    }
+    std::printf("  cancel/reload: %zu callbacks for %llu requests, peak live %zu\n",
+        done.entries.size(), static_cast<unsigned long long>(kRounds * 2), peakLive);
+}
+
+IC_TEST(DecodeScheduler_QueuedCancelSuppressesCallback)
+{
+    const auto& files = Files();
+    Completions done;
+    std::mutex gateMutex;
+    std::condition_variable gateCv;
+    bool entered = false;
+    bool released = false;
+    {
+        DecodeScheduler scheduler;
+        scheduler.SetThreadCount(1);
+        GateRelease releaseOnExit { gateMutex, gateCv, released };
+
+        auto gatedCallback = [&, inner = done.Callback(1)](PipelineResult&& result) mutable
+        {
+            {
+                std::unique_lock<std::mutex> lock(gateMutex);
+                entered = true;
+                gateCv.notify_all();
+                gateCv.wait(lock, [&]() { return released; });
+            }
+            inner(std::move(result));
+        };
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 1, gatedCallback)));
+        {
+            std::unique_lock<std::mutex> lock(gateMutex);
+            IC_REQUIRE(gateCv.wait_for(lock, kWaitTimeout, [&]() { return entered; }));
+        }
+
+        // Task 1 is being delivered (it already left the live table); 2 and 3 queue.
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 2, done.Callback(2))));
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[0], ImagePurpose::Thumbnail, 3, done.Callback(3))));
+        IC_CHECK(scheduler.LiveRequestCount() == 2);
+        scheduler.Cancel(2);
+        scheduler.Cancel(3);
+        scheduler.Cancel(1);  // late: delivery already started, so it is a no-op
+        IC_CHECK(scheduler.LiveRequestCount() == 0);
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 4, done.Callback(4))));
+
+        {
+            std::lock_guard<std::mutex> lock(gateMutex);
+            released = true;
+        }
+        gateCv.notify_all();
+        IC_REQUIRE(done.WaitFor(2));
+        IC_REQUIRE(WaitUntil([&]() { return scheduler.LiveRequestCount() == 0; }));
+    }
+
+    // Only the in-delivery task 1 (a callback after its Cancel returned, which
+    // the contract allows) and the uncanceled task 4 were delivered.
+    IC_REQUIRE(done.entries.size() == 2);
+    IC_CHECK(done.entries[0].handle == 1);
+    IC_CHECK(done.entries[1].handle == 4);
+}
+
+IC_TEST(DecodeScheduler_CancelDuringDecodeSuppressesCallback)
+{
+    // The decode of task 1 is held inside the archive read (after dequeue,
+    // before delivery). A cancel issued then must suppress its callback.
+    const auto& files = Files();
+    Completions done;
+    {
+        Watchdog watchdog("cancel during decode", std::chrono::seconds(60));
+        GatedByteSource source;
+        source.archivePath = files.thumbs[30];
+        source.gatedRead = files.thumbs[30];
+        DecodeScheduler scheduler;
+        scheduler.SetThreadCount(1);
+
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[30], ImagePurpose::FullResolution, 1, done.Callback(1))));
+        IC_REQUIRE(source.WaitEntered());
+        scheduler.Cancel(1);
+        IC_CHECK(scheduler.LiveRequestCount() == 0);
+        source.Release();
+
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 2, done.Callback(2))));
+        IC_REQUIRE(done.WaitFor(1));
+    }
+
+    IC_REQUIRE(done.entries.size() == 1);
+    IC_CHECK(done.entries[0].handle == 2);
+}
+
+IC_TEST(DecodeScheduler_StolenFullResolutionRunsAboveNormal)
+{
+    // With one worker held, the other worker takes the next full-resolution
+    // task; with two workers one of them is the background worker. Full-
+    // resolution work must never run in background mode.
+    const auto& files = Files();
+    Completions done;
+    std::mutex gateMutex;
+    std::condition_variable gateCv;
+    bool entered = false;
+    bool released = false;
+    DWORD gatedThread = 0;
+    DWORD otherThread = 0;
+    {
+        DecodeScheduler scheduler;
+        scheduler.SetThreadCount(2);  // one high-priority worker + one background worker
+        GateRelease releaseOnExit { gateMutex, gateCv, released };
+
+        auto gatedCallback = [&, inner = done.Callback(1)](PipelineResult&& result) mutable
+        {
+            {
+                std::unique_lock<std::mutex> lock(gateMutex);
+                gatedThread = GetCurrentThreadId();
+                entered = true;
+                gateCv.notify_all();
+                gateCv.wait(lock, [&]() { return released; });
+            }
+            inner(std::move(result));
+        };
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 1, gatedCallback)));
+        {
+            std::unique_lock<std::mutex> lock(gateMutex);
+            IC_REQUIRE(gateCv.wait_for(lock, kWaitTimeout, [&]() { return entered; }));
+        }
+
+        auto inner2 = done.Callback(2);
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 2,
+            [&, inner2](PipelineResult&& result) mutable
+            {
+                otherThread = GetCurrentThreadId();
+                inner2(std::move(result));
+            })));
+        IC_REQUIRE(done.WaitFor(1));
+
+        {
+            std::lock_guard<std::mutex> lock(gateMutex);
+            released = true;
+        }
+        gateCv.notify_all();
+        IC_REQUIRE(done.WaitFor(2));
+
+        // Background work afterwards still runs in background mode.
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[2], ImagePurpose::Thumbnail, 3, done.Callback(3))));
+        IC_REQUIRE(done.WaitFor(3));
+    }
+
+    IC_CHECK(gatedThread != 0 && otherThread != 0 && gatedThread != otherThread);
+    IC_REQUIRE(done.entries.size() == 3);
+    for (const auto& entry : done.entries)
+    {
+        if (entry.handle == 3)
+        {
+            IC_CHECK(entry.threadPriority < THREAD_PRIORITY_NORMAL);
+        }
+        else
+        {
+            IC_CHECK(entry.threadPriority == THREAD_PRIORITY_ABOVE_NORMAL);
+        }
+    }
+}
+
+IC_TEST(DecodeScheduler_EnqueueAfterShutdownIsRejected)
+{
+    const auto& files = Files();
+    Completions done;
+    DecodeScheduler scheduler;
+    scheduler.SetThreadCount(2);
+    scheduler.Shutdown();
+    scheduler.Shutdown();  // idempotent
+
+    IC_CHECK(!scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 1, done.Callback(1))));
+    IC_CHECK(!scheduler.Enqueue(MakeTask(files.thumbs[0], ImagePurpose::Thumbnail, 2, done.Callback(2))));
+    scheduler.Cancel(1);
+    IC_CHECK(scheduler.LiveRequestCount() == 0);
+    IC_CHECK(scheduler.WorkerCount() == 0);
+    std::lock_guard<std::mutex> lock(done.mutex);
+    IC_CHECK(done.entries.empty());
+}
+
+IC_TEST(DecodeScheduler_RestartClearsTuningAndPrefetchedBytes)
+{
+    // Restart (SetThreadCount on a running scheduler) drops queued work and must
+    // not inherit volume tuning or prefetched bytes from the previous run.
+    const auto& files = Files();
+    FileByteCache& cache = FileByteCache::Instance();
+    Completions done;
+    std::mutex gateMutex;
+    std::condition_variable gateCv;
+    bool entered = false;
+    bool released = false;
+    {
+        Watchdog watchdog("restart test", std::chrono::seconds(60));
+        ScopedFileByteSource byteSource;
+        DecodeScheduler scheduler;
+        scheduler.SetThreadCount(1);
+        GateRelease releaseOnExit { gateMutex, gateCv, released };
+
+        auto gatedCallback = [&, inner = done.Callback(1)](PipelineResult&& result) mutable
+        {
+            {
+                std::unique_lock<std::mutex> lock(gateMutex);
+                entered = true;
+                gateCv.notify_all();
+                gateCv.wait(lock, [&]() { return released; });
+            }
+            inner(std::move(result));
+        };
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[0], ImagePurpose::Thumbnail, 1, gatedCallback)));
+        for (uint64_t handle = 2; handle <= 12; ++handle)
+        {
+            IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[handle], ImagePurpose::Thumbnail, handle,
+                done.Callback(handle))));
+        }
+        {
+            std::unique_lock<std::mutex> lock(gateMutex);
+            IC_REQUIRE(gateCv.wait_for(lock, kWaitTimeout, [&]() { return entered; }));
+        }
+        // Prefetch fills the cache while the only worker is held.
+        IC_REQUIRE(WaitUntil([&]() { return cache.Count() >= 1; }));
+        IC_CHECK(scheduler.VolumeProfileCount() == 1);
+        IC_CHECK(scheduler.LiveRequestCount() >= 1);
+
+        {
+            std::lock_guard<std::mutex> lock(gateMutex);
+            released = true;
+        }
+        gateCv.notify_all();
+        scheduler.SetThreadCount(2);
+
+        IC_CHECK(cache.Count() == 0);
+        IC_CHECK(cache.MaxEntries() == 4);
+        IC_CHECK(scheduler.VolumeProfileCount() == 0);
+        IC_CHECK(scheduler.LiveRequestCount() == 0);
+
+        // The restarted scheduler works.
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[20], ImagePurpose::Thumbnail, 100, done.Callback(100))));
+        IC_REQUIRE(WaitUntil([&]() { return Delivered(done, 100); }));
+        IC_CHECK(scheduler.VolumeProfileCount() == 1);
+    }
+}
+
+IC_TEST(DecodeScheduler_TuningQueryRunsOutsideQueueMutex)
+{
+    // Enqueue resolves storage tuning (host path, volume query) before taking
+    // the queue mutex. With that step blocked, Cancel and other queue users must
+    // still make progress.
+    const auto& files = Files();
+    Completions done;
+    {
+        Watchdog watchdog("tuning outside mutex", std::chrono::seconds(60));
+        GatedByteSource source;
+        source.gatedResolve = files.thumbs[25];
+        DecodeScheduler scheduler;
+        scheduler.SetThreadCount(1);
+
+        std::thread enqueuer([&]()
+        {
+            scheduler.Enqueue(MakeTask(files.thumbs[25], ImagePurpose::Thumbnail, 1, done.Callback(1)));
+        });
+        const bool entered = source.WaitEntered();
+
+        std::mutex m;
+        std::condition_variable cv;
+        bool progressed = false;
+        std::thread other([&]()
+        {
+            scheduler.Cancel(999);
+            (void)scheduler.LiveRequestCount();
+            std::lock_guard<std::mutex> lock(m);
+            progressed = true;
+            cv.notify_all();
+        });
+        bool progressedWhileBlocked = false;
+        {
+            std::unique_lock<std::mutex> lock(m);
+            progressedWhileBlocked = cv.wait_for(lock, std::chrono::seconds(2), [&]() { return progressed; });
+        }
+        source.Release();
+        other.join();
+        enqueuer.join();
+
+        IC_REQUIRE(entered);
+        IC_CHECK(progressedWhileBlocked);
+        IC_REQUIRE(done.WaitFor(1));
     }
 }
 

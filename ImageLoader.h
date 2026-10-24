@@ -29,16 +29,21 @@ namespace ImageCore
     public:
         static ImageLoader& Instance();
 
-        // Explicit shutdown (call before FD2D::Core::Shutdown / CoUninitialize)
+        // Explicit shutdown (call before FD2D::Core::Shutdown / CoUninitialize).
+        // Idempotent and final: queued requests are dropped without callbacks,
+        // and later requests are rejected.
         void Shutdown();
 
-        // Image load request (async)
-        // Image load request (async) - unified payload
+        // Image load request (async) - unified payload. The callback runs on a
+        // worker thread. Returns 0 without ever invoking the callback when the
+        // request is rejected (empty source, no callback, or after Shutdown).
         ImageHandle RequestDecoded(
             const ImageRequest& request,
             DecodedImageLoadCallback callback);
 
-        // Cancel request
+        // Best-effort cancel (see DecodeScheduler::Cancel). The callback can still
+        // run after Cancel returns if delivery had already started; callers must
+        // drop stale results themselves. Unknown or finished handles are a no-op.
         void Cancel(ImageHandle handle);
 
         // Clear cache
@@ -58,8 +63,15 @@ namespace ImageCore
 
         void Initialize();
 
+        std::shared_ptr<DecodeScheduler> Scheduler() const;
+
         std::unique_ptr<ImageCache> m_cache;
-        std::unique_ptr<DecodeScheduler> m_scheduler;
+
+        // Requests copy the pointer under m_mutex and use the scheduler outside
+        // it, so Shutdown (which joins workers) never holds the mutex while a
+        // worker callback issues a new request.
+        mutable std::mutex m_mutex;
+        std::shared_ptr<DecodeScheduler> m_scheduler;
 
         std::atomic<ImageHandle> m_nextHandle;
     };
