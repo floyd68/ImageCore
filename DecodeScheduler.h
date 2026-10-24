@@ -4,7 +4,7 @@
 #include "DecodeTypes.h"
 #include <thread>
 #include <vector>
-#include <deque>
+#include <queue>
 #include <cstdint>
 #include <mutex>
 #include <condition_variable>
@@ -15,11 +15,20 @@
 
 namespace ImageCore
 {
-    // Per-request cancellation state, owned by the task (and by the scheduler's
-    // live-request table while the task is queued or decoding).
+    // Per-request state, owned by the task (and by the scheduler's live-request
+    // table while the task is queued or decoding). The prefetch fields are guarded
+    // by the scheduler's queue mutex.
     struct DecodeRequestState
     {
         std::atomic<bool> canceled { false };
+
+        // Thumbnail/preview bytes read by the prefetch stage. Owned by this request,
+        // so no other request (canceled, finished, or same-path) can take them away.
+        std::shared_ptr<const std::vector<uint8_t>> prefetched;
+        bool holdsPrefetchSlot { false };  // counted for prefetch backpressure
+        bool decoding { false };           // taken by a worker
+        std::wstring prefetchVolume;
+        std::wstring prefetchPath;
     };
 
     // Decode task
@@ -29,13 +38,6 @@ namespace ImageCore
         std::function<void(PipelineResult&&)> callback;  // Callback that receives the DecodedImage result (move semantics)
         uint64_t handle;
         std::shared_ptr<DecodeRequestState> state;       // set by Enqueue
-
-        // Thumbnail/preview bytes read by the prefetch stage. Owned by this task,
-        // so no other task (canceled, finished, or same-path) can take them away.
-        std::shared_ptr<const std::vector<uint8_t>> prefetched;
-        // True while the task holds a prefetch slot (counted for backpressure).
-        bool holdsPrefetchSlot { false };
-        std::wstring prefetchVolume;
 
         DecodeTask()
             : handle(0)
@@ -77,8 +79,9 @@ namespace ImageCore
         // once the scheduler has been shut down.
         bool Enqueue(DecodeTask task);
 
-        // Best-effort cancel. A queued task is removed from its queue at once
-        // (releasing any prefetched bytes) and dropped without a callback; a
+        // Best-effort cancel, O(1). A queued task releases its prefetched bytes
+        // and prefetch slot at once and is dropped without a callback when a
+        // thread reaches it; a
         // decode in progress cannot be interrupted, but its callback is suppressed
         // if the cancel is observed before delivery starts. A callback that has
         // already been selected for delivery can still run concurrently with, or
@@ -118,10 +121,10 @@ namespace ImageCore
         // for its handle). Requires m_queueMutex.
         void Finish_NoLock(const DecodeTask& task);
 
-        // Gives back the task's prefetch slot (backpressure count) and drops its
-        // bytes. Returns true if a slot was released; the caller then notifies
+        // Gives back the request's prefetch slot (backpressure count) and drops
+        // its bytes. Returns true if a slot was released; the caller then notifies
         // m_queueCondition after unlocking. Requires m_queueMutex.
-        bool ReleasePrefetch_NoLock(DecodeTask& task);
+        bool ReleasePrefetch_NoLock(DecodeRequestState& state);
 
         // Cached per-volume seek-penalty query. Called without m_queueMutex: the
         // storage query opens the volume device and can block.
@@ -131,9 +134,9 @@ namespace ImageCore
         std::vector<std::thread> m_backgroundWorkers;
         std::thread m_thumbPrefetchWorker;
 
-        std::deque<DecodeTask> m_highQueue;
-        std::deque<DecodeTask> m_thumbIoQueue;     // serialized disk reads (thumbnail/preview)
-        std::deque<DecodeTask> m_backgroundQueue;  // CPU decode/resize work (from prefetched bytes)
+        std::queue<DecodeTask> m_highQueue;
+        std::queue<DecodeTask> m_thumbIoQueue;     // serialized disk reads (thumbnail/preview)
+        std::queue<DecodeTask> m_backgroundQueue;  // CPU decode/resize work (from prefetched bytes)
         mutable std::mutex m_queueMutex;
         std::condition_variable m_queueCondition;
         std::atomic<bool> m_shutdown;

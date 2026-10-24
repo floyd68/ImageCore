@@ -1217,7 +1217,8 @@ IC_TEST(DecodeScheduler_CancelReleasesPrefetchSlotsImmediately)
         {
             scheduler.Cancel(kFirst + i);
         }
-        IC_CHECK(scheduler.PrefetchedTaskCount() < held);
+        // (No slot-count check here: the freed slots wake prefetch, which may
+        // legitimately refill them before any count could be observed.)
         IC_CHECK(WaitUntil([&]() { return byteSource.ReadCount() >= (std::min)(2 * held, static_cast<size_t>(kCount)); }));
 
         gate.Release();
@@ -1289,6 +1290,58 @@ IC_TEST(DecodeScheduler_SamePathCancelRequeueStressKeepsArchiveBytes)
     }
     std::printf("  same-path stress: %zu results delivered, %zu failed\n", done.entries.size(), failures);
     IC_CHECK(failures == 0);
+}
+
+IC_TEST(DecodeScheduler_BulkCancelOfLargeBacklogIsLinear)
+{
+    // A consumer that queues a request per folder entry (thousands) and cancels
+    // them on navigation must not pay a queue scan per Cancel. With the only
+    // worker held and prefetch stopped at its cap, the backlog stays queued while
+    // it is canceled; 8x more requests must cost about 8x more time, far from the
+    // 64x of a per-Cancel scan.
+    const auto& files = Files();
+    Completions done;
+    WorkerGate gate;
+    double smallMs = 0.0;
+    double largeMs = 0.0;
+    {
+        Watchdog watchdog("bulk cancel", std::chrono::seconds(120));
+        DecodeScheduler scheduler;
+        scheduler.SetThreadCount(1);
+        struct ReleaseOnExit { WorkerGate& g; ~ReleaseOnExit() { g.Release(); } } releaseOnExit { gate };
+
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 1, gate.Callback(done, 1))));
+        IC_REQUIRE(gate.WaitEntered());
+
+        auto cancelBacklog = [&](uint64_t first, uint64_t count) -> double
+        {
+            for (uint64_t i = 0; i < count; ++i)
+            {
+                scheduler.Enqueue(MakeTask(files.thumbs[i % files.thumbs.size()], ImagePurpose::Thumbnail,
+                    first + i, done.Callback(first + i)));
+            }
+            const auto start = std::chrono::steady_clock::now();
+            for (uint64_t i = 0; i < count; ++i)
+            {
+                scheduler.Cancel(first + i);
+            }
+            return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        };
+
+        smallMs = cancelBacklog(100, 4000);
+        largeMs = cancelBacklog(100000, 32000);
+        IC_CHECK(scheduler.LiveRequestCount() == 0);
+
+        gate.Release();
+        IC_REQUIRE(done.WaitFor(1));
+        IC_REQUIRE(WaitUntil([&]() { return scheduler.PrefetchedTaskCount() == 0; }));
+    }
+
+    std::printf("  bulk cancel: 4000 queued in %.2f ms, 32000 queued in %.2f ms\n", smallMs, largeMs);
+    // Generous linear bound with a floor for timer noise on tiny durations.
+    IC_CHECK(largeMs < (std::max)(24.0 * smallMs, 50.0));
+    std::lock_guard<std::mutex> lock(done.mutex);
+    IC_CHECK(done.entries.size() == 1);
 }
 
 // Kept last: it creates and destroys many schedulers.
