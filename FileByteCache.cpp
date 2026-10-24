@@ -97,6 +97,13 @@ namespace ImageCore
         return it->second.bytes;
     }
 
+    void FileByteCache::Clear()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_map.clear();
+        m_countByVolume.clear();
+    }
+
     void FileByteCache::EraseIfUnshared(const std::wstring& path)
     {
         if (path.empty())

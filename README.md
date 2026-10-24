@@ -73,9 +73,15 @@ DirectXTex decoding supports:
 ## Cancellation semantics
 
 - `ImageLoader::Cancel(handle)` is **best-effort**:
-  - queued tasks may be skipped
-  - if decode already started, we cannot abort the decoder safely
-  - but the callback is suppressed for canceled handles to avoid applying stale results
+  - queued tasks are skipped without a callback
+  - if decode already started, we cannot abort the decoder safely, but the callback is suppressed when the cancel is observed before delivery starts
+  - a callback whose delivery has already started can still run concurrently with, or after, `Cancel` returns, so callers must drop stale results themselves (for example with a generation)
+- Cancellation state is owned by each request and released when the request finishes, is canceled, or the scheduler shuts down; canceling an unknown or finished handle is a no-op and leaves nothing behind.
+- `ImageLoader::Shutdown()` is idempotent and final: queued requests are dropped without callbacks, and later `RequestDecoded` calls return 0 without invoking the callback.
+
+## Priority
+
+- Full-resolution (main image) work always runs at above-normal thread priority, including when a background worker picks it up; thumbnail/preview work runs in Windows background mode (lower CPU and I/O priority).
 
 ## Building
 

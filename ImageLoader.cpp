@@ -32,16 +32,28 @@ namespace ImageCore
         RegisterBuiltInDecoders();
 
         m_cache = std::make_unique<ImageCache>();
-        m_scheduler = std::make_unique<DecodeScheduler>();
+        m_scheduler = std::make_shared<DecodeScheduler>();
+    }
+
+    std::shared_ptr<DecodeScheduler> ImageLoader::Scheduler() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_scheduler;
     }
 
     void ImageLoader::Shutdown()
     {
-        if (m_scheduler)
+        std::shared_ptr<DecodeScheduler> scheduler;
         {
-            m_scheduler->Shutdown();
+            std::lock_guard<std::mutex> lock(m_mutex);
+            scheduler = std::move(m_scheduler);
         }
-        m_scheduler.reset();
+        if (scheduler)
+        {
+            // Joins the workers; a request racing with this sees either the
+            // nullptr above or a scheduler that rejects it.
+            scheduler->Shutdown();
+        }
         m_cache.reset();
     }
 
@@ -50,6 +62,12 @@ namespace ImageCore
         DecodedImageLoadCallback callback)
     {
         if (request.source.empty() || !callback)
+        {
+            return 0;
+        }
+
+        std::shared_ptr<DecodeScheduler> scheduler = Scheduler();
+        if (!scheduler)
         {
             return 0;
         }
@@ -76,18 +94,24 @@ namespace ImageCore
             callback(S_OK, std::move(result.image));
         };
 
-        m_scheduler->Enqueue(std::move(task));
+        if (!scheduler->Enqueue(std::move(task)))
+        {
+            return 0;
+        }
         return handle;
     }
 
     void ImageLoader::Cancel(ImageHandle handle)
     {
-        if (handle == 0 || !m_scheduler)
+        if (handle == 0)
         {
             return;
         }
 
-        m_scheduler->Cancel(handle);
+        if (std::shared_ptr<DecodeScheduler> scheduler = Scheduler())
+        {
+            scheduler->Cancel(handle);
+        }
     }
 
     void ImageLoader::ClearCache()
@@ -108,10 +132,15 @@ namespace ImageCore
 
     void ImageLoader::SetWorkerThreadCount(size_t count)
     {
-        if (m_scheduler)
+        if (std::shared_ptr<DecodeScheduler> scheduler = Scheduler())
         {
-            m_scheduler->SetThreadCount(count);
+            scheduler->SetThreadCount(count);
         }
     }
-}
 
+    size_t ImageLoader::LiveRequestCount() const
+    {
+        std::shared_ptr<DecodeScheduler> scheduler = Scheduler();
+        return scheduler ? scheduler->LiveRequestCount() : 0;
+    }
+}

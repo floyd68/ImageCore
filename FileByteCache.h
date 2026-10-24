@@ -19,6 +19,8 @@ namespace ImageCore
         std::shared_ptr<const std::vector<uint8_t>> Get(const std::wstring& path) const;
         // Removes entry if the cache is the only owner (safe with concurrent/overlapping requests).
         void EraseIfUnshared(const std::wstring& path);
+        // Drops every entry (scheduler shutdown/restart: no task can still use them).
+        void Clear();
 
         size_t Count() const;
         size_t CountForVolume(const std::wstring& volume) const;
