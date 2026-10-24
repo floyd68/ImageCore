@@ -33,3 +33,9 @@ target_link_libraries(ImageCore PUBLIC
 if(MSVC)
     target_compile_options(ImageCore PRIVATE /permissive-)
 endif()
+
+option(IMAGECORE_BUILD_TESTS "Build ImageCore unit tests (configure from the FICture2 tree)" OFF)
+if(IMAGECORE_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
