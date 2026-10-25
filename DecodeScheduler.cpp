@@ -362,15 +362,6 @@ namespace ImageCore
         }
     }
 
-    void DecodeScheduler::QueueStop(std::shared_ptr<DecodeRequestState> state)
-    {
-        {
-            std::lock_guard<std::mutex> lock(m_stopMutex);
-            m_stopQueue.push_back(std::move(state));
-        }
-        m_stopCondition.notify_all();
-    }
-
     void DecodeScheduler::CancelActiveReadsIo()
     {
         // Only CancelSynchronousIo (no host code), so the caller's deadline
@@ -668,7 +659,18 @@ namespace ImageCore
                 releasedSlot = ReleasePrefetch_NoLock(state);
             }
             m_liveRequests.erase(it);
+
+            // A read in progress is released through the request's token (and
+            // OS cancellation), both dispatched on the stop-dispatch thread, so
+            // no host stop callback runs on (or can block) the caller. The stop
+            // is published in the same critical section that removes the
+            // request: a Shutdown either finds it in the live table or runs
+            // after it is queued, so the dispatch thread cannot retire first.
+            std::lock_guard<std::mutex> stopLock(m_stopMutex);
+            m_stopQueue.push_back(std::move(canceledState));
         }
+        m_stopCondition.notify_all();
+        RunTestHook(TestPoint::CancelPublished, handle);
 
         // The request no longer holds its bytes; drop the shared cache entry if
         // nothing else uses it, then wake the prefetch stage for the free slot.
@@ -677,11 +679,6 @@ namespace ImageCore
             FileByteCache::Instance().EraseIfUnshared(releasedPath);
             m_queueCondition.notify_all();
         }
-
-        // A read in progress is released through the request's token (and OS
-        // cancellation). Both are dispatched on the stop-dispatch thread, so no
-        // host stop callback runs on (or can block) the caller.
-        QueueStop(std::move(canceledState));
     }
 
     void DecodeScheduler::Shutdown()

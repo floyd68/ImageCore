@@ -3373,6 +3373,47 @@ IC_TEST(ReadCancel_BoundedShutdownWaitsForThreadTermination)
     IC_CHECK(DeliveryCount(done) == 1);
 }
 
+IC_TEST(ReadCancel_ShutdownWhileCancelIsPublishingStillStopsTheRead)
+{
+    // Cancel is paused right after it removed the request from the live table
+    // (CancelPublished). A Shutdown running then no longer finds the request in
+    // the table, so the stop must already be queued for the dispatch thread:
+    // the token-only read is released and Shutdown(bound) joins in time.
+    const auto& files = Files();
+    Completions done;
+    HookProbe probe;
+    Watchdog watchdog("shutdown during cancel publication", std::chrono::seconds(60));
+    ControlledSource source(files.dir);
+    const std::wstring entry = source.Entry(files.thumbs[4]);
+    source.SetMode(entry, Mode::Cooperative);
+    probe.HoldAt(Point::CancelPublished, 1);
+    bool ok = false;
+    long long elapsed = 0;
+    {
+        DecodeScheduler scheduler;
+        scheduler.SetTestHook(probe.Hook());
+        scheduler.SetThreadCount(1);
+        OnExit release { [&] { probe.ReleaseAll(); source.Release(); } };
+
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(entry, ImagePurpose::Thumbnail, 1, done.Callback(1))));
+        IC_REQUIRE(source.WaitEntered(entry));
+        std::thread canceler([&] { scheduler.Cancel(1); });
+        IC_REQUIRE(probe.WaitHeld(Point::CancelPublished, 1));
+        IC_CHECK(scheduler.LiveRequestCount() == 0);
+
+        const auto start = std::chrono::steady_clock::now();
+        ok = scheduler.Shutdown(std::chrono::milliseconds(3000));
+        elapsed = ElapsedMs(start);
+        probe.Release(Point::CancelPublished, 1);
+        canceler.join();
+        IC_CHECK(ok);
+        IC_CHECK(elapsed < 2000);
+    }
+    std::printf("  shutdown during cancel publication: %s in %lld ms\n", ok ? "joined" : "timed out", elapsed);
+    IC_CHECK(source.StoppedReturns(entry) == 1);
+    IC_CHECK(DeliveryCount(done) == 0);
+}
+
 IC_TEST(ReadCancel_CancelFinishShutdownRaceStress)
 {
     // Cancel, read completion and bounded shutdown race: a canceler thread keeps

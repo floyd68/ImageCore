@@ -231,6 +231,7 @@ namespace ImageCore
             CancelDispatch,     // just before CancelSynchronousIo (see above)
             DecodeStart,        // decode worker, just before the decode stage runs
             StopDispatched,     // stop-dispatch thread, after a request's stop and OS cancel attempt
+            CancelPublished,    // canceling thread, after Cancel removed the request and queued its stop
         };
         using TestHook = std::function<void(TestPoint point, uint64_t handle)>;
 
@@ -264,8 +265,6 @@ namespace ImageCore
         // Runs no host code. Requires m_lifecycleMutex (it walks m_threads).
         void CancelActiveReadsIo();
 
-        // Queues a stop request for the stop-dispatch thread.
-        void QueueStop(std::shared_ptr<DecodeRequestState> state);
         void StopDispatchThread(ThreadSlot* slot);
 
         // Reads `path` for `state` through the host byte source with the
@@ -312,7 +311,8 @@ namespace ImageCore
         std::condition_variable m_exitCondition;
 
         // Stop-dispatch queue (guarded by m_stopMutex). m_stopExit lets the
-        // dispatch thread exit once the queue is drained.
+        // dispatch thread exit once the queue is drained. Lock order:
+        // m_queueMutex, then m_stopMutex (Cancel publishes under both).
         std::mutex m_stopMutex;
         std::condition_variable m_stopCondition;
         std::deque<std::shared_ptr<DecodeRequestState>> m_stopQueue;
