@@ -17,6 +17,8 @@
 #include <cstdio>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <algorithm>
 
@@ -1378,4 +1380,370 @@ IC_TEST(DecodeScheduler_ShutdownCyclesNeverHang)
     }
 
     IC_CHECK(completed == 2 * (kCycles / 3));
+}
+
+// ---------------------------------------------------------------------------
+// Request priority and promotion (both stages). The prefetch stage is held in
+// a gated read or the only decode worker in a gated callback, so the queue
+// contents are fixed before the order is observed.
+
+namespace
+{
+    // Filesystem byte source whose read of one path blocks until Open().
+    class GatedFileByteSource final : public ScopedFileByteSource
+    {
+    public:
+        explicit GatedFileByteSource(std::wstring gatedPath)
+            : m_gatedPath(std::move(gatedPath))
+        {
+        }
+
+        std::vector<uint8_t> ReadAll(const std::wstring& path) const override
+        {
+            if (path == m_gatedPath)
+            {
+                std::unique_lock<std::mutex> lock(m_mutex);
+                m_entered = true;
+                m_cv.notify_all();
+                m_cv.wait(lock, [&] { return m_open; });
+            }
+            return ScopedFileByteSource::ReadAll(path);
+        }
+
+        bool WaitEntered()
+        {
+            std::unique_lock<std::mutex> lock(m_mutex);
+            return m_cv.wait_for(lock, kWaitTimeout, [&] { return m_entered; });
+        }
+
+        void Open()
+        {
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_open = true;
+            }
+            m_cv.notify_all();
+        }
+
+    private:
+        std::wstring m_gatedPath;
+        mutable std::mutex m_mutex;
+        mutable std::condition_variable m_cv;
+        mutable bool m_entered { false };
+        bool m_open { false };
+    };
+
+    // Opens the gate on every exit path (declare after the scheduler).
+    struct ByteGateRelease
+    {
+        GatedFileByteSource& source;
+        ~ByteGateRelease() { source.Open(); }
+    };
+
+    DecodeTask MakeThumb(const std::wstring& path, uint64_t handle, RequestPriority priority,
+        std::function<void(PipelineResult&&)> callback)
+    {
+        DecodeTask task = MakeTask(path, ImagePurpose::Thumbnail, handle, std::move(callback));
+        task.priority = priority;
+        return task;
+    }
+
+    size_t IndexOf(const std::vector<std::wstring>& items, const std::wstring& value)
+    {
+        return static_cast<size_t>(std::find(items.begin(), items.end(), value) - items.begin());
+    }
+
+    bool WaitUntil(const std::function<bool()>& condition)
+    {
+        const auto deadline = std::chrono::steady_clock::now() + kWaitTimeout;
+        while (!condition())
+        {
+            if (std::chrono::steady_clock::now() > deadline)
+            {
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        return true;
+    }
+}
+
+IC_TEST(DecodeScheduler_PriorityOrdersAndPromotesInTheIoStage)
+{
+    // The prefetch stage is held inside the read of thumbs[0]. Queued meanwhile:
+    // three prefetch-priority thumbnails, then one visible; then the third
+    // prefetch one is promoted. Reads after the gate must follow priority, then
+    // age: the promoted one (older) and the visible one before the other two.
+    const auto& files = Files();
+    Completions done;
+    std::vector<std::wstring> reads;
+    {
+        Watchdog watchdog("I/O priority test", std::chrono::seconds(60));
+        GatedFileByteSource byteSource(files.thumbs[0]);
+        DecodeScheduler scheduler;
+        scheduler.SetThreadCount(2);
+        ByteGateRelease release { byteSource };
+
+        scheduler.Enqueue(MakeThumb(files.thumbs[0], 1, RequestPriority::Prefetch, done.Callback(1)));
+        IC_REQUIRE(byteSource.WaitEntered());
+        scheduler.Enqueue(MakeThumb(files.thumbs[1], 2, RequestPriority::Prefetch, done.Callback(2)));
+        scheduler.Enqueue(MakeThumb(files.thumbs[2], 3, RequestPriority::Prefetch, done.Callback(3)));
+        scheduler.Enqueue(MakeThumb(files.thumbs[3], 4, RequestPriority::Prefetch, done.Callback(4)));
+        scheduler.Enqueue(MakeThumb(files.thumbs[4], 5, RequestPriority::Visible, done.Callback(5)));
+        scheduler.SetPriority(4, RequestPriority::Visible);   // promote thumbs[3]
+        scheduler.SetPriority(99, RequestPriority::Visible);  // unknown: no-op
+
+        byteSource.Open();
+        IC_REQUIRE(done.WaitFor(5));
+        reads = byteSource.Reads();
+    }
+
+    IC_REQUIRE(reads.size() == 5);
+    IC_CHECK(reads[0] == files.thumbs[0]);
+    IC_CHECK(reads[1] == files.thumbs[3]);   // promoted, older than thumbs[4]
+    IC_CHECK(reads[2] == files.thumbs[4]);   // visible
+    IC_CHECK(reads[3] == files.thumbs[1]);   // prefetch, by age
+    IC_CHECK(reads[4] == files.thumbs[2]);
+    for (const auto& entry : done.entries)
+    {
+        IC_CHECK(SUCCEEDED(entry.hr));
+    }
+}
+
+IC_TEST(DecodeScheduler_HigherPriorityTakesTheNextPrefetchSlot)
+{
+    // The only decode worker is held, so prefetched bytes reach the cap and the
+    // prefetch stage waits for a slot holding the next prefetch-priority task.
+    // A visible request queued now must get that slot first.
+    const auto& files = Files();
+    FileByteCache& cache = FileByteCache::Instance();
+    Completions done;
+
+    std::mutex gateMutex;
+    std::condition_variable gateCv;
+    bool entered = false;
+    bool released = false;
+    std::vector<std::wstring> reads;
+    size_t readsAtCap = 0;
+    const size_t backlog = 12;
+    {
+        Watchdog watchdog("prefetch slot test", std::chrono::seconds(60));
+        ScopedFileByteSource byteSource;
+        DecodeScheduler scheduler;
+        scheduler.SetThreadCount(1);
+        GateRelease releaseOnExit { gateMutex, gateCv, released };
+
+        auto gated = [&, inner = done.Callback(1)](PipelineResult&& result) mutable
+        {
+            {
+                std::unique_lock<std::mutex> lock(gateMutex);
+                entered = true;
+                gateCv.notify_all();
+                gateCv.wait(lock, [&]() { return released; });
+            }
+            inner(std::move(result));
+        };
+        scheduler.Enqueue(MakeThumb(files.thumbs[0], 1, RequestPriority::Prefetch, gated));
+        for (size_t i = 1; i < backlog; ++i)
+        {
+            const uint64_t handle = static_cast<uint64_t>(i) + 1;
+            scheduler.Enqueue(MakeThumb(files.thumbs[i], handle, RequestPriority::Prefetch, done.Callback(handle)));
+        }
+        const size_t cap = cache.MaxEntries();
+        IC_REQUIRE(cap + 2 < backlog);
+        {
+            std::unique_lock<std::mutex> lock(gateMutex);
+            IC_REQUIRE(gateCv.wait_for(lock, kWaitTimeout, [&]() { return entered; }));
+        }
+        IC_REQUIRE(WaitUntil([&] { return scheduler.PrefetchedTaskCount() == cap; }));
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));   // let the stage block on the slot
+        readsAtCap = byteSource.ReadCount();
+
+        const std::wstring& visible = files.thumbs[backlog];
+        const uint64_t visibleHandle = backlog + 1;
+        scheduler.Enqueue(MakeThumb(visible, visibleHandle, RequestPriority::Visible, done.Callback(visibleHandle)));
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        IC_CHECK(byteSource.ReadCount() == readsAtCap);   // still at the cap
+
+        {
+            std::lock_guard<std::mutex> lock(gateMutex);
+            released = true;
+        }
+        gateCv.notify_all();
+        IC_REQUIRE(done.WaitFor(backlog + 1));
+        reads = byteSource.Reads();
+    }
+
+    IC_REQUIRE(reads.size() == backlog + 1);
+    IC_CHECK(readsAtCap >= 1);
+    // The first read after the cap was the visible request, not the waiting one.
+    IC_CHECK(reads[readsAtCap] == files.thumbs[backlog]);
+}
+
+IC_TEST(DecodeScheduler_PromotionReordersTheDecodeStage)
+{
+    // With the only decode worker held, several thumbnails are read and wait in
+    // the decode stage. Promoting the oldest-but-lowest one to MainImage priority
+    // makes it decode first once the worker is free.
+    const auto& files = Files();
+    FileByteCache& cache = FileByteCache::Instance();
+    Completions done;
+
+    std::mutex gateMutex;
+    std::condition_variable gateCv;
+    bool entered = false;
+    bool released = false;
+    bool skipped = false;
+    {
+        Watchdog watchdog("decode priority test", std::chrono::seconds(60));
+        ScopedFileByteSource byteSource;
+        DecodeScheduler scheduler;
+        scheduler.SetThreadCount(1);
+        GateRelease releaseOnExit { gateMutex, gateCv, released };
+
+        auto gated = [&, inner = done.Callback(1)](PipelineResult&& result) mutable
+        {
+            {
+                std::unique_lock<std::mutex> lock(gateMutex);
+                entered = true;
+                gateCv.notify_all();
+                gateCv.wait(lock, [&]() { return released; });
+            }
+            inner(std::move(result));
+        };
+        scheduler.Enqueue(MakeThumb(files.thumbs[0], 1, RequestPriority::Visible, gated));
+        {
+            std::unique_lock<std::mutex> lock(gateMutex);
+            IC_REQUIRE(gateCv.wait_for(lock, kWaitTimeout, [&]() { return entered; }));
+        }
+        scheduler.Enqueue(MakeThumb(files.thumbs[1], 2, RequestPriority::Prefetch, done.Callback(2)));
+        scheduler.Enqueue(MakeThumb(files.thumbs[2], 3, RequestPriority::Prefetch, done.Callback(3)));
+        scheduler.Enqueue(MakeThumb(files.thumbs[3], 4, RequestPriority::Visible, done.Callback(4)));
+
+        // All three must wait in the decode stage (they hold prefetch slots next
+        // to the held task); a seek-penalty volume caps prefetch below that.
+        if (cache.MaxEntries() < 4)
+        {
+            skipped = true;
+        }
+        else
+        {
+            IC_REQUIRE(WaitUntil([&] { return scheduler.PrefetchedTaskCount() == 4; }));
+            scheduler.SetPriority(2, RequestPriority::MainImage);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(gateMutex);
+            released = true;
+        }
+        gateCv.notify_all();
+        IC_REQUIRE(done.WaitFor(4));
+    }
+
+    if (skipped)
+    {
+        std::printf("  (prefetch cap below 4 on this volume: decode-stage ordering not checked)\n");
+        return;
+    }
+    IC_REQUIRE(done.entries.size() == 4);
+    IC_CHECK(done.entries[0].handle == 1);
+    IC_CHECK(done.entries[1].handle == 2);   // promoted to MainImage
+    IC_CHECK(done.entries[2].handle == 4);   // visible
+    IC_CHECK(done.entries[3].handle == 3);   // prefetch
+}
+
+IC_TEST(DecodeScheduler_PromotionAndCancelStressUnderTileReuse)
+{
+    // Rapid tile reuse: each "tile" repeatedly cancels its request and issues a
+    // new one for another path, while scrolling promotes and demotes recent
+    // handles (including stale ones). Every request that was not canceled must
+    // complete exactly once; nothing may remain live or hold prefetched bytes.
+    const auto& files = Files();
+    constexpr int kTiles = 16;
+    constexpr int kRounds = 60;
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::unordered_map<uint64_t, int> deliveries;
+    std::unordered_set<uint64_t> canceled;
+    std::vector<uint64_t> issued;
+    {
+        Watchdog watchdog("priority stress", std::chrono::seconds(90));
+        ScopedFileByteSource byteSource;
+        DecodeScheduler scheduler;
+        scheduler.SetThreadCount(3);
+
+        std::vector<uint64_t> tileHandle(kTiles, 0);
+        uint64_t nextHandle = 1;
+        uint32_t rng = 12345;
+        const auto next = [&rng]() { rng = rng * 1664525u + 1013904223u; return rng >> 8; };
+        for (int round = 0; round < kRounds; ++round)
+        {
+            for (int tile = 0; tile < kTiles; ++tile)
+            {
+                if (tileHandle[tile] != 0)
+                {
+                    scheduler.Cancel(tileHandle[tile]);
+                    std::lock_guard<std::mutex> lock(mutex);
+                    canceled.insert(tileHandle[tile]);
+                }
+                const uint64_t handle = nextHandle++;
+                tileHandle[tile] = handle;
+                issued.push_back(handle);
+                const auto priority = static_cast<RequestPriority>(next() % 3);
+                const auto& path = files.thumbs[next() % files.thumbs.size()];
+                scheduler.Enqueue(MakeThumb(path, handle, priority, [&, handle](PipelineResult&&)
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    ++deliveries[handle];
+                    cv.notify_all();
+                }));
+            }
+            // Scrolling: re-prioritize random recent handles, some long finished.
+            for (int k = 0; k < kTiles; ++k)
+            {
+                const uint64_t handle = 1 + next() % (nextHandle - 1);
+                scheduler.SetPriority(handle, static_cast<RequestPriority>(next() % 3));
+            }
+        }
+
+        // The last request of every tile stays live: all of those must complete.
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            IC_REQUIRE(cv.wait_for(lock, std::chrono::seconds(30), [&]
+            {
+                for (uint64_t handle : tileHandle)
+                {
+                    if (deliveries.find(handle) == deliveries.end())
+                    {
+                        return false;
+                    }
+                }
+                return true;
+            }));
+        }
+        IC_REQUIRE(WaitUntil([&] { return scheduler.LiveRequestCount() == 0; }));
+        IC_CHECK(WaitUntil([&] { return scheduler.PrefetchedTaskCount() == 0; }));
+        // Promoting finished handles leaves no state behind.
+        for (uint64_t handle : tileHandle)
+        {
+            scheduler.SetPriority(handle, RequestPriority::MainImage);
+        }
+        IC_CHECK(scheduler.LiveRequestCount() == 0);
+    }
+
+    std::lock_guard<std::mutex> lock(mutex);
+    for (uint64_t handle : issued)
+    {
+        const auto it = deliveries.find(handle);
+        const int count = (it == deliveries.end()) ? 0 : it->second;
+        if (canceled.count(handle) != 0)
+        {
+            IC_CHECK(count <= 1);   // a late cancel may still deliver once
+        }
+        else
+        {
+            IC_CHECK(count == 1);
+        }
+    }
 }

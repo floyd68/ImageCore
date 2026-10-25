@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <atomic>
 #include <functional>
+#include <map>
 #include <memory>
 #include <unordered_map>
 
@@ -29,6 +30,12 @@ namespace ImageCore
         bool decoding { false };           // taken by a worker
         std::wstring prefetchVolume;
         std::wstring prefetchPath;
+
+        // Scheduling (guarded by the queue mutex). The sequence orders requests
+        // of one priority by age and survives promotion.
+        RequestPriority priority { RequestPriority::Visible };
+        uint64_t sequence { 0 };
+        enum class Stage { None, Io, Decode } queuedIn { Stage::None };
     };
 
     // Decode task
@@ -37,12 +44,46 @@ namespace ImageCore
         ImageRequest request;
         std::function<void(PipelineResult&&)> callback;  // Callback that receives the DecodedImage result (move semantics)
         uint64_t handle;
+        RequestPriority priority { RequestPriority::Visible };  // initial priority
         std::shared_ptr<DecodeRequestState> state;       // set by Enqueue
 
         DecodeTask()
             : handle(0)
         {
         }
+    };
+
+    // Thumbnail/preview queue ordered by priority, then age. Promotion re-keys a
+    // queued task in O(log n). Canceled tasks stay until popped (see Cancel).
+    // Not thread-safe: the scheduler guards it with its queue mutex.
+    class PriorityTaskQueue
+    {
+    public:
+        // Inserts `task` by its state's priority and sequence; records `stage`.
+        void Push(DecodeTask task, DecodeRequestState::Stage stage);
+        bool Empty() const { return m_tasks.empty(); }
+        size_t Size() const { return m_tasks.size(); }
+        RequestPriority TopPriority() const;
+        DecodeTask Pop();
+        // Moves the queued task of `state` to `priority`; false if not queued here.
+        bool Reprioritize(DecodeRequestState& state, RequestPriority priority);
+
+    private:
+        struct Key
+        {
+            uint8_t rank { 0 };      // 255 - priority: highest priority first
+            uint64_t sequence { 0 };
+            bool operator<(const Key& other) const
+            {
+                return rank != other.rank ? rank < other.rank : sequence < other.sequence;
+            }
+        };
+        static Key KeyOf(RequestPriority priority, uint64_t sequence)
+        {
+            return Key { static_cast<uint8_t>(255 - static_cast<uint8_t>(priority)), sequence };
+        }
+
+        std::map<Key, DecodeTask> m_tasks;
     };
 
     class DecodeScheduler
@@ -75,9 +116,22 @@ namespace ImageCore
         // Number of running decode worker threads (excludes the prefetch thread).
         size_t WorkerCount() const;
 
-        // Add to the task queue. Returns false (and never invokes the callback)
-        // once the scheduler has been shut down.
+        // Add to the task queue at `task.priority`. Returns false (and never
+        // invokes the callback) once the scheduler has been shut down.
+        //
+        // Priority: full-resolution requests have their own queue, served first
+        // by every worker. Thumbnail/preview requests pass the serialized I/O
+        // stage and then the decode stage; both take the highest priority first
+        // (then the oldest), and a higher-priority request also takes over the
+        // next free prefetch slot from a lower-priority one waiting for it.
         bool Enqueue(DecodeTask task);
+
+        // Changes the priority of a queued request, O(log n): promotion moves it
+        // ahead of lower-priority work in whichever stage it is waiting, and a
+        // request between stages keeps the new priority for the next one. A
+        // request already decoding, finished, canceled or unknown is a no-op, so
+        // a recycled tile can promote or demote a stale handle safely.
+        void SetPriority(uint64_t handle, RequestPriority priority);
 
         // Best-effort cancel, O(1). A queued task releases its prefetched bytes
         // and prefetch slot at once and is dropped without a callback when a
@@ -135,8 +189,9 @@ namespace ImageCore
         std::thread m_thumbPrefetchWorker;
 
         std::queue<DecodeTask> m_highQueue;
-        std::queue<DecodeTask> m_thumbIoQueue;     // serialized disk reads (thumbnail/preview)
-        std::queue<DecodeTask> m_backgroundQueue;  // CPU decode/resize work (from prefetched bytes)
+        PriorityTaskQueue m_thumbIoQueue;     // serialized disk reads (thumbnail/preview)
+        PriorityTaskQueue m_backgroundQueue;  // CPU decode/resize work (from prefetched bytes)
+        uint64_t m_nextSequence { 0 };        // guarded by m_queueMutex
         mutable std::mutex m_queueMutex;
         std::condition_variable m_queueCondition;
         std::atomic<bool> m_shutdown;

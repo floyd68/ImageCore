@@ -18,6 +18,25 @@ namespace ImageCore
         FullResolution  // Original resolution
     };
 
+    // Scheduling priority of a request. It is not part of the request's
+    // identity (equality, hash, cache key) and can change while the request is
+    // queued (ImageLoader::SetPriority). Higher values run first in both the
+    // serialized I/O stage and the decode stage; within one level, older
+    // requests run first.
+    enum class RequestPriority : uint8_t
+    {
+        Prefetch = 0,   // near-visible work that may never be shown
+        Visible = 1,    // on screen now
+        MainImage = 2,  // the image being viewed
+    };
+
+    // MainImage for full-resolution requests (which also have their own queue
+    // and worker), Visible otherwise.
+    inline RequestPriority DefaultPriority(ImagePurpose purpose)
+    {
+        return purpose == ImagePurpose::FullResolution ? RequestPriority::MainImage : RequestPriority::Visible;
+    }
+
     struct ImageRequest
     {
         std::wstring source;        // File path
