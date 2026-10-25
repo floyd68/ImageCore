@@ -27,8 +27,9 @@ if(MSVC)
 endif()
 
 add_test(NAME ImageCore.DecodeScheduler COMMAND ImageCoreTests DecodeScheduler_)
+add_test(NAME ImageCore.ReadCancel COMMAND ImageCoreTests ReadCancel_)
 add_test(NAME ImageCore.Log COMMAND ImageCoreTests Log_)
 # ImageLoader is a process singleton whose Shutdown is final: own process.
 add_test(NAME ImageCore.ImageLoader COMMAND ImageCoreTests ImageLoader_)
 # Safety net only: every wait inside the tests is bounded at 10 s.
-set_tests_properties(ImageCore.DecodeScheduler ImageCore.Log ImageCore.ImageLoader PROPERTIES TIMEOUT 120)
+set_tests_properties(ImageCore.DecodeScheduler ImageCore.ReadCancel ImageCore.Log ImageCore.ImageLoader PROPERTIES TIMEOUT 120)

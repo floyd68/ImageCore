@@ -12,16 +12,31 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <stop_token>
 #include <unordered_map>
 
 namespace ImageCore
 {
+    // Read lease of one scheduler thread (defined in DecodeScheduler.cpp): which
+    // request's byte-source read runs on that thread right now. OS cancellation
+    // (CancelSynchronousIo) for a request is issued through the lease, under its
+    // mutex, and only while that request's read is registered on it.
+    struct ReadLease;
+
     // Per-request state, owned by the task (and by the scheduler's live-request
     // table while the task is queued or decoding). The prefetch fields are guarded
     // by the scheduler's queue mutex.
     struct DecodeRequestState
     {
         std::atomic<bool> canceled { false };
+
+        // Request-owned I/O cancellation: Cancel and Shutdown request stop on it,
+        // outside every scheduler lock. Its token is passed to the byte source.
+        std::stop_source stop;
+
+        // Lease of the thread that took this request (guarded by the queue
+        // mutex; set once, when a prefetch or decode thread takes the task).
+        std::shared_ptr<ReadLease> readLease;
 
         // Thumbnail/preview bytes read by the prefetch stage. Owned by this request,
         // so no other request (canceled, finished, or same-path) can take them away.
@@ -135,9 +150,16 @@ namespace ImageCore
 
         // Best-effort cancel, O(1). A queued task releases its prefetched bytes
         // and prefetch slot at once and is dropped without a callback when a
-        // thread reaches it; a
-        // decode in progress cannot be interrupted, but its callback is suppressed
-        // if the cancel is observed before delivery starts. A callback that has
+        // thread reaches it. A byte-source read in progress (thumbnail prefetch
+        // or full-resolution archive read) is asked to stop through the
+        // request's stop token, and CancelSynchronousIo is tried on the reading
+        // thread (best effort); its result is discarded, never cached, and the
+        // request never reaches the decode stage (so the decoders' own path
+        // fallback cannot re-read the file). A request canceled before its decode
+        // starts is not decoded. A decode in progress cannot be interrupted, but
+        // its callback is suppressed if the cancel is observed before delivery
+        // starts. The token is signaled after the queue lock is released, so a
+        // synchronous stop callback may call back into the scheduler. A callback that has
         // already been selected for delivery can still run concurrently with, or
         // after, Cancel returning, so callers must validate results themselves
         // (for example with a generation). Canceling an unknown or finished handle
@@ -160,6 +182,24 @@ namespace ImageCore
         // quantity bounded by prefetch backpressure).
         size_t PrefetchedTaskCount() const;
 
+        // Test-only seam: points in a request's life at which the hook runs, on
+        // the thread named. No scheduler lock is held, except CancelDispatch,
+        // which runs under the reading thread's read-lease mutex (so the worker
+        // cannot retire that read or start another one until the hook returns).
+        enum class TestPoint
+        {
+            TaskTaken,          // decode worker, after taking a task, before any read or decode
+            BeforeReadRegister, // reading thread, before registering a read on its lease
+            BeforeReadRetire,   // reading thread, after the read returned, before retiring it
+            CancelDispatch,     // canceling thread, just before CancelSynchronousIo
+            DecodeStart,        // decode worker, just before the decode stage runs
+        };
+        using TestHook = std::function<void(TestPoint point, uint64_t handle)>;
+
+        // Installs the hook. Set it before the first Enqueue (it is read without
+        // synchronization by the scheduler threads).
+        void SetTestHook(TestHook hook);
+
     private:
         enum class WorkerKind
         {
@@ -168,8 +208,30 @@ namespace ImageCore
             Shared      // sole worker: high queue first, then background queue
         };
 
-        void WorkerThread(WorkerKind kind);
-        void ThumbPrefetchThread();
+        // One scheduler thread (decode worker or prefetch thread) and its read
+        // lease. Defined in DecodeScheduler.cpp.
+        struct ThreadSlot;
+
+        void WorkerThread(WorkerKind kind, ThreadSlot* slot);
+        void ThumbPrefetchThread(ThreadSlot* slot);
+
+        // Reads `path` for `state` through the host byte source with the
+        // request's stop token, registered on `lease` for the duration of the
+        // read. Returns null on failure, and also when stop was requested
+        // (`stopped` is then true): a canceled read's bytes are never used.
+        std::shared_ptr<std::vector<uint8_t>> LeasedRead(
+            ReadLease& lease,
+            const std::shared_ptr<DecodeRequestState>& state,
+            uint64_t handle,
+            const std::wstring& path,
+            bool& stopped);
+
+        // Signals stop on `state`'s token, then tries CancelSynchronousIo on the
+        // thread whose lease has `state`'s read registered. Call without any
+        // scheduler lock: stop callbacks run synchronously in here.
+        void StopRequest(const std::shared_ptr<DecodeRequestState>& state, uint64_t handle);
+
+        void RunTestHook(TestPoint point, uint64_t handle) const;
 
         // Removes `task` from the live-request table (if it is still the entry
         // for its handle). Requires m_queueMutex.
@@ -184,9 +246,11 @@ namespace ImageCore
         // storage query opens the volume device and can block.
         size_t PrefetchDepthForPath(const std::wstring& path);
 
-        std::vector<std::thread> m_highWorkers;
-        std::vector<std::thread> m_backgroundWorkers;
-        std::thread m_thumbPrefetchWorker;
+        // Decode workers and the prefetch thread. Started and joined only by
+        // SetThreadCount and Shutdown.
+        std::vector<std::unique_ptr<ThreadSlot>> m_threads;
+        std::atomic<size_t> m_workerCount { 0 };  // decode workers in m_threads
+        TestHook m_testHook;
 
         std::queue<DecodeTask> m_highQueue;
         PriorityTaskQueue m_thumbIoQueue;     // serialized disk reads (thumbnail/preview)

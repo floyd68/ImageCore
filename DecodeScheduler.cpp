@@ -90,7 +90,7 @@ namespace ImageCore
             return desc.IncursSeekPenalty ? true : false;
         }
 
-        static std::shared_ptr<std::vector<uint8_t>> ReadWholeFileBytes(const std::wstring& path)
+        static std::shared_ptr<std::vector<uint8_t>> ReadWholeFileBytes(const std::wstring& path, std::stop_token stop)
         {
             IPathByteSource* source = GetPathByteSource();
             if (!source)
@@ -99,7 +99,7 @@ namespace ImageCore
             }
 
             // Host adapter reads disk files and archive entries.
-            std::vector<uint8_t> data = source->ReadAll(path);
+            std::vector<uint8_t> data = source->ReadAll(path, stop);
             if (data.empty())
             {
                 return nullptr;
@@ -128,6 +128,48 @@ namespace ImageCore
         }
 
         // (debug-only tracing removed)
+    }
+
+    struct ReadLease
+    {
+        // Guards both fields. OS cancellation is issued under it, so retiring a
+        // read (which takes it) waits for any CancelSynchronousIo aimed at that
+        // read, and a late cancel can never hit the thread's next operation.
+        std::mutex mutex;
+        HANDLE thread { nullptr };                    // real handle of the owning thread
+        std::shared_ptr<DecodeRequestState> active;   // request whose read runs there
+
+        ~ReadLease()
+        {
+            if (thread)
+            {
+                CloseHandle(thread);
+            }
+        }
+    };
+
+    struct DecodeScheduler::ThreadSlot
+    {
+        std::thread thread;
+        std::shared_ptr<ReadLease> lease { std::make_shared<ReadLease>() };
+    };
+
+    namespace
+    {
+        // Gives the calling thread's lease a real handle of the thread, for
+        // CancelSynchronousIo from other threads (GetCurrentThread() is a
+        // pseudo handle).
+        void BindLeaseToCurrentThread(ReadLease& lease)
+        {
+            HANDLE handle = nullptr;
+            if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &handle,
+                0, FALSE, DUPLICATE_SAME_ACCESS))
+            {
+                handle = nullptr;
+            }
+            std::lock_guard<std::mutex> lock(lease.mutex);
+            lease.thread = handle;
+        }
     }
 
     void PriorityTaskQueue::Push(DecodeTask task, DecodeRequestState::Stage stage)
@@ -188,7 +230,7 @@ namespace ImageCore
 
     size_t DecodeScheduler::WorkerCount() const
     {
-        return m_highWorkers.size() + m_backgroundWorkers.size();
+        return m_workerCount.load();
     }
 
     size_t DecodeScheduler::LiveRequestCount() const
@@ -231,6 +273,90 @@ namespace ImageCore
         // SSD/NVMe (no seek penalty) -> deeper prefetch helps hide latency.
         // HDD (seek penalty) -> keep shallow to avoid memory + avoid extra I/O pressure.
         return incursSeek ? 2 : 4;
+    }
+
+    void DecodeScheduler::SetTestHook(TestHook hook)
+    {
+        m_testHook = std::move(hook);
+    }
+
+    void DecodeScheduler::RunTestHook(TestPoint point, uint64_t handle) const
+    {
+        if (m_testHook)
+        {
+            m_testHook(point, handle);
+        }
+    }
+
+    std::shared_ptr<std::vector<uint8_t>> DecodeScheduler::LeasedRead(
+        ReadLease& lease,
+        const std::shared_ptr<DecodeRequestState>& state,
+        uint64_t handle,
+        const std::wstring& path,
+        bool& stopped)
+    {
+        const std::stop_token stop = state->stop.get_token();
+        RunTestHook(TestPoint::BeforeReadRegister, handle);
+        {
+            std::lock_guard<std::mutex> lock(lease.mutex);
+            lease.active = state;
+        }
+
+        // Registered before the check: a Cancel that this check misses requests
+        // stop later and then finds the read on the lease.
+        std::shared_ptr<std::vector<uint8_t>> bytes;
+        if (!stop.stop_requested())
+        {
+            try
+            {
+                bytes = ReadWholeFileBytes(path, stop);
+            }
+            catch (...)
+            {
+                // Never let a host exception kill the thread or skip retirement.
+                bytes.reset();
+            }
+        }
+
+        RunTestHook(TestPoint::BeforeReadRetire, handle);
+        {
+            // Waits for an OS cancel aimed at this read that is still in progress.
+            std::lock_guard<std::mutex> lock(lease.mutex);
+            lease.active.reset();
+        }
+
+        stopped = stop.stop_requested();
+        if (stopped)
+        {
+            bytes.reset();  // empty or partial: never cached, never decoded
+        }
+        return bytes;
+    }
+
+    void DecodeScheduler::StopRequest(const std::shared_ptr<DecodeRequestState>& state, uint64_t handle)
+    {
+        // Host stop callbacks run synchronously here; no scheduler lock is held.
+        state->stop.request_stop();
+
+        std::shared_ptr<ReadLease> lease;
+        {
+            std::lock_guard<std::mutex> lock(m_queueMutex);
+            lease = state->readLease;
+        }
+        if (!lease)
+        {
+            return;  // not taken by a thread yet: it is skipped when taken
+        }
+
+        // Best effort: unblocks a synchronous OS call (network path, online-only
+        // file) that ignores the token. Issued only while this request's read is
+        // registered, under the lease mutex, so it cannot reach another request.
+        std::lock_guard<std::mutex> lock(lease->mutex);
+        if (lease->active == state && lease->thread)
+        {
+            RunTestHook(TestPoint::CancelDispatch, handle);
+            (void)CancelSynchronousIo(lease->thread);
+        }
     }
 
     void DecodeScheduler::Finish_NoLock(const DecodeTask& task)
@@ -284,12 +410,18 @@ namespace ImageCore
             m_shutdown = false;
         }
 
+        const auto startWorker = [this](WorkerKind kind)
+        {
+            auto slot = std::make_unique<ThreadSlot>();
+            slot->thread = std::thread(&DecodeScheduler::WorkerThread, this, kind, slot.get());
+            m_threads.push_back(std::move(slot));
+        };
         if (m_threadCount == 1)
         {
             // A single worker must serve both queues: full-res first, background work only
             // when the high queue is empty. Worst-case main-image latency is therefore one
             // in-flight thumbnail decode, never the queued backlog.
-            m_highWorkers.emplace_back(&DecodeScheduler::WorkerThread, this, WorkerKind::Shared);
+            startWorker(WorkerKind::Shared);
         }
         else
         {
@@ -301,17 +433,22 @@ namespace ImageCore
 
             for (size_t i = 0; i < highCount; ++i)
             {
-                m_highWorkers.emplace_back(&DecodeScheduler::WorkerThread, this, WorkerKind::HighPriority);
+                startWorker(WorkerKind::HighPriority);
             }
             for (size_t i = 0; i < bgCount; ++i)
             {
-                m_backgroundWorkers.emplace_back(&DecodeScheduler::WorkerThread, this, WorkerKind::Background);
+                startWorker(WorkerKind::Background);
             }
         }
+        m_workerCount = m_threads.size();
 
         // One serialized thumbnail I/O thread: reads files sequentially into memory, then schedules CPU work.
         // This avoids HDD seek thrashing while still allowing CPU decode/resize to run in parallel.
-        m_thumbPrefetchWorker = std::thread(&DecodeScheduler::ThumbPrefetchThread, this);
+        {
+            auto slot = std::make_unique<ThreadSlot>();
+            slot->thread = std::thread(&DecodeScheduler::ThumbPrefetchThread, this, slot.get());
+            m_threads.push_back(std::move(slot));
+        }
 
         // Start with a conservative global cap; it will be auto-tuned as volumes are observed.
         m_globalPrefetchCap = 4;
@@ -435,6 +572,7 @@ namespace ImageCore
         // bytes until the decode finishes.
         std::wstring releasedPath;
         bool releasedSlot = false;
+        std::shared_ptr<DecodeRequestState> canceledState;
         {
             std::lock_guard<std::mutex> lock(m_queueMutex);
             auto it = m_liveRequests.find(handle);
@@ -442,6 +580,7 @@ namespace ImageCore
             {
                 return;
             }
+            canceledState = it->second;
             DecodeRequestState& state = *it->second;
             state.canceled.store(true);
             if (!state.decoding && state.holdsPrefetchSlot)
@@ -459,6 +598,10 @@ namespace ImageCore
             FileByteCache::Instance().EraseIfUnshared(releasedPath);
             m_queueCondition.notify_all();
         }
+
+        // A read in progress is released through the request's token (and OS
+        // cancellation); this runs outside the queue lock.
+        StopRequest(canceledState, handle);
     }
 
     void DecodeScheduler::Shutdown()
@@ -468,6 +611,7 @@ namespace ImageCore
         // holds the mutex until it blocks, and a notification sent before that
         // point is lost. Setting the flag outside the lock let notify_all() race
         // that window, leaving a worker asleep forever and the join below hanging.
+        std::vector<std::pair<uint64_t, std::shared_ptr<DecodeRequestState>>> live;
         {
             std::lock_guard<std::mutex> lock(m_queueMutex);
             if (m_shutdown)
@@ -475,31 +619,45 @@ namespace ImageCore
                 return;
             }
             m_shutdown = true;
+            // Every live request is dropped: none is delivered from here on.
+            live.reserve(m_liveRequests.size());
+            for (const auto& [handle, state] : m_liveRequests)
+            {
+                state->canceled.store(true);
+                live.emplace_back(handle, state);
+            }
         }
         m_queueCondition.notify_all();
 
-        for (auto& worker : m_highWorkers)
+        // Release reads in progress (token, then best-effort OS cancel) outside
+        // the queue lock, so stop callbacks may call back into the scheduler.
+        for (const auto& [handle, state] : live)
         {
-            if (worker.joinable())
-            {
-                worker.join();
-            }
-        }
-        for (auto& worker : m_backgroundWorkers)
-        {
-            if (worker.joinable())
-            {
-                worker.join();
-            }
+            StopRequest(state, handle);
         }
 
-        if (m_thumbPrefetchWorker.joinable())
+        for (auto& slot : m_threads)
         {
-            m_thumbPrefetchWorker.join();
+            if (slot->thread.joinable())
+            {
+                slot->thread.join();
+            }
         }
-
-        m_highWorkers.clear();
-        m_backgroundWorkers.clear();
+        // Retire the leases before their thread handles close: a concurrent
+        // Cancel finds no registered read (every read retired before its thread
+        // exited) and so never uses a closed handle.
+        for (auto& slot : m_threads)
+        {
+            std::lock_guard<std::mutex> lock(slot->lease->mutex);
+            slot->lease->active.reset();
+            if (slot->lease->thread)
+            {
+                CloseHandle(slot->lease->thread);
+                slot->lease->thread = nullptr;
+            }
+        }
+        m_threads.clear();
+        m_workerCount = 0;
 
         // Drop queued work (no callbacks) and reset per-run state, so a restart
         // cannot inherit stale volume tuning or orphaned prefetched bytes.
@@ -522,8 +680,10 @@ namespace ImageCore
         FileByteCache::Instance().SetMaxEntries(m_globalPrefetchCap);
     }
 
-    void DecodeScheduler::WorkerThread(WorkerKind kind)
+    void DecodeScheduler::WorkerThread(WorkerKind kind, ThreadSlot* slot)
     {
+        BindLeaseToCurrentThread(*slot->lease);
+
         // Thread scheduling priority follows the task, not the worker:
         // - full-resolution (high queue) work runs above normal for main-image response;
         // - background (thumbnail) work runs in background mode, which lowers CPU and
@@ -596,7 +756,8 @@ namespace ImageCore
                     });
                 }
 
-                if (m_shutdown && m_highQueue.empty() && m_backgroundQueue.Empty())
+                // Queued work is dropped at shutdown (Shutdown canceled it).
+                if (m_shutdown)
                 {
                     break;
                 }
@@ -649,22 +810,30 @@ namespace ImageCore
                     continue;
                 }
 
-                // From here on Cancel leaves the bytes to this worker.
+                // From here on Cancel leaves the bytes to this worker, and finds a
+                // read this worker runs for the task through its lease.
                 if (task.state)
                 {
                     task.state->decoding = true;
+                    task.state->readLease = slot->lease;
                     bytesHold = task.state->prefetched;
                 }
             }
 
+            RunTestHook(TestPoint::TaskTaken, task.handle);
+
             // Run this task at its own priority (see above).
             setBackgroundMode(tookBackgroundTask);
 
-            // Run decode through the dispatcher (includes format routing + decoder selection)
+            // Run decode through the dispatcher (includes format routing + decoder selection).
+            // A request canceled before its decode starts is neither decoded nor
+            // delivered: without bytes the decoders would open the path themselves,
+            // re-reading the file with no way to cancel it.
             PipelineResult result;
+            bool skipped = false;
             {
                 DecodeInput input {};
-                
+
                 const std::wstring& src = task.request.source;
                 const bool isArchivePath = IsArchiveBackedPath(src);
 
@@ -680,11 +849,16 @@ namespace ImageCore
                         input.header = std::span<const uint8_t>(bytesHold->data(), headerSize);
                     }
                 }
-                else if (isArchivePath)
+                else if (isArchivePath && task.state)
                 {
                     // FullResolution from archive: must read via the host byte source
-                    auto bytes = ReadWholeFileBytes(task.request.source);
-                    if (bytes && !bytes->empty())
+                    bool stopped = false;
+                    auto bytes = LeasedRead(*slot->lease, task.state, task.handle, task.request.source, stopped);
+                    if (stopped)
+                    {
+                        skipped = true;
+                    }
+                    else if (bytes && !bytes->empty())
                     {
                         bytesHold = bytes;
                         input.bytes = std::span<const uint8_t>(bytesHold->data(), bytesHold->size());
@@ -697,21 +871,30 @@ namespace ImageCore
                     }
                 }
 
-                try
+                if (task.state && task.state->canceled.load())
                 {
-                    result = dispatcher.Decode(task.request, nullptr, input);
-                }
-                catch (...)
-                {
-                    // Never let an exception kill the worker thread.
-                    result = PipelineResult(E_FAIL);
+                    skipped = true;
                 }
 
-                if (FAILED(result.hr))
+                if (!skipped)
                 {
-                    IC_LOG_ERROR("[DecodeScheduler] Decode failed ({}): 0x{:08X}",
-                        Log::ToUtf8(src),
-                        static_cast<unsigned>(result.hr));
+                    RunTestHook(TestPoint::DecodeStart, task.handle);
+                    try
+                    {
+                        result = dispatcher.Decode(task.request, nullptr, input);
+                    }
+                    catch (...)
+                    {
+                        // Never let an exception kill the worker thread.
+                        result = PipelineResult(E_FAIL);
+                    }
+
+                    if (FAILED(result.hr))
+                    {
+                        IC_LOG_ERROR("[DecodeScheduler] Decode failed ({}): 0x{:08X}",
+                            Log::ToUtf8(src),
+                            static_cast<unsigned>(result.hr));
+                    }
                 }
             }
 
@@ -721,7 +904,7 @@ namespace ImageCore
             bool deliver = false;
             {
                 std::lock_guard<std::mutex> lock(m_queueMutex);
-                deliver = !(task.state && task.state->canceled.load());
+                deliver = !skipped && !(task.state && task.state->canceled.load());
                 Finish_NoLock(task);
             }
             if (deliver && task.callback)
@@ -768,8 +951,10 @@ namespace ImageCore
         }
     }
 
-    void DecodeScheduler::ThumbPrefetchThread()
+    void DecodeScheduler::ThumbPrefetchThread(ThreadSlot* slot)
     {
+        BindLeaseToCurrentThread(*slot->lease);
+
         // Make thumbnail prefetch low priority (CPU + I/O).
         (void)SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
 
@@ -784,7 +969,8 @@ namespace ImageCore
                     return !m_thumbIoQueue.Empty() || m_shutdown;
                 });
 
-                if (m_shutdown && m_thumbIoQueue.Empty())
+                // Queued work is dropped at shutdown (Shutdown canceled it).
+                if (m_shutdown)
                 {
                     break;
                 }
@@ -800,6 +986,10 @@ namespace ImageCore
                 {
                     Finish_NoLock(task);
                     continue;
+                }
+                if (task.state)
+                {
+                    task.state->readLease = slot->lease;
                 }
             }
 
@@ -866,24 +1056,26 @@ namespace ImageCore
 
             // Read file bytes sequentially on this single thread. The shared cache
             // only de-duplicates reads for same-path tasks; the bytes are attached
-            // to this task, which owns them from here on.
+            // to this task, which owns them from here on. A canceled read is never
+            // cached, so a same-path request behind it reads its own bytes.
             std::shared_ptr<const std::vector<uint8_t>> bytes = FileByteCache::Instance().Get(task.request.source);
+            bool stopped = false;
             if (!bytes)
             {
-                auto read = ReadWholeFileBytes(task.request.source);
-                if (read)
+                auto read = LeasedRead(*slot->lease, task.state, task.handle, task.request.source, stopped);
+                if (read && !task.state->canceled.load())
                 {
                     FileByteCache::Instance().Put(task.request.source, read);
                     bytes = std::move(read);
                 }
             }
 
-            // Schedule CPU decode work regardless; the decoder falls back to the file
-            // path if the prefetch failed.
+            // Schedule CPU decode work unless canceled; the decoder falls back to the
+            // file path if an uncanceled prefetch failed.
             bool canceled = false;
             {
                 std::lock_guard<std::mutex> lock(m_queueMutex);
-                canceled = task.state && task.state->canceled.load();
+                canceled = stopped || task.state->canceled.load();
                 if (canceled)
                 {
                     // Canceled while its bytes were being read (it was in no queue).
