@@ -6,6 +6,7 @@
 #include "ImageCore.h"
 
 #include <windows.h>
+#include <tlhelp32.h>
 
 #include <atomic>
 #include <chrono>
@@ -2874,4 +2875,378 @@ IC_TEST(ReadCancel_TokenReleasesWaitForOtherThreadWork)
     IC_CHECK(probe.Count(Point::CancelDispatch, 1) == 1);
     IC_CHECK(probe.Count(Point::DecodeStart, 1) == 0);
     IC_CHECK(DeliveryCount(done) == 0);
+}
+
+// ---------------------------------------------------------------------------
+// Bounded shutdown.
+
+namespace
+{
+    std::unordered_set<DWORD> ProcessThreadIds()
+    {
+        std::unordered_set<DWORD> ids;
+        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snapshot == INVALID_HANDLE_VALUE)
+        {
+            return ids;
+        }
+        THREADENTRY32 entry { sizeof(entry) };
+        for (BOOL ok = Thread32First(snapshot, &entry); ok; ok = Thread32Next(snapshot, &entry))
+        {
+            if (entry.th32OwnerProcessID == GetCurrentProcessId())
+            {
+                ids.insert(entry.th32ThreadID);
+            }
+        }
+        CloseHandle(snapshot);
+        return ids;
+    }
+
+    bool IsSubset(const std::unordered_set<DWORD>& subset, const std::unordered_set<DWORD>& set)
+    {
+        return std::all_of(subset.begin(), subset.end(), [&](DWORD id) { return set.count(id) != 0; });
+    }
+
+    // Owns a SYNCHRONIZE handle to a thread, so its exit can be checked
+    // without thread-id reuse.
+    class ThreadWatch
+    {
+    public:
+        explicit ThreadWatch(DWORD id)
+            : m_handle(OpenThread(SYNCHRONIZE, FALSE, id))
+        {
+        }
+        ~ThreadWatch()
+        {
+            if (m_handle)
+            {
+                CloseHandle(m_handle);
+            }
+        }
+        ThreadWatch(const ThreadWatch&) = delete;
+        ThreadWatch& operator=(const ThreadWatch&) = delete;
+
+        bool Running() const { return m_handle && WaitForSingleObject(m_handle, 0) == WAIT_TIMEOUT; }
+        bool Exited() const { return m_handle && WaitForSingleObject(m_handle, 0) == WAIT_OBJECT_0; }
+
+    private:
+        HANDLE m_handle;
+    };
+
+    long long ElapsedMs(std::chrono::steady_clock::time_point since)
+    {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - since).count();
+    }
+}
+
+IC_TEST(ReadCancel_BoundedShutdownReleasesCooperativeReads)
+{
+    // Reads blocked on their tokens on both decode workers (full resolution)
+    // and on the prefetch thread, a prefetched thumbnail waiting for decode
+    // (holding a prefetch slot) and queued requests: Shutdown(bound) releases the
+    // reads, joins every thread well within the bound, invokes no callback and
+    // leaves no request or slot behind.
+    const auto& files = Files();
+    FileByteCache& cache = FileByteCache::Instance();
+    Completions done;
+    HookProbe probe;
+    Watchdog watchdog("bounded shutdown, cooperative", std::chrono::seconds(60));
+    ControlledSource source(files.dir);
+    const std::wstring fullB = source.Entry(files.thumbs[25]);
+    const std::wstring fullD = source.Entry(files.thumbs[26]);
+    const std::wstring thumbA = source.Entry(files.thumbs[27]);
+    source.SetMode(fullB, Mode::Cooperative);
+    source.SetMode(fullD, Mode::Cooperative);
+    source.SetMode(thumbA, Mode::Cooperative);
+    bool ok = false;
+    long long elapsed = 0;
+    {
+        DecodeScheduler scheduler;
+        scheduler.SetTestHook(probe.Hook());
+        scheduler.SetThreadCount(2);
+        OnExit release { [&] { source.Release(); } };
+
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(fullB, ImagePurpose::FullResolution, 1, done.Callback(1))));
+        IC_REQUIRE(source.WaitEntered(fullB));
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(fullD, ImagePurpose::FullResolution, 2, done.Callback(2))));
+        IC_REQUIRE(source.WaitEntered(fullD));
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(source.Entry(files.thumbs[28]), ImagePurpose::Thumbnail, 3, done.Callback(3))));
+        IC_REQUIRE(WaitUntil([&] { return scheduler.PrefetchedTaskCount() == 1; }));
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(thumbA, ImagePurpose::Thumbnail, 4, done.Callback(4))));
+        IC_REQUIRE(source.WaitEntered(thumbA));
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[29], ImagePurpose::Thumbnail, 5, done.Callback(5))));
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 6, done.Callback(6))));
+
+        const auto start = std::chrono::steady_clock::now();
+        ok = scheduler.Shutdown(std::chrono::milliseconds(5000));
+        elapsed = ElapsedMs(start);
+        IC_CHECK(ok);
+        IC_CHECK(elapsed < 2000);
+        IC_CHECK(scheduler.WorkerCount() == 0);
+        IC_CHECK(scheduler.LiveRequestCount() == 0);
+        IC_CHECK(scheduler.PrefetchedTaskCount() == 0);
+        IC_CHECK(cache.Count() == 0);
+        IC_CHECK(!scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 7, done.Callback(7))));
+    }
+    std::printf("  bounded shutdown (cooperative reads): %s in %lld ms\n", ok ? "joined" : "timed out", elapsed);
+    IC_CHECK(source.StoppedReturns(fullB) == 1);
+    IC_CHECK(source.StoppedReturns(fullD) == 1);
+    IC_CHECK(source.StoppedReturns(thumbA) == 1);
+    for (uint64_t handle = 1; handle <= 6; ++handle)
+    {
+        IC_CHECK(probe.Count(Point::DecodeStart, handle) == 0);
+    }
+    IC_CHECK(DeliveryCount(done) == 0);
+}
+
+IC_TEST(ReadCancel_BoundedShutdownOsCancelsBlockedSynchronousRead)
+{
+    // Reads that ignore their token but block in a cancellable ReadFile, on the
+    // prefetch thread and on the decode worker, are released by the OS cancel
+    // attempt Shutdown(bound) makes through the read leases.
+    const auto& files = Files();
+    Completions done;
+    Watchdog watchdog("bounded shutdown, OS cancel", std::chrono::seconds(60));
+    ControlledSource source(files.dir);
+    const std::wstring thumb = source.Entry(files.thumbs[30]);
+    const std::wstring full = source.Entry(files.thumbs[31]);
+    source.SetMode(thumb, Mode::Pipe);
+    source.SetMode(full, Mode::Pipe);
+    {
+        DecodeScheduler scheduler;
+        scheduler.SetThreadCount(1);
+        OnExit release { [&] { for (int i = 0; i < 4; ++i) { source.WritePipe(); } } };
+
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(full, ImagePurpose::FullResolution, 1, done.Callback(1))));
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(thumb, ImagePurpose::Thumbnail, 2, done.Callback(2))));
+        IC_REQUIRE(source.WaitEntered(full));
+        IC_REQUIRE(source.WaitEntered(thumb));
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));  // both in ReadFile
+
+        const auto start = std::chrono::steady_clock::now();
+        IC_CHECK(scheduler.Shutdown(std::chrono::milliseconds(5000)));
+        IC_CHECK(ElapsedMs(start) < 2000);
+        IC_CHECK(scheduler.LiveRequestCount() == 0);
+        IC_CHECK(scheduler.PrefetchedTaskCount() == 0);
+    }
+    IC_CHECK(source.Aborted(thumb) == 1);
+    IC_CHECK(source.Aborted(full) == 1);
+    IC_CHECK(DeliveryCount(done) == 0);
+}
+
+IC_TEST(ReadCancel_BoundedShutdownTimesOutOnNonCooperativeRead)
+{
+    // Reads that ignore both the token and OS cancellation, on the decode
+    // worker and on the prefetch thread. Shutdown(bound) returns false after
+    // about the bound without detaching: the stuck threads keep running, no new
+    // request is accepted, and SetThreadCount neither restarts nor blocks. Once
+    // the source is released a second call joins every thread; afterwards the
+    // scheduler restarts normally.
+    const auto& files = Files();
+    Completions done;
+    Watchdog watchdog("bounded shutdown, non-cooperative", std::chrono::seconds(60));
+    ControlledSource source(files.dir);
+    const std::wstring thumb = source.Entry(files.thumbs[32]);
+    const std::wstring full = source.Entry(files.thumbs[33]);
+    source.SetMode(thumb, Mode::IgnoreToken);
+    source.SetMode(full, Mode::IgnoreToken);
+    {
+        DecodeScheduler scheduler;
+        scheduler.SetThreadCount(2);
+        OnExit release { [&] { source.Release(); } };
+
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(full, ImagePurpose::FullResolution, 1, done.Callback(1))));
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(thumb, ImagePurpose::Thumbnail, 2, done.Callback(2))));
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[34], ImagePurpose::Thumbnail, 3, done.Callback(3))));
+        IC_REQUIRE(source.WaitEntered(full));
+        IC_REQUIRE(source.WaitEntered(thumb));
+        const ThreadWatch stuckWorker(source.LastReadThread(full));
+        const ThreadWatch stuckPrefetch(source.LastReadThread(thumb));
+        const size_t workers = scheduler.WorkerCount();
+        IC_REQUIRE(workers == 2);
+
+        auto start = std::chrono::steady_clock::now();
+        IC_CHECK(!scheduler.Shutdown(std::chrono::milliseconds(300)));
+        const long long elapsed = ElapsedMs(start);
+        IC_CHECK(elapsed >= 290);
+        IC_CHECK(elapsed < 2000);
+        std::printf("  bounded shutdown (non-cooperative reads): timed out after %lld ms (bound 300 ms)\n", elapsed);
+        IC_CHECK(stuckWorker.Running());
+        IC_CHECK(stuckPrefetch.Running());
+        IC_CHECK(!scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 4, done.Callback(4))));
+        IC_CHECK(scheduler.WorkerCount() == workers);
+
+        // SetThreadCount neither restarts nor waits for the stuck threads.
+        const auto threadsBefore = ProcessThreadIds();
+        start = std::chrono::steady_clock::now();
+        scheduler.SetThreadCount(3);
+        IC_CHECK(ElapsedMs(start) < 1000);
+        IC_CHECK(scheduler.WorkerCount() == workers);
+        IC_CHECK(IsSubset(ProcessThreadIds(), threadsBefore));
+        IC_CHECK(!scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 5, done.Callback(5))));
+
+        // Still stuck: a retry times out again.
+        IC_CHECK(!scheduler.Shutdown(std::chrono::milliseconds(100)));
+
+        source.Release();
+        IC_CHECK(scheduler.Shutdown(std::chrono::milliseconds(5000)));
+        IC_CHECK(stuckWorker.Exited());
+        IC_CHECK(stuckPrefetch.Exited());
+        IC_CHECK(scheduler.WorkerCount() == 0);
+        IC_CHECK(scheduler.LiveRequestCount() == 0);
+        IC_CHECK(scheduler.PrefetchedTaskCount() == 0);
+        IC_CHECK(scheduler.Shutdown(std::chrono::milliseconds(100)));
+        scheduler.Shutdown();
+
+        // Restart after the successful join.
+        scheduler.SetThreadCount(2);
+        IC_CHECK(scheduler.WorkerCount() == 2);
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 6, done.Callback(6))));
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[35], ImagePurpose::Thumbnail, 7, done.Callback(7))));
+        IC_REQUIRE(done.WaitFor(2));
+        IC_CHECK(SUCCEEDED(DeliveredHr(done, 6)));
+        IC_CHECK(SUCCEEDED(DeliveredHr(done, 7)));
+    }
+    IC_CHECK(DeliveryCount(done) == 2);
+}
+
+IC_TEST(ReadCancel_BoundedShutdownBeforeRequestsAndRepeated)
+{
+    const auto& files = Files();
+    Completions done;
+    Watchdog watchdog("bounded shutdown, idle", std::chrono::seconds(60));
+    DecodeScheduler scheduler;
+    IC_CHECK(scheduler.Shutdown(std::chrono::milliseconds(2000)));
+    IC_CHECK(scheduler.Shutdown(std::chrono::milliseconds(2000)));
+    IC_CHECK(scheduler.Shutdown(std::chrono::milliseconds(0)));  // nothing left to join
+    scheduler.Shutdown();
+    IC_CHECK(scheduler.WorkerCount() == 0);
+    IC_CHECK(!scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 1, done.Callback(1))));
+
+    scheduler.SetThreadCount(1);
+    IC_REQUIRE(scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 2, done.Callback(2))));
+    IC_REQUIRE(done.WaitFor(1));
+    IC_CHECK(scheduler.Shutdown(std::chrono::milliseconds(2000)));
+    IC_CHECK(DeliveryCount(done) == 1);
+}
+
+IC_TEST(ReadCancel_StopCallbackDuringShutdownMayReenterScheduler)
+{
+    // Shutdown(bound) signals stop with no scheduler lock held: a stop callback
+    // that queries the scheduler, cancels and enqueues (rejected) does not
+    // deadlock, and a probe thread can take the queue lock meanwhile.
+    const auto& files = Files();
+    Completions done;
+    Watchdog watchdog("re-entrant stop callback at shutdown", std::chrono::seconds(60));
+    ControlledSource source(files.dir);
+    const std::wstring entry = source.Entry(files.thumbs[36]);
+    source.SetMode(entry, Mode::Cooperative);
+    bool reentered = false;
+    bool probeFinished = false;
+    bool enqueued = true;
+    {
+        DecodeScheduler scheduler;
+        scheduler.SetThreadCount(1);
+        OnExit release { [&] { source.Release(); } };
+        source.SetOnStop([&]
+        {
+            (void)scheduler.LiveRequestCount();
+            (void)scheduler.WorkerCount();
+            scheduler.SetPriority(2, RequestPriority::MainImage);
+            scheduler.Cancel(2);
+            enqueued = scheduler.Enqueue(MakeTask(files.thumbs[37], ImagePurpose::Thumbnail, 3, done.Callback(3)));
+            std::mutex m;
+            std::condition_variable cv;
+            bool finished = false;
+            std::thread probeThread([&]
+            {
+                (void)scheduler.PrefetchedTaskCount();
+                std::lock_guard<std::mutex> lock(m);
+                finished = true;
+                cv.notify_all();
+            });
+            {
+                std::unique_lock<std::mutex> lock(m);
+                probeFinished = cv.wait_for(lock, std::chrono::seconds(5), [&] { return finished; });
+            }
+            probeThread.join();
+            reentered = true;
+        });
+
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(entry, ImagePurpose::Thumbnail, 1, done.Callback(1))));
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[38], ImagePurpose::Thumbnail, 2, done.Callback(2))));
+        IC_REQUIRE(source.WaitEntered(entry));
+        IC_CHECK(scheduler.Shutdown(std::chrono::milliseconds(5000)));
+        source.SetOnStop({});
+    }
+    IC_CHECK(reentered);
+    IC_CHECK(probeFinished);
+    IC_CHECK(!enqueued);
+    IC_CHECK(DeliveryCount(done) == 0);
+}
+
+IC_TEST(ReadCancel_CancelFinishShutdownRaceStress)
+{
+    // Cancel, read completion and bounded shutdown race: a canceler thread keeps
+    // canceling (also after Shutdown returned, when the lease handles are
+    // closed) while requests read, decode and finish. Every cycle must join
+    // within the bound, deliver nothing after Shutdown returned and leave no
+    // request or prefetch slot behind.
+    const auto& files = Files();
+    constexpr int kCycles = 150;
+    Watchdog watchdog("cancel/finish/shutdown stress", std::chrono::seconds(90));
+    int timedOut = 0;
+    int lateDeliveries = 0;
+    for (int cycle = 0; cycle < kCycles; ++cycle)
+    {
+        ControlledSource source(files.dir);
+        source.SetJitter(500);
+        std::atomic<bool> shutDown { false };
+        std::atomic<int> late { 0 };
+        {
+            DecodeScheduler scheduler;
+            scheduler.SetThreadCount(1 + (cycle % 3));
+            OnExit release { [&] { source.Release(); } };
+
+            constexpr uint64_t kRequests = 24;
+            for (uint64_t handle = 1; handle <= kRequests; ++handle)
+            {
+                const std::wstring entry = source.Entry(files.thumbs[(cycle + handle) % files.thumbs.size()]);
+                const bool full = (handle % 3) == 0;
+                scheduler.Enqueue(MakeTask(entry, full ? ImagePurpose::FullResolution : ImagePurpose::Thumbnail, handle,
+                    [&](PipelineResult&&)
+                    {
+                        if (shutDown.load())
+                        {
+                            late.fetch_add(1);
+                        }
+                    }));
+            }
+            std::atomic<bool> stop { false };
+            std::thread canceler([&]
+            {
+                uint32_t rng = static_cast<uint32_t>(cycle) * 2654435761u;
+                while (!stop.load())
+                {
+                    rng = rng * 1664525u + 1013904223u;
+                    scheduler.Cancel(1 + (rng >> 8) % kRequests);
+                    std::this_thread::yield();
+                }
+            });
+            std::this_thread::sleep_for(std::chrono::microseconds((cycle * 37) % 3000));
+            if (!scheduler.Shutdown(std::chrono::milliseconds(5000)))
+            {
+                ++timedOut;
+            }
+            shutDown.store(true);
+            IC_CHECK(scheduler.LiveRequestCount() == 0);
+            IC_CHECK(scheduler.PrefetchedTaskCount() == 0);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            stop.store(true);
+            canceler.join();
+        }
+        lateDeliveries += late.load();
+    }
+    IC_CHECK(timedOut == 0);
+    IC_CHECK(lateDeliveries == 0);
 }
