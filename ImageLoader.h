@@ -2,6 +2,7 @@
 
 #include "ImageRequest.h"
 #include "DecodedImage.h"
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <functional>
@@ -31,8 +32,29 @@ namespace ImageCore
 
         // Explicit shutdown (call before FD2D::Core::Shutdown / CoUninitialize).
         // Idempotent and final: queued requests are dropped without callbacks,
-        // and later requests are rejected.
+        // and later requests are rejected. Joins the decode threads without a
+        // bound (see DecodeScheduler::Shutdown()), so a read that honours neither
+        // its stop token nor OS cancellation keeps it waiting.
         void Shutdown();
+
+        // Bounded shutdown (see DecodeScheduler::Shutdown(bound)): true when
+        // every decode thread was joined within `bound`; the loader then drops
+        // its scheduler and cache as Shutdown() does. On false it keeps both
+        // (the unjoined threads may still use them) and keeps rejecting
+        // requests; a later call retries the join. The host should take a
+        // forced-exit path rather than run static destruction with threads
+        // still running (~ImageLoader joins without a bound).
+        bool Shutdown(std::chrono::milliseconds bound);
+
+        // Bounded shutdown that never constructs the loader: true at once when
+        // Instance() was never called (so no scheduler and no thread is created
+        // just to be joined), otherwise Instance().Shutdown(bound). A call that
+        // observes a construction in progress waits for it, then shuts it down.
+        // A first Instance() call after this returned is not supported.
+        static bool ShutdownIfCreated(std::chrono::milliseconds bound);
+
+        // Tests/diagnostics: whether Instance() has begun constructing the loader.
+        static bool IsInstantiated();
 
         // Image load request (async) - unified payload. The callback runs on a
         // worker thread. Returns 0 without ever invoking the callback when the
