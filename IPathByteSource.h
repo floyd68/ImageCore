@@ -22,9 +22,11 @@ namespace ImageCore
         virtual std::vector<uint8_t> ReadAll(const std::wstring& path) const = 0;
 
         // Stop-aware read. ImageCore calls this one, with a token owned by the
-        // request; Cancel and Shutdown request stop on it (synchronously, from
-        // the canceling thread and outside every scheduler lock, so a stop
-        // callback may call back into ImageCore). A source that honours the
+        // request; Cancel and Shutdown have stop requested on it by a
+        // scheduler-owned stop-dispatch thread, outside every scheduler lock (so
+        // a stop callback never runs on the canceling thread and may call back
+        // into ImageCore; one that blocks makes a bounded Shutdown time out
+        // instead of hanging it). A source that honours the
         // token returns early with an empty or partial vector; once stop was
         // requested ImageCore discards whatever the read returns, never caches
         // it and never decodes the request. ImageCore also tries

@@ -2574,19 +2574,20 @@ IC_TEST(ReadCancel_CancelInterruptsBlockedSynchronousRead)
 
 IC_TEST(ReadCancel_StopCallbackMayReenterScheduler)
 {
-    // The stop callback runs synchronously inside Cancel. It queries the
-    // scheduler, cancels and re-prioritizes other requests and enqueues a new
-    // one; a probe thread meanwhile needs the queue lock. Neither may block:
-    // the callback runs with no scheduler lock held.
+    // The stop callback runs on the scheduler's stop-dispatch thread. It
+    // queries the scheduler, cancels and re-prioritizes other requests and
+    // enqueues a new one; a probe thread meanwhile needs the queue lock. Neither
+    // may block: the callback runs with no scheduler lock held.
     const auto& files = Files();
     Completions done;
     Watchdog watchdog("re-entrant stop callback", std::chrono::seconds(60));
     ControlledSource source(files.dir);
     const std::wstring entry = source.Entry(files.thumbs[14]);
     source.SetMode(entry, Mode::Cooperative);
-    bool reentered = false;
-    bool probeFinished = false;
-    bool enqueued = false;
+    // Written by the stop callback on the scheduler's stop-dispatch thread.
+    std::atomic<bool> reentered { false };
+    std::atomic<bool> probeFinished { false };
+    std::atomic<bool> enqueued { false };
     {
         DecodeScheduler scheduler;
         scheduler.SetThreadCount(2);
@@ -2622,9 +2623,9 @@ IC_TEST(ReadCancel_StopCallbackMayReenterScheduler)
         IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[16], ImagePurpose::Thumbnail, 2, done.Callback(2))));
         IC_REQUIRE(source.WaitEntered(entry));
         scheduler.Cancel(1);
-        IC_CHECK(reentered);
-        IC_CHECK(probeFinished);
-        IC_CHECK(enqueued);
+        IC_REQUIRE(WaitUntil([&] { return reentered.load(); }));
+        IC_CHECK(probeFinished.load());
+        IC_CHECK(enqueued.load());
         IC_REQUIRE(WaitUntil([&] { return Delivered(done, 3); }));
         IC_REQUIRE(Idle(scheduler));
         source.SetOnStop({});
@@ -2725,6 +2726,8 @@ namespace
             std::thread canceler;
             if (cancelAt == Point::CancelDispatch)
             {
+                // Cancel returns at once; the dispatch thread is held at the
+                // dispatch point under the lease mutex.
                 canceler = std::thread([&] { scheduler.Cancel(1); });
                 IC_REQUIRE(probe.WaitHeld(Point::CancelDispatch, 1));
                 probe.Release(holdAt, 1);
@@ -2736,7 +2739,10 @@ namespace
             }
             else
             {
+                // The stop (and any OS cancel) is dispatched asynchronously;
+                // release T only once it is done, so it lands at `cancelAt`.
                 scheduler.Cancel(1);
+                IC_REQUIRE(WaitUntil([&] { return probe.Count(Point::StopDispatched, 1) == 1; }));
                 probe.Release(holdAt, 1);
             }
 
@@ -2860,6 +2866,7 @@ IC_TEST(ReadCancel_TokenReleasesWaitForOtherThreadWork)
         IC_CHECK(source.WaitReturned(entry, 1, std::chrono::milliseconds(5000)));
         IC_CHECK(source.StoppedReturns(entry) == 1);
         IC_CHECK(probe.WaitHeld(Point::BeforeReadRetire, 1));
+        IC_CHECK(WaitUntil([&] { return probe.Count(Point::CancelDispatch, 1) == 1; }));
         probe.Release(Point::BeforeReadRetire, 1);
         readingThread = source.LastReadThread(entry);
 
@@ -3141,9 +3148,9 @@ IC_TEST(ReadCancel_StopCallbackDuringShutdownMayReenterScheduler)
     ControlledSource source(files.dir);
     const std::wstring entry = source.Entry(files.thumbs[36]);
     source.SetMode(entry, Mode::Cooperative);
-    bool reentered = false;
-    bool probeFinished = false;
-    bool enqueued = true;
+    std::atomic<bool> reentered { false };
+    std::atomic<bool> probeFinished { false };
+    std::atomic<bool> enqueued { true };
     {
         DecodeScheduler scheduler;
         scheduler.SetThreadCount(1);
@@ -3179,10 +3186,91 @@ IC_TEST(ReadCancel_StopCallbackDuringShutdownMayReenterScheduler)
         IC_CHECK(scheduler.Shutdown(std::chrono::milliseconds(5000)));
         source.SetOnStop({});
     }
-    IC_CHECK(reentered);
-    IC_CHECK(probeFinished);
-    IC_CHECK(!enqueued);
+    IC_CHECK(reentered.load());
+    IC_CHECK(probeFinished.load());
+    IC_CHECK(!enqueued.load());
     IC_CHECK(DeliveryCount(done) == 0);
+}
+
+namespace
+{
+    // A host stop callback blocks (as one waiting on a mutex held by a stuck
+    // read would). Neither Cancel nor a bounded Shutdown may run it on the
+    // caller's thread: Cancel returns at once, and Shutdown(bound) times out
+    // (keeping its threads) until the callback is released; a retry then joins.
+    void RunBlockedStopCallback(bool cancelFirst)
+    {
+        const auto& files = Files();
+        Completions done;
+        Watchdog watchdog("blocked stop callback", std::chrono::seconds(60));
+        ControlledSource source(files.dir);
+        const std::wstring entry = source.Entry(files.thumbs[cancelFirst ? 1 : 0]);
+        source.SetMode(entry, Mode::Cooperative);
+        HANDLE gate = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        HANDLE entered = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        std::atomic<DWORD> callbackThread { 0 };
+        source.SetOnStop([&]
+        {
+            callbackThread = GetCurrentThreadId();
+            SetEvent(entered);
+            (void)WaitForSingleObject(gate, 10000);
+        });
+        {
+            DecodeScheduler scheduler;
+            scheduler.SetThreadCount(1);
+            OnExit release { [&] { SetEvent(gate); source.Release(); } };
+
+            IC_REQUIRE(scheduler.Enqueue(MakeTask(entry, ImagePurpose::Thumbnail, 1, done.Callback(1))));
+            IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[2], ImagePurpose::Thumbnail, 2, done.Callback(2))));
+            IC_REQUIRE(source.WaitEntered(entry));
+
+            if (cancelFirst)
+            {
+                const auto start = std::chrono::steady_clock::now();
+                scheduler.Cancel(1);
+                IC_CHECK(ElapsedMs(start) < 200);
+                IC_REQUIRE(WaitForSingleObject(entered, 10000) == WAIT_OBJECT_0);
+                IC_CHECK(callbackThread.load() != GetCurrentThreadId());
+                // Other scheduler calls keep working while the callback blocks.
+                IC_CHECK(scheduler.LiveRequestCount() == 1);
+            }
+
+            auto start = std::chrono::steady_clock::now();
+            IC_CHECK(!scheduler.Shutdown(std::chrono::milliseconds(300)));
+            const long long elapsed = ElapsedMs(start);
+            IC_CHECK(elapsed >= 290);
+            IC_CHECK(elapsed < 2000);
+            IC_CHECK(WaitForSingleObject(entered, 0) == WAIT_OBJECT_0);
+            IC_CHECK(callbackThread.load() != GetCurrentThreadId());
+            IC_CHECK(!scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 3, done.Callback(3))));
+            IC_CHECK(scheduler.WorkerCount() == 1);
+            std::printf("  blocked stop callback (%s): Shutdown(300 ms) timed out after %lld ms\n",
+                cancelFirst ? "after Cancel" : "from Shutdown", elapsed);
+
+            SetEvent(gate);
+            start = std::chrono::steady_clock::now();
+            IC_CHECK(scheduler.Shutdown(std::chrono::milliseconds(5000)));
+            IC_CHECK(ElapsedMs(start) < 2000);
+            IC_CHECK(scheduler.WorkerCount() == 0);
+            IC_CHECK(scheduler.LiveRequestCount() == 0);
+            IC_CHECK(scheduler.PrefetchedTaskCount() == 0);
+        }
+        source.SetOnStop({});
+        CloseHandle(gate);
+        CloseHandle(entered);
+        IC_CHECK(source.StoppedReturns(entry) == 1);
+        IC_CHECK(DeliveryCount(done) == 0);
+    }
+}
+
+IC_TEST(ReadCancel_BlockedStopCallbackDuringShutdownTimesOut)
+{
+    RunBlockedStopCallback(false);
+}
+
+IC_TEST(ReadCancel_BlockedStopCallbackAfterCancelTimesOutShutdown)
+{
+    RunBlockedStopCallback(true);
 }
 
 IC_TEST(ReadCancel_CancelFinishShutdownRaceStress)

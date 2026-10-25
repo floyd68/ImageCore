@@ -9,6 +9,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
+#include <deque>
 #include <chrono>
 #include <functional>
 #include <map>
@@ -33,8 +34,9 @@ namespace ImageCore
         std::atomic<bool> canceled { false };
         uint64_t handle { 0 };
 
-        // Request-owned I/O cancellation: Cancel and Shutdown request stop on it,
-        // outside every scheduler lock. Its token is passed to the byte source.
+        // Request-owned I/O cancellation: Cancel and Shutdown have stop requested
+        // on it by the scheduler's stop-dispatch thread. Its token is passed to
+        // the byte source.
         std::stop_source stop;
 
         // Lease of the thread that took this request (guarded by the queue
@@ -164,8 +166,11 @@ namespace ImageCore
         // fallback cannot re-read the file). A request canceled before its decode
         // starts is not decoded. A decode in progress cannot be interrupted, but
         // its callback is suppressed if the cancel is observed before delivery
-        // starts. The token is signaled after the queue lock is released, so a
-        // synchronous stop callback may call back into the scheduler. A callback that has
+        // starts. Cancel itself sets only the canceled flag (enough for every
+        // check above); the token is signaled, and CancelSynchronousIo tried,
+        // shortly after on the scheduler's stop-dispatch thread, with no
+        // scheduler lock held. So a stop callback never runs on, or blocks, the
+        // caller, and it may call back into the scheduler. A callback that has
         // already been selected for delivery can still run concurrently with, or
         // after, Cancel returning, so callers must validate results themselves
         // (for example with a generation). Canceling an unknown or finished handle
@@ -173,20 +178,23 @@ namespace ImageCore
         void Cancel(uint64_t handle);
 
         // Idempotent. Rejects new requests, cancels every live request (stop
-        // token plus best-effort OS cancellation of reads in progress, as in
-        // Cancel), then stops and joins all threads; queued and in-flight
+        // token, signaled on the stop-dispatch thread, plus best-effort OS
+        // cancellation of reads in progress), then stops and joins all threads,
+        // the stop-dispatch thread included; queued and in-flight
         // requests are dropped without callbacks. Clears volume tuning and
         // FileByteCache so a later SetThreadCount starts from a clean state.
         // Enqueue fails afterwards.
         //
         // The join has no bound: a byte-source read that honours neither its
-        // token nor OS cancellation (or a callback that never returns) keeps
-        // this waiting. Threads are never detached.
+        // token nor OS cancellation (or a decode or stop callback that never
+        // returns) keeps this waiting. Threads are never detached.
         void Shutdown();
 
         // Bounded Shutdown: the same steps, but waits at most `bound` for the
         // threads to exit and joins only threads that have exited, so it never
-        // blocks on a stuck one. Returns true when every thread was joined (the
+        // blocks on a stuck one (a stuck read, decode callback or stop callback:
+        // no host code runs on the calling thread). Returns true when every
+        // thread was joined (the
         // state is then exactly as after Shutdown()). On false nothing is
         // detached: the scheduler keeps the unjoined threads and everything they
         // use, keeps rejecting requests and must not be destroyed while they run
@@ -194,8 +202,8 @@ namespace ImageCore
         // Shutdown() retries the join. Harmless before any request and when
         // repeated. With a legacy (ReadAll-only) byte source a blocked read is not
         // interrupted, so false is expected until that read returns. Stop
-        // callbacks run inside both overloads (no scheduler lock held); they may
-        // use the other scheduler calls but not Shutdown or SetThreadCount.
+        // callbacks (on the stop-dispatch thread, no scheduler lock held) may use
+        // the other scheduler calls but not Shutdown or SetThreadCount.
         bool Shutdown(std::chrono::milliseconds bound);
 
         // Tests/diagnostics: requests currently queued or decoding (cancellation
@@ -213,13 +221,16 @@ namespace ImageCore
         // the thread named. No scheduler lock is held, except CancelDispatch,
         // which runs under the reading thread's read-lease mutex (so the worker
         // cannot retire that read or start another one until the hook returns).
+        // CancelDispatch runs on the stop-dispatch thread for Cancel, and also on
+        // the thread calling Shutdown.
         enum class TestPoint
         {
             TaskTaken,          // decode worker, after taking a task, before any read or decode
             BeforeReadRegister, // reading thread, before registering a read on its lease
             BeforeReadRetire,   // reading thread, after the read returned, before retiring it
-            CancelDispatch,     // canceling thread, just before CancelSynchronousIo
+            CancelDispatch,     // just before CancelSynchronousIo (see above)
             DecodeStart,        // decode worker, just before the decode stage runs
+            StopDispatched,     // stop-dispatch thread, after a request's stop and OS cancel attempt
         };
         using TestHook = std::function<void(TestPoint point, uint64_t handle)>;
 
@@ -249,9 +260,13 @@ namespace ImageCore
         // m_lifecycleMutex. Without a deadline it waits until every thread exits.
         bool StopAndJoin(std::optional<std::chrono::steady_clock::time_point> deadline);
 
-        // Requests stop on, and OS-cancels, every read registered on a lease.
-        // Requires m_lifecycleMutex (it walks m_threads), not m_queueMutex.
-        void StopActiveReads();
+        // OS-cancels every read registered on a lease for a canceled request.
+        // Runs no host code. Requires m_lifecycleMutex (it walks m_threads).
+        void CancelActiveReadsIo();
+
+        // Queues a stop request for the stop-dispatch thread.
+        void QueueStop(std::shared_ptr<DecodeRequestState> state);
+        void StopDispatchThread(ThreadSlot* slot);
 
         // Reads `path` for `state` through the host byte source with the
         // request's stop token, registered on `lease` for the duration of the
@@ -265,8 +280,9 @@ namespace ImageCore
             bool& stopped);
 
         // Signals stop on `state`'s token, then tries CancelSynchronousIo on the
-        // thread whose lease has `state`'s read registered. Call without any
-        // scheduler lock: stop callbacks run synchronously in here.
+        // thread whose lease has `state`'s read registered. Runs only on the
+        // stop-dispatch thread, without any scheduler lock: stop callbacks run
+        // synchronously in here.
         void StopRequest(const std::shared_ptr<DecodeRequestState>& state);
 
         void RunTestHook(TestPoint point, uint64_t handle) const;
@@ -294,6 +310,13 @@ namespace ImageCore
         // notified as each thread exits.
         std::mutex m_exitMutex;
         std::condition_variable m_exitCondition;
+
+        // Stop-dispatch queue (guarded by m_stopMutex). m_stopExit lets the
+        // dispatch thread exit once the queue is drained.
+        std::mutex m_stopMutex;
+        std::condition_variable m_stopCondition;
+        std::deque<std::shared_ptr<DecodeRequestState>> m_stopQueue;
+        bool m_stopExit { false };
         std::atomic<size_t> m_workerCount { 0 };  // decode workers in m_threads
         TestHook m_testHook;
 
