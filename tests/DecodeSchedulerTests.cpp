@@ -3243,6 +3243,7 @@ namespace
                 IC_CHECK(ElapsedMs(start) < 200);
                 IC_REQUIRE(WaitForSingleObject(entered, 10000) == WAIT_OBJECT_0);
                 IC_CHECK(callbackThread.load() != GetCurrentThreadId());
+                IC_CHECK(callbackThread.load() != source.LastReadThread(entry));
                 // Other scheduler calls keep working while the callback blocks.
                 IC_CHECK(scheduler.LiveRequestCount() == 1);
             }
