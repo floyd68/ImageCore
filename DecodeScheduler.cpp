@@ -306,9 +306,12 @@ namespace ImageCore
         // Registered before the check: a Cancel that this check misses has its
         // stop dispatched later, and the dispatch then finds the read on the
         // lease. The canceled flag is checked too: Cancel sets it at once, while
-        // the token is signaled by the stop-dispatch thread.
+        // the token is signaled by the stop-dispatch thread. So is the shutdown
+        // flag: a read that registers after Shutdown scanned the leases (which
+        // the dispatch thread may outlive only briefly) must not start, and one
+        // registered before the scan is found by it and stopped.
         std::shared_ptr<std::vector<uint8_t>> bytes;
-        if (!stop.stop_requested() && !state->canceled.load())
+        if (!stop.stop_requested() && !state->canceled.load() && !m_shutdown.load())
         {
             try
             {
@@ -328,7 +331,7 @@ namespace ImageCore
             lease.active.reset();
         }
 
-        stopped = stop.stop_requested() || state->canceled.load();
+        stopped = stop.stop_requested() || state->canceled.load() || m_shutdown.load();
         if (stopped)
         {
             bytes.reset();  // empty or partial: never cached, never decoded
@@ -727,13 +730,17 @@ namespace ImageCore
         }
         m_queueCondition.notify_all();
 
-        // A read registered for a request outside the live table (handle 0) is
-        // stopped too.
+        // Every read registered now is stopped too: one for a request outside
+        // the live table (handle 0), and one whose Cancel already removed it
+        // from the table (stopping twice is harmless). A read that registers
+        // after this scan sees m_shutdown and does not start (see LeasedRead),
+        // so the dispatch thread may retire once this queue is drained.
         for (const auto& slot : m_threads)
         {
             std::lock_guard<std::mutex> lock(slot->lease->mutex);
-            if (slot->lease->active && !slot->lease->active->canceled.exchange(true))
+            if (slot->lease->active)
             {
+                slot->lease->active->canceled.store(true);
                 live.push_back(slot->lease->active);
             }
         }
@@ -1069,7 +1076,9 @@ namespace ImageCore
                     }
                 }
 
-                if (task.state && task.state->canceled.load())
+                // Work taken just before shutdown began is dropped as well (a
+                // handle-0 task is in no live table, so Shutdown cannot mark it).
+                if ((task.state && task.state->canceled.load()) || m_shutdown.load())
                 {
                     skipped = true;
                 }

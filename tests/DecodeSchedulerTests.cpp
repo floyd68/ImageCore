@@ -3414,6 +3414,62 @@ IC_TEST(ReadCancel_ShutdownWhileCancelIsPublishingStillStopsTheRead)
     IC_CHECK(DeliveryCount(done) == 0);
 }
 
+namespace
+{
+    // A handle-0 task is in no live table, so Shutdown can stop its read only
+    // through the lease scan. Hold the reading thread just before it registers
+    // the read, start Shutdown, let it scan the leases (nothing registered) and
+    // the empty dispatch thread exit, then let the thread register: the read
+    // must not start, and Shutdown(bound) joins in time.
+    void RunRegisterAfterShutdownBegan(ImagePurpose purpose)
+    {
+        const auto& files = Files();
+        Completions done;
+        HookProbe probe;
+        Watchdog watchdog("read registering after shutdown began", std::chrono::seconds(60));
+        ControlledSource source(files.dir);
+        const std::wstring entry = source.Entry(files.thumbs[purpose == ImagePurpose::Thumbnail ? 5 : 6]);
+        source.SetMode(entry, Mode::Cooperative);
+        probe.HoldAt(Point::BeforeReadRegister, 0);
+        std::atomic<bool> ok { false };
+        std::atomic<long long> elapsed { 0 };
+        {
+            DecodeScheduler scheduler;
+            scheduler.SetTestHook(probe.Hook());
+            scheduler.SetThreadCount(1);
+            OnExit release { [&] { probe.ReleaseAll(); source.Release(); } };
+
+            IC_REQUIRE(scheduler.Enqueue(MakeTask(entry, purpose, 0, done.Callback(0))));
+            IC_REQUIRE(probe.WaitHeld(Point::BeforeReadRegister, 0));
+            IC_CHECK(scheduler.LiveRequestCount() == 0);
+
+            std::thread shutdownThread([&]
+            {
+                const auto start = std::chrono::steady_clock::now();
+                ok = scheduler.Shutdown(std::chrono::milliseconds(3000));
+                elapsed = ElapsedMs(start);
+            });
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            probe.Release(Point::BeforeReadRegister, 0);
+            shutdownThread.join();
+            IC_CHECK(ok.load());
+            IC_CHECK(elapsed.load() < 2000);
+        }
+        std::printf("  %s read registering after shutdown began: %s in %lld ms\n",
+            purpose == ImagePurpose::Thumbnail ? "thumbnail" : "full-resolution",
+            ok.load() ? "joined" : "timed out", elapsed.load());
+        IC_CHECK(source.Reads(entry) == 0);
+        IC_CHECK(probe.Count(Point::DecodeStart, 0) == 0);
+        IC_CHECK(DeliveryCount(done) == 0);
+    }
+}
+
+IC_TEST(ReadCancel_ReadRegisteringAfterShutdownBeganDoesNotStart)
+{
+    RunRegisterAfterShutdownBegan(ImagePurpose::Thumbnail);
+    RunRegisterAfterShutdownBegan(ImagePurpose::FullResolution);
+}
+
 IC_TEST(ReadCancel_CancelFinishShutdownRaceStress)
 {
     // Cancel, read completion and bounded shutdown race: a canceler thread keeps
