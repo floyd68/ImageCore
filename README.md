@@ -78,8 +78,14 @@ DirectXTex decoding supports:
   - queued tasks are skipped without a callback
   - if decode already started, we cannot abort the decoder safely, but the callback is suppressed when the cancel is observed before delivery starts
   - a callback whose delivery has already started can still run concurrently with, or after, `Cancel` returns, so callers must drop stale results themselves (for example with a generation)
+  - a byte-source read in progress (thumbnail prefetch, full-resolution archive read) is asked to stop through the request's `std::stop_token`, passed to `IPathByteSource::ReadAll(path, stop)`; ImageCore also tries `CancelSynchronousIo` on the reading thread (best effort, not relied upon)
+  - a stopped read's bytes (empty or partial) are discarded: never put into `FileByteCache` (a same-path request reads its own bytes) and never decoded, so the decoders cannot fall back to re-reading the path; a request canceled before its decode starts is not decoded
+- Stop is signaled outside the scheduler locks, so a synchronous stop callback may call back into ImageCore. OS cancellation goes through a per-thread read lease, so a late cancel never reaches the thread's next read.
+- Byte sources that implement only `ReadAll(path)` keep working (the stop-aware overload delegates to it); their reads are not interrupted.
 - Cancellation state is owned by each request and released when the request finishes, is canceled, or the scheduler shuts down; canceling an unknown or finished handle is a no-op and leaves nothing behind.
-- `ImageLoader::Shutdown()` is idempotent and final: queued requests are dropped without callbacks, and later `RequestDecoded` calls return 0 without invoking the callback.
+- `ImageLoader::Shutdown()` is idempotent and final: it cancels every live request (as above), queued requests are dropped without callbacks, and later `RequestDecoded` calls return 0 without invoking the callback. It joins the decode threads without a bound, so a read that honours neither its token nor OS cancellation keeps it waiting.
+- `ImageLoader::Shutdown(bound)` does the same but waits at most `bound` and returns whether every thread was joined. On `false` nothing is detached: the loader keeps its scheduler and cache, keeps rejecting requests, and a later call retries the join; the host should take a forced-exit path instead of static destruction. `DecodeScheduler::SetThreadCount` does not restart until a retry succeeds.
+- `ImageLoader::ShutdownIfCreated(bound)` is the bounded shutdown for host cleanup paths: it never constructs the loader (returns `true` when ImageCore was never used, starting no thread) and otherwise returns `Instance().Shutdown(bound)`.
 
 ## Priority
 
