@@ -1921,6 +1921,8 @@ namespace
         size_t Aborted(const std::wstring& path) const { std::lock_guard<std::mutex> l(m_mutex); return StatsOf(path).aborted; }
         size_t StoppedReturns(const std::wstring& path) const { std::lock_guard<std::mutex> l(m_mutex); return StatsOf(path).stoppedReturns; }
         DWORD LastReadThread(const std::wstring& path) const { std::lock_guard<std::mutex> l(m_mutex); return StatsOf(path).lastThread; }
+        // Thread on which the last stop callback ran (0 if none ran).
+        DWORD StopCallbackThread() const { std::lock_guard<std::mutex> l(m_mutex); return m_stopThread; }
 
         // OtherThread mode: helper reads that completed with data / were aborted.
         size_t HelperCompleted() const { std::lock_guard<std::mutex> l(m_mutex); return m_helperCompleted; }
@@ -1999,6 +2001,7 @@ namespace
                 {
                     std::lock_guard<std::mutex> lock(m_mutex);
                     onStop = m_onStop;
+                    m_stopThread = GetCurrentThreadId();
                 }
                 if (onStop)
                 {
@@ -2036,8 +2039,10 @@ namespace
 
         std::vector<uint8_t> ReadCooperative(const std::wstring& path, std::stop_token stop, bool partialOnStop) const
         {
-            Enter(path);
+            // Entered is signaled only once the stop callback is registered, so
+            // a Cancel or Shutdown issued after WaitEntered always runs it.
             const auto wake = WakeOnStop(stop);
+            Enter(path);
             std::unique_lock<std::mutex> lock(m_mutex);
             m_cv.wait_for(lock, kWaitTimeout, [&] { return stop.stop_requested() || m_released; });
             PathStats& stats = m_stats[path];
@@ -2073,8 +2078,8 @@ namespace
                     m_cv.notify_all();
                 });
             }
+            const auto wake = WakeOnStop(stop);  // registered before Enter (see ReadCooperative)
             Enter(path);
-            const auto wake = WakeOnStop(stop);
             std::unique_lock<std::mutex> lock(m_mutex);
             m_cv.wait_for(lock, kWaitTimeout, [&] { return stop.stop_requested() || *done; });
             PathStats& stats = m_stats[path];
@@ -2103,6 +2108,7 @@ namespace
         mutable size_t m_helperCompleted { 0 };
         mutable size_t m_helperAborted { 0 };
         std::function<void()> m_onStop;
+        mutable DWORD m_stopThread { 0 };
         bool m_released { false };
         std::atomic<int> m_jitterUs { 0 };
     };
@@ -2626,6 +2632,9 @@ IC_TEST(ReadCancel_StopCallbackMayReenterScheduler)
         IC_REQUIRE(WaitUntil([&] { return reentered.load(); }));
         IC_CHECK(probeFinished.load());
         IC_CHECK(enqueued.load());
+        IC_CHECK(source.StopCallbackThread() != 0);
+        IC_CHECK(source.StopCallbackThread() != GetCurrentThreadId());
+        IC_CHECK(source.StopCallbackThread() != source.LastReadThread(entry));
         IC_REQUIRE(WaitUntil([&] { return Delivered(done, 3); }));
         IC_REQUIRE(Idle(scheduler));
         source.SetOnStop({});
@@ -3186,6 +3195,9 @@ IC_TEST(ReadCancel_StopCallbackDuringShutdownMayReenterScheduler)
         IC_CHECK(scheduler.Shutdown(std::chrono::milliseconds(5000)));
         source.SetOnStop({});
     }
+    IC_CHECK(source.StopCallbackThread() != 0);
+    IC_CHECK(source.StopCallbackThread() != GetCurrentThreadId());
+    IC_CHECK(source.StopCallbackThread() != source.LastReadThread(entry));
     IC_CHECK(reentered.load());
     IC_CHECK(probeFinished.load());
     IC_CHECK(!enqueued.load());
@@ -3241,7 +3253,9 @@ namespace
             IC_CHECK(elapsed >= 290);
             IC_CHECK(elapsed < 2000);
             IC_CHECK(WaitForSingleObject(entered, 0) == WAIT_OBJECT_0);
+            IC_CHECK(callbackThread.load() != 0);
             IC_CHECK(callbackThread.load() != GetCurrentThreadId());
+            IC_CHECK(callbackThread.load() != source.LastReadThread(entry));
             IC_CHECK(!scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 3, done.Callback(3))));
             IC_CHECK(scheduler.WorkerCount() == 1);
             std::printf("  blocked stop callback (%s): Shutdown(300 ms) timed out after %lld ms\n",
