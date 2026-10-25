@@ -37,9 +37,18 @@ namespace ImageCore
         // Image load request (async) - unified payload. The callback runs on a
         // worker thread. Returns 0 without ever invoking the callback when the
         // request is rejected (empty source, no callback, or after Shutdown).
+        // Without a priority, DefaultPriority(request.purpose) applies.
         ImageHandle RequestDecoded(
             const ImageRequest& request,
             DecodedImageLoadCallback callback);
+        ImageHandle RequestDecoded(
+            const ImageRequest& request,
+            DecodedImageLoadCallback callback,
+            RequestPriority priority);
+
+        // Promotes or demotes a queued request (see DecodeScheduler::SetPriority).
+        // Running, finished, canceled and unknown handles are a no-op.
+        void SetPriority(ImageHandle handle, RequestPriority priority);
 
         // Best-effort cancel (see DecodeScheduler::Cancel). The callback can still
         // run after Cancel returns if delivery had already started; callers must

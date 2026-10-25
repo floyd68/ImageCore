@@ -61,6 +61,14 @@ namespace ImageCore
         const ImageRequest& request,
         DecodedImageLoadCallback callback)
     {
+        return RequestDecoded(request, std::move(callback), DefaultPriority(request.purpose));
+    }
+
+    ImageHandle ImageLoader::RequestDecoded(
+        const ImageRequest& request,
+        DecodedImageLoadCallback callback,
+        RequestPriority priority)
+    {
         if (request.source.empty() || !callback)
         {
             return 0;
@@ -77,6 +85,7 @@ namespace ImageCore
         DecodeTask task;
         task.request = request;
         task.handle = handle;
+        task.priority = priority;
         task.callback = [callback](PipelineResult&& result)
         {
             if (FAILED(result.hr))
@@ -111,6 +120,19 @@ namespace ImageCore
         if (std::shared_ptr<DecodeScheduler> scheduler = Scheduler())
         {
             scheduler->Cancel(handle);
+        }
+    }
+
+    void ImageLoader::SetPriority(ImageHandle handle, RequestPriority priority)
+    {
+        if (handle == 0)
+        {
+            return;
+        }
+
+        if (std::shared_ptr<DecodeScheduler> scheduler = Scheduler())
+        {
+            scheduler->SetPriority(handle, priority);
         }
     }
 

@@ -130,6 +130,49 @@ namespace ImageCore
         // (debug-only tracing removed)
     }
 
+    void PriorityTaskQueue::Push(DecodeTask task, DecodeRequestState::Stage stage)
+    {
+        DecodeRequestState* state = task.state.get();
+        const RequestPriority priority = state ? state->priority : task.priority;
+        const uint64_t sequence = state ? state->sequence : 0;
+        if (state)
+        {
+            state->queuedIn = stage;
+        }
+        m_tasks.emplace(KeyOf(priority, sequence), std::move(task));
+    }
+
+    RequestPriority PriorityTaskQueue::TopPriority() const
+    {
+        return static_cast<RequestPriority>(255 - m_tasks.begin()->first.rank);
+    }
+
+    DecodeTask PriorityTaskQueue::Pop()
+    {
+        auto it = m_tasks.begin();
+        DecodeTask task = std::move(it->second);
+        m_tasks.erase(it);
+        if (task.state)
+        {
+            task.state->queuedIn = DecodeRequestState::Stage::None;
+        }
+        return task;
+    }
+
+    bool PriorityTaskQueue::Reprioritize(DecodeRequestState& state, RequestPriority priority)
+    {
+        auto it = m_tasks.find(KeyOf(state.priority, state.sequence));
+        if (it == m_tasks.end() || it->second.state.get() != &state)
+        {
+            return false;
+        }
+        DecodeTask task = std::move(it->second);
+        m_tasks.erase(it);
+        state.priority = priority;
+        m_tasks.emplace(KeyOf(priority, state.sequence), std::move(task));
+        return true;
+    }
+
     DecodeScheduler::DecodeScheduler()
         : m_shutdown(false)
         , m_threadCount(0)
@@ -291,6 +334,7 @@ namespace ImageCore
         }
 
         task.state = std::make_shared<DecodeRequestState>();
+        task.state->priority = task.priority;
 
         {
             std::lock_guard<std::mutex> lock(m_queueMutex);
@@ -298,6 +342,7 @@ namespace ImageCore
             {
                 return false;
             }
+            task.state->sequence = ++m_nextSequence;
             if (task.handle != 0)
             {
                 m_liveRequests[task.handle] = task.state;
@@ -327,7 +372,7 @@ namespace ImageCore
                 FileByteCache::Instance().SetMaxEntries(m_globalPrefetchCap);
 
                 // Thumbnail/Preview: go through serialized I/O prefetch stage first.
-                m_thumbIoQueue.push(std::move(task));
+                m_thumbIoQueue.Push(std::move(task), DecodeRequestState::Stage::Io);
             }
         }
         // Multiple threads wait on the same condition_variable with different queue predicates
@@ -335,6 +380,42 @@ namespace ImageCore
         // whose predicate is false, leaving the correct worker asleep even though work is available.
         m_queueCondition.notify_all();
         return true;
+    }
+
+    void DecodeScheduler::SetPriority(uint64_t handle, RequestPriority priority)
+    {
+        if (handle == 0)
+        {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(m_queueMutex);
+            auto it = m_liveRequests.find(handle);
+            if (it == m_liveRequests.end())
+            {
+                return;
+            }
+            DecodeRequestState& state = *it->second;
+            if (state.decoding || state.canceled.load() || state.priority == priority)
+            {
+                return;
+            }
+            switch (state.queuedIn)
+            {
+            case DecodeRequestState::Stage::Io:
+                (void)m_thumbIoQueue.Reprioritize(state, priority);
+                break;
+            case DecodeRequestState::Stage::Decode:
+                (void)m_backgroundQueue.Reprioritize(state, priority);
+                break;
+            case DecodeRequestState::Stage::None:
+                // Being read, or a full-resolution request: the next stage uses it.
+                state.priority = priority;
+                break;
+            }
+        }
+        // The prefetch stage may be holding lower-priority work for a slot.
+        m_queueCondition.notify_all();
     }
 
     void DecodeScheduler::Cancel(uint64_t handle)
@@ -511,11 +592,11 @@ namespace ImageCore
                 {
                     m_queueCondition.wait(lock, [this]
                     {
-                        return !m_highQueue.empty() || !m_backgroundQueue.empty() || m_shutdown;
+                        return !m_highQueue.empty() || !m_backgroundQueue.Empty() || m_shutdown;
                     });
                 }
 
-                if (m_shutdown && m_highQueue.empty() && m_backgroundQueue.empty())
+                if (m_shutdown && m_highQueue.empty() && m_backgroundQueue.Empty())
                 {
                     break;
                 }
@@ -540,10 +621,9 @@ namespace ImageCore
                         task = std::move(m_highQueue.front());
                         m_highQueue.pop();
                     }
-                    else if (!m_backgroundQueue.empty())
+                    else if (!m_backgroundQueue.Empty())
                     {
-                        task = std::move(m_backgroundQueue.front());
-                        m_backgroundQueue.pop();
+                        task = m_backgroundQueue.Pop();
                         tookBackgroundTask = true;
                     }
                     else
@@ -701,21 +781,20 @@ namespace ImageCore
                 std::unique_lock<std::mutex> lock(m_queueMutex);
                 m_queueCondition.wait(lock, [this]
                 {
-                    return !m_thumbIoQueue.empty() || m_shutdown;
+                    return !m_thumbIoQueue.Empty() || m_shutdown;
                 });
 
-                if (m_shutdown && m_thumbIoQueue.empty())
+                if (m_shutdown && m_thumbIoQueue.Empty())
                 {
                     break;
                 }
 
-                if (m_thumbIoQueue.empty())
+                if (m_thumbIoQueue.Empty())
                 {
                     continue;
                 }
 
-                task = std::move(m_thumbIoQueue.front());
-                m_thumbIoQueue.pop();
+                task = m_thumbIoQueue.Pop();
 
                 if (task.state && task.state->canceled.load())
                 {
@@ -749,12 +828,20 @@ namespace ImageCore
             }
 
             // Backpressure without Sleep: wait until fewer tasks hold prefetched bytes
-            // than the global and per-volume caps allow.
+            // than the global and per-volume caps allow. A higher-priority request
+            // queued (or promoted) meanwhile takes the slot instead: this task goes
+            // back to the queue with its age and the loop picks the new top.
+            bool yielded = false;
             {
                 std::unique_lock<std::mutex> lock(m_queueMutex);
-                m_queueCondition.wait(lock, [this, vol, volCap]
+                const auto outranked = [this, &task]
                 {
-                    if (m_shutdown)
+                    return task.state && !m_thumbIoQueue.Empty() &&
+                        m_thumbIoQueue.TopPriority() > task.state->priority;
+                };
+                m_queueCondition.wait(lock, [this, vol, volCap, &outranked]
+                {
+                    if (m_shutdown || outranked())
                     {
                         return true;
                     }
@@ -766,6 +853,15 @@ namespace ImageCore
                 {
                     break;
                 }
+                if (outranked())
+                {
+                    m_thumbIoQueue.Push(std::move(task), DecodeRequestState::Stage::Io);
+                    yielded = true;
+                }
+            }
+            if (yielded)
+            {
+                continue;
             }
 
             // Read file bytes sequentially on this single thread. The shared cache
@@ -804,7 +900,7 @@ namespace ImageCore
                         ++m_prefetchedTotal;
                         ++m_prefetchedByVolume[vol];
                     }
-                    m_backgroundQueue.push(std::move(task));
+                    m_backgroundQueue.Push(std::move(task), DecodeRequestState::Stage::Decode);
                 }
             }
             if (canceled)
