@@ -3273,6 +3273,92 @@ IC_TEST(ReadCancel_BlockedStopCallbackAfterCancelTimesOutShutdown)
     RunBlockedStopCallback(true);
 }
 
+namespace
+{
+    // A thread_local whose destructor blocks on a gate (bounded): it runs after
+    // the scheduler thread function returned, during thread exit.
+    HANDLE g_tlsGate = nullptr;
+
+    struct BlockingTlsObject
+    {
+        bool touched { false };
+        ~BlockingTlsObject()
+        {
+            if (touched && g_tlsGate)
+            {
+                (void)WaitForSingleObject(g_tlsGate, 10000);
+            }
+        }
+    };
+
+    thread_local BlockingTlsObject t_blockingTls;
+
+    // Filesystem source whose reads create the blocking thread_local on the
+    // reading thread (as a host library might).
+    class TlsTouchingSource final : public IPathByteSource
+    {
+    public:
+        TlsTouchingSource() : m_previous(GetPathByteSource()) { SetPathByteSource(this); }
+        ~TlsTouchingSource() override { SetPathByteSource(m_previous); }
+
+        std::wstring ResolveHostPath(const std::wstring& path) const override { return path; }
+
+        std::vector<uint8_t> ReadAll(const std::wstring& path) const override
+        {
+            t_blockingTls.touched = true;
+            std::ifstream in(std::filesystem::path(path), std::ios::binary);
+            return std::vector<uint8_t>(std::istreambuf_iterator<char>(in), {});
+        }
+
+    private:
+        IPathByteSource* m_previous;
+    };
+}
+
+IC_TEST(ReadCancel_BoundedShutdownWaitsForThreadTermination)
+{
+    // The prefetch thread signals exit, but its thread_local destructor then
+    // blocks. Shutdown(bound) must wait for real thread termination within the
+    // bound and return false (keeping the thread) instead of blocking in join();
+    // once the destructor is released a retry joins.
+    const auto& files = Files();
+    Completions done;
+    Watchdog watchdog("TLS destructor at thread exit", std::chrono::seconds(60));
+    g_tlsGate = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    {
+        TlsTouchingSource source;
+        DecodeScheduler scheduler;
+        scheduler.SetThreadCount(1);
+        OnExit release { [&] { SetEvent(g_tlsGate); } };
+
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[3], ImagePurpose::Thumbnail, 1, done.Callback(1))));
+        IC_REQUIRE(done.WaitFor(1));
+        IC_CHECK(SUCCEEDED(DeliveredHr(done, 1)));
+
+        auto start = std::chrono::steady_clock::now();
+        IC_CHECK(!scheduler.Shutdown(std::chrono::milliseconds(300)));
+        const long long elapsed = ElapsedMs(start);
+        IC_CHECK(elapsed >= 290);
+        IC_CHECK(elapsed < 2000);
+        IC_CHECK(scheduler.WorkerCount() == 1);
+        IC_CHECK(!scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 2, done.Callback(2))));
+        std::printf("  TLS destructor: Shutdown(300 ms) timed out after %lld ms\n", elapsed);
+
+        // Still blocked: a retry times out again without blocking.
+        start = std::chrono::steady_clock::now();
+        IC_CHECK(!scheduler.Shutdown(std::chrono::milliseconds(100)));
+        IC_CHECK(ElapsedMs(start) < 2000);
+
+        SetEvent(g_tlsGate);
+        IC_CHECK(scheduler.Shutdown(std::chrono::milliseconds(5000)));
+        IC_CHECK(scheduler.WorkerCount() == 0);
+        IC_CHECK(scheduler.LiveRequestCount() == 0);
+    }
+    CloseHandle(g_tlsGate);
+    g_tlsGate = nullptr;
+    IC_CHECK(DeliveryCount(done) == 1);
+}
+
 IC_TEST(ReadCancel_CancelFinishShutdownRaceStress)
 {
     // Cancel, read completion and bounded shutdown race: a canceler thread keeps

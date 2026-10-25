@@ -796,20 +796,45 @@ namespace ImageCore
             }
         }
 
-        // Join only threads that signaled exit; a stuck one is left running and
-        // owned (never detached) for a later call.
-        for (ThreadSlot* slot : exited)
+        // Join only threads that have terminated; a stuck one is left running and
+        // owned (never detached) for a later call. Signaling exit is the last
+        // step of the thread function, but TLS destructors and thread-detach
+        // processing still run after it, and they can block (a thread_local
+        // created by a byte source or decoder), so wait for the native handle,
+        // within the remaining budget, before join().
+        size_t joined = 0;
+        for (const auto& slot : m_threads)
         {
-            if (slot->thread.joinable())
+            if (!slot->thread.joinable())
             {
-                slot->thread.join();
+                ++joined;  // joined by an earlier call
             }
         }
-        if (exited.size() != m_threads.size())
+        for (ThreadSlot* slot : exited)
+        {
+            if (!slot->thread.joinable())
+            {
+                continue;
+            }
+            DWORD waitMs = INFINITE;
+            if (deadline)
+            {
+                const auto remaining = *deadline - std::chrono::steady_clock::now();
+                waitMs = remaining > std::chrono::steady_clock::duration::zero()
+                    ? static_cast<DWORD>(std::chrono::ceil<std::chrono::milliseconds>(remaining).count())
+                    : 0;
+            }
+            if (WaitForSingleObject(static_cast<HANDLE>(slot->thread.native_handle()), waitMs) == WAIT_OBJECT_0)
+            {
+                slot->thread.join();
+                ++joined;
+            }
+        }
+        if (joined != m_threads.size())
         {
             m_joinPending = true;
             IC_LOG_WARN("[DecodeScheduler] Shutdown: {} of {} threads still running after the bound; not joined.",
-                m_threads.size() - exited.size(), m_threads.size());
+                m_threads.size() - joined, m_threads.size());
             return false;
         }
         m_joinPending = false;
