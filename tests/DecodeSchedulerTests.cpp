@@ -3419,8 +3419,8 @@ namespace
     // A handle-0 task is in no live table, so Shutdown can stop its read only
     // through the lease scan. Hold the reading thread just before it registers
     // the read, start Shutdown, let it scan the leases (nothing registered) and
-    // the empty dispatch thread exit, then let the thread register: the read
-    // must not start, and Shutdown(bound) joins in time.
+    // wait until the drained dispatch thread has exited, then let the thread
+    // register: the read must not start, and Shutdown(bound) joins in time.
     void RunRegisterAfterShutdownBegan(ImagePurpose purpose)
     {
         const auto& files = Files();
@@ -3443,13 +3443,15 @@ namespace
             IC_REQUIRE(probe.WaitHeld(Point::BeforeReadRegister, 0));
             IC_CHECK(scheduler.LiveRequestCount() == 0);
 
+            // SetThreadCount may have retired an earlier dispatch thread.
+            const size_t exitsBefore = probe.Count(Point::StopDispatchExit, 0);
             std::thread shutdownThread([&]
             {
                 const auto start = std::chrono::steady_clock::now();
                 ok = scheduler.Shutdown(std::chrono::milliseconds(3000));
                 elapsed = ElapsedMs(start);
             });
-            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            IC_CHECK(WaitUntil([&] { return probe.Count(Point::StopDispatchExit, 0) == exitsBefore + 1; }));
             probe.Release(Point::BeforeReadRegister, 0);
             shutdownThread.join();
             IC_CHECK(ok.load());

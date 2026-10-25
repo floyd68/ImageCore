@@ -232,6 +232,7 @@ namespace ImageCore
             DecodeStart,        // decode worker, just before the decode stage runs
             StopDispatched,     // stop-dispatch thread, after a request's stop and OS cancel attempt
             CancelPublished,    // canceling thread, after Cancel removed the request and queued its stop
+            StopDispatchExit,   // stop-dispatch thread, queue drained after shutdown, just before it exits (handle 0)
         };
         using TestHook = std::function<void(TestPoint point, uint64_t handle)>;
 

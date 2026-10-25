@@ -406,6 +406,7 @@ namespace ImageCore
             RunTestHook(TestPoint::StopDispatched, state->handle);
         }
 
+        RunTestHook(TestPoint::StopDispatchExit, 0);
         SignalExit(*slot);
     }
 
