@@ -42,7 +42,13 @@ namespace ImageCore
         std::wstring source;        // File path
         ImagePurpose purpose;       // Loading purpose
         Size targetSize;            // Target size for thumbnail/preview
-        bool srgb;                  // Whether to use sRGB color space
+        // Not read by any decoder: it only takes part in request equality,
+        // ordering and hashing (and so in cache keys). It does not select a
+        // color space: the DirectXTex BGRA8 conversion keeps an _SRGB source's
+        // stored (display-encoded) values instead of linearizing them, and BCn
+        // passthrough keeps the source DXGI format. Defaults to true; callers
+        // leave it so.
+        bool srgb;
         // If true, allow returning GPU-compressed DDS blocks (BCn) for GPU-native rendering.
         // If false (e.g., D2D-only renderer), the decode pipeline returns CPU-displayable BGRA8 pixels.
         bool allowGpuCompressedDDS;

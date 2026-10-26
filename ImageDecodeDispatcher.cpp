@@ -484,8 +484,19 @@ namespace ImageCore
                 return E_NOTIMPL;
             }
 
-            static HRESULT ConvertImageToBGRA8(const DirectX::Image& image, DirectX::ScratchImage& outScratchImage)
+            // Converts to B8G8R8A8_UNORM holding display-encoded values, which is
+            // how every consumer shows the BGRA8 payload. An _SRGB source already
+            // stores display-encoded (sRGB) values, so it is reinterpreted as its
+            // _UNORM twin (same bytes) before decompressing or converting:
+            // DirectXTex would otherwise convert sRGB to linear, because only the
+            // source is _SRGB, and the linear values would look too dark. _UNORM
+            // and other linear sources convert as before. Alpha is never
+            // sRGB-encoded, so it is unaffected.
+            static HRESULT ConvertImageToBGRA8(const DirectX::Image& source, DirectX::ScratchImage& outScratchImage)
             {
+                DirectX::Image image = source;
+                image.format = DirectX::MakeLinear(source.format);
+
                 // Fast-path: already in the target format and not compressed.
                 if (!DirectX::IsCompressed(image.format) && image.format == DXGI_FORMAT_B8G8R8A8_UNORM)
                 {
@@ -498,6 +509,8 @@ namespace ImageCore
 
                 if (DirectX::IsCompressed(image.format))
                 {
+                    // DXGI_FORMAT_UNKNOWN picks the default (_UNORM) target for the
+                    // now-_UNORM block format, so no sRGB-to-linear step happens here.
                     HRESULT hr = DirectX::Decompress(image, DXGI_FORMAT_UNKNOWN, decompressed);
                     if (FAILED(hr))
                     {
