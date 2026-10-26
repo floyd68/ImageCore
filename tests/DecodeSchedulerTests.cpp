@@ -6,17 +6,23 @@
 #include "ImageCore.h"
 
 #include <windows.h>
+#include <tlhelp32.h>
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
+#include <map>
 #include <mutex>
 #include <cstdio>
+#include <stop_token>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -1746,4 +1752,1789 @@ IC_TEST(DecodeScheduler_PromotionAndCancelStressUnderTileReuse)
             IC_CHECK(count == 1);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Read cancellation (request stop tokens, read leases, OS cancellation). The
+// byte source below blocks chosen reads in a controlled way; the scheduler's
+// test hook observes (and can hold) a request at its read and decode points.
+// Every wait is bounded.
+
+namespace
+{
+    // Archive-like byte source with per-path read modes. Paths under
+    // `<dir>\pack.zip\` are virtual (as in VirtualArchiveSource): they resolve
+    // to a host archive that does not exist, so a decode of one succeeds only
+    // with the bytes the read returned. Other paths are read from disk.
+    //
+    // Modes (each applies to the next `times` stop-aware reads of a path):
+    //   Cooperative - blocks until stop is requested (then returns a partial
+    //                 prefix, or nothing) or Release();
+    //   IgnoreToken - blocks on an event until Release(), ignoring the token and
+    //                 OS cancellation (WaitForSingleObject is not I/O);
+    //   Pipe        - blocks in ReadFile on an anonymous pipe until WritePipe()
+    //                 (or CancelSynchronousIo), ignoring the token;
+    //   OtherThread - hands a pipe ReadFile to a helper thread and waits for it
+    //                 on the token (like a host waiting for a shared open).
+    class ControlledSource final : public IPathByteSource
+    {
+    public:
+        enum class Mode { Normal, Cooperative, IgnoreToken, Pipe, OtherThread };
+
+        explicit ControlledSource(const std::filesystem::path& dir)
+            : m_previous(GetPathByteSource())
+            , m_dir(dir)
+            , m_host((dir / L"pack.zip").wstring())
+            , m_event(CreateEventW(nullptr, TRUE, FALSE, nullptr))
+        {
+            (void)CreatePipe(&m_pipeRead, &m_pipeWrite, nullptr, 0);
+            SetPathByteSource(this);
+        }
+
+        ~ControlledSource() override
+        {
+            SetPathByteSource(m_previous);
+            Release();
+            // A read still blocked on the pipe fails with ERROR_BROKEN_PIPE.
+            CloseHandle(m_pipeWrite);
+            for (auto& helper : m_helpers)
+            {
+                helper.join();
+            }
+            CloseHandle(m_pipeRead);
+            CloseHandle(m_event);
+        }
+
+        std::wstring Entry(const std::wstring& realPath) const
+        {
+            return m_host + L"\\" + std::filesystem::path(realPath).filename().wstring();
+        }
+
+        void SetMode(const std::wstring& path, Mode mode, int times = 1, bool partialOnStop = true)
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_modes[path] = { mode, times, partialOnStop };
+        }
+
+        // Runs on the thread that requests stop, inside the stop callback.
+        void SetOnStop(std::function<void()> onStop)
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_onStop = std::move(onStop);
+        }
+
+        std::wstring ResolveHostPath(const std::wstring& path) const override
+        {
+            return IsVirtual(path) ? m_host : path;
+        }
+
+        std::vector<uint8_t> ReadAll(const std::wstring& path) const override
+        {
+            return Load(path);
+        }
+
+        std::vector<uint8_t> ReadAll(const std::wstring& path, std::stop_token stop) const override
+        {
+            ModeEntry mode {};
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                PathStats& stats = m_stats[path];
+                ++stats.reads;
+                stats.lastThread = GetCurrentThreadId();
+                auto it = m_modes.find(path);
+                if (it != m_modes.end() && it->second.times > 0)
+                {
+                    mode = it->second;
+                    --it->second.times;
+                }
+            }
+
+            switch (mode.mode)
+            {
+            case Mode::Normal:
+                return ReadNormal(path, stop);
+            case Mode::Cooperative:
+                return ReadCooperative(path, stop, mode.partialOnStop);
+            case Mode::IgnoreToken:
+                Enter(path);
+                (void)WaitForSingleObject(m_event, static_cast<DWORD>(kWaitTimeout.count() * 1000));
+                return Load(path);
+            case Mode::Pipe:
+            {
+                Enter(path);
+                const bool ok = ReadPipeByte();
+                const DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+                std::lock_guard<std::mutex> lock(m_mutex);
+                PathStats& stats = m_stats[path];
+                stats.aborted += (error == ERROR_OPERATION_ABORTED) ? 1 : 0;
+                stats.returned += 1;
+                m_cv.notify_all();
+                return ok ? LoadUnlocked(path) : std::vector<uint8_t> {};
+            }
+            case Mode::OtherThread:
+                return ReadOnOtherThread(path, stop);
+            }
+            return {};
+        }
+
+        // Normal reads take a random 0..`maxMicroseconds` and return a partial
+        // prefix when stop is requested meanwhile.
+        void SetJitter(int maxMicroseconds)
+        {
+            m_jitterUs = maxMicroseconds;
+        }
+
+        // Unblocks Cooperative (with full bytes) and IgnoreToken reads.
+        void Release()
+        {
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_released = true;
+            }
+            m_cv.notify_all();
+            SetEvent(m_event);
+        }
+
+        // Lets one pending pipe read complete.
+        void WritePipe()
+        {
+            const uint8_t byte = 1;
+            DWORD written = 0;
+            (void)WriteFile(m_pipeWrite, &byte, 1, &written, nullptr);
+        }
+
+        bool WaitEntered(const std::wstring& path, size_t count = 1) const
+        {
+            std::unique_lock<std::mutex> lock(m_mutex);
+            return m_cv.wait_for(lock, kWaitTimeout, [&] { return StatsOf(path).entered >= count; });
+        }
+
+        // Waits until `count` blocked reads of `path` have returned.
+        bool WaitReturned(const std::wstring& path, size_t count = 1,
+            std::chrono::milliseconds timeout = std::chrono::duration_cast<std::chrono::milliseconds>(kWaitTimeout)) const
+        {
+            std::unique_lock<std::mutex> lock(m_mutex);
+            return m_cv.wait_for(lock, timeout, [&] { return StatsOf(path).returned >= count; });
+        }
+
+        size_t Reads(const std::wstring& path) const { std::lock_guard<std::mutex> l(m_mutex); return StatsOf(path).reads; }
+        size_t Aborted(const std::wstring& path) const { std::lock_guard<std::mutex> l(m_mutex); return StatsOf(path).aborted; }
+        size_t StoppedReturns(const std::wstring& path) const { std::lock_guard<std::mutex> l(m_mutex); return StatsOf(path).stoppedReturns; }
+        DWORD LastReadThread(const std::wstring& path) const { std::lock_guard<std::mutex> l(m_mutex); return StatsOf(path).lastThread; }
+        // Thread on which the last stop callback ran (0 if none ran).
+        DWORD StopCallbackThread() const { std::lock_guard<std::mutex> l(m_mutex); return m_stopThread; }
+
+        // OtherThread mode: helper reads that completed with data / were aborted.
+        size_t HelperCompleted() const { std::lock_guard<std::mutex> l(m_mutex); return m_helperCompleted; }
+        size_t HelperAborted() const { std::lock_guard<std::mutex> l(m_mutex); return m_helperAborted; }
+        bool WaitHelperCompleted(size_t count) const
+        {
+            std::unique_lock<std::mutex> lock(m_mutex);
+            return m_cv.wait_for(lock, kWaitTimeout, [&] { return m_helperCompleted + m_helperAborted >= count; });
+        }
+
+    private:
+        struct ModeEntry
+        {
+            Mode mode { Mode::Normal };
+            int times { 0 };
+            bool partialOnStop { true };
+        };
+
+        struct PathStats
+        {
+            size_t reads { 0 };
+            size_t entered { 0 };
+            size_t returned { 0 };
+            size_t aborted { 0 };
+            size_t stoppedReturns { 0 };
+            DWORD lastThread { 0 };
+        };
+
+        bool IsVirtual(const std::wstring& path) const
+        {
+            return path.size() > m_host.size() && path.compare(0, m_host.size(), m_host) == 0;
+        }
+
+        std::vector<uint8_t> Load(const std::wstring& path) const
+        {
+            return LoadUnlocked(path);
+        }
+
+        std::vector<uint8_t> LoadUnlocked(const std::wstring& path) const
+        {
+            const std::filesystem::path real = IsVirtual(path)
+                ? m_dir / std::filesystem::path(path).filename()
+                : std::filesystem::path(path);
+            std::ifstream in(real, std::ios::binary);
+            return std::vector<uint8_t>(std::istreambuf_iterator<char>(in), {});
+        }
+
+        const PathStats& StatsOf(const std::wstring& path) const
+        {
+            static const PathStats kEmpty {};
+            auto it = m_stats.find(path);
+            return it == m_stats.end() ? kEmpty : it->second;
+        }
+
+        void Enter(const std::wstring& path) const
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            ++m_stats[path].entered;
+            m_cv.notify_all();
+        }
+
+        bool ReadPipeByte() const
+        {
+            uint8_t byte = 0;
+            DWORD read = 0;
+            return ReadFile(m_pipeRead, &byte, 1, &read, nullptr) && read == 1;
+        }
+
+        std::stop_callback<std::function<void()>> WakeOnStop(std::stop_token stop) const
+        {
+            // Registered before m_mutex is taken: it runs at once (on this
+            // thread) when stop was already requested.
+            return std::stop_callback<std::function<void()>>(stop, std::function<void()>([this]
+            {
+                std::function<void()> onStop;
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    onStop = m_onStop;
+                    m_stopThread = GetCurrentThreadId();
+                }
+                if (onStop)
+                {
+                    onStop();
+                }
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                }
+                m_cv.notify_all();
+            }));
+        }
+
+        std::vector<uint8_t> ReadNormal(const std::wstring& path, std::stop_token stop) const
+        {
+            const int jitter = m_jitterUs.load();
+            if (jitter > 0)
+            {
+                thread_local uint32_t rng = GetCurrentThreadId();
+                rng = rng * 1664525u + 1013904223u;
+                const auto until = std::chrono::steady_clock::now() +
+                    std::chrono::microseconds((rng >> 8) % static_cast<uint32_t>(jitter));
+                while (std::chrono::steady_clock::now() < until && !stop.stop_requested())
+                {
+                    std::this_thread::yield();
+                }
+                if (stop.stop_requested())
+                {
+                    std::vector<uint8_t> bytes = Load(path);
+                    bytes.resize((std::min)(bytes.size(), static_cast<size_t>(40)));
+                    return bytes;
+                }
+            }
+            return Load(path);
+        }
+
+        std::vector<uint8_t> ReadCooperative(const std::wstring& path, std::stop_token stop, bool partialOnStop) const
+        {
+            // Entered is signaled only once the stop callback is registered, so
+            // a Cancel or Shutdown issued after WaitEntered always runs it.
+            const auto wake = WakeOnStop(stop);
+            Enter(path);
+            std::unique_lock<std::mutex> lock(m_mutex);
+            m_cv.wait_for(lock, kWaitTimeout, [&] { return stop.stop_requested() || m_released; });
+            PathStats& stats = m_stats[path];
+            stats.returned += 1;
+            m_cv.notify_all();
+            if (!stop.stop_requested())
+            {
+                return LoadUnlocked(path);
+            }
+            stats.stoppedReturns += 1;
+            if (!partialOnStop)
+            {
+                return {};
+            }
+            std::vector<uint8_t> bytes = LoadUnlocked(path);
+            bytes.resize((std::min)(bytes.size(), static_cast<size_t>(40)));
+            return bytes;
+        }
+
+        std::vector<uint8_t> ReadOnOtherThread(const std::wstring& path, std::stop_token stop) const
+        {
+            auto done = std::make_shared<bool>(false);
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_helpers.emplace_back([this, done]
+                {
+                    const bool ok = ReadPipeByte();
+                    const DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    *done = true;
+                    m_helperCompleted += ok ? 1 : 0;
+                    m_helperAborted += (error == ERROR_OPERATION_ABORTED) ? 1 : 0;
+                    m_cv.notify_all();
+                });
+            }
+            const auto wake = WakeOnStop(stop);  // registered before Enter (see ReadCooperative)
+            Enter(path);
+            std::unique_lock<std::mutex> lock(m_mutex);
+            m_cv.wait_for(lock, kWaitTimeout, [&] { return stop.stop_requested() || *done; });
+            PathStats& stats = m_stats[path];
+            stats.returned += 1;
+            m_cv.notify_all();
+            if (stop.stop_requested())
+            {
+                stats.stoppedReturns += 1;
+                return {};
+            }
+            return LoadUnlocked(path);
+        }
+
+        IPathByteSource* m_previous;
+        std::filesystem::path m_dir;
+        std::wstring m_host;
+        HANDLE m_event { nullptr };
+        HANDLE m_pipeRead { nullptr };
+        HANDLE m_pipeWrite { nullptr };
+
+        mutable std::mutex m_mutex;
+        mutable std::condition_variable m_cv;
+        mutable std::unordered_map<std::wstring, ModeEntry> m_modes;
+        mutable std::unordered_map<std::wstring, PathStats> m_stats;
+        mutable std::vector<std::thread> m_helpers;
+        mutable size_t m_helperCompleted { 0 };
+        mutable size_t m_helperAborted { 0 };
+        std::function<void()> m_onStop;
+        mutable DWORD m_stopThread { 0 };
+        bool m_released { false };
+        std::atomic<int> m_jitterUs { 0 };
+    };
+
+    // Records the scheduler's test points and can hold a thread at one.
+    class HookProbe
+    {
+    public:
+        using Point = DecodeScheduler::TestPoint;
+
+        DecodeScheduler::TestHook Hook()
+        {
+            return [this](Point point, uint64_t handle) { OnPoint(point, handle); };
+        }
+
+        // The next arrival at (point, handle) blocks until Release(point, handle).
+        void HoldAt(Point point, uint64_t handle)
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_holds[Key(point, handle)] = Hold {};
+        }
+
+        bool WaitHeld(Point point, uint64_t handle)
+        {
+            std::unique_lock<std::mutex> lock(m_mutex);
+            return m_cv.wait_for(lock, kWaitTimeout, [&]
+            {
+                auto it = m_holds.find(Key(point, handle));
+                return it != m_holds.end() && it->second.held;
+            });
+        }
+
+        void Release(Point point, uint64_t handle)
+        {
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_holds[Key(point, handle)].released = true;
+            }
+            m_cv.notify_all();
+        }
+
+        void ReleaseAll()
+        {
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                for (auto& [key, hold] : m_holds)
+                {
+                    hold.released = true;
+                }
+            }
+            m_cv.notify_all();
+        }
+
+        size_t Count(Point point, uint64_t handle) const
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            auto it = m_counts.find(Key(point, handle));
+            return it == m_counts.end() ? 0 : it->second;
+        }
+
+    private:
+        struct Hold
+        {
+            bool held { false };
+            bool released { false };
+        };
+
+        static std::pair<int, uint64_t> Key(Point point, uint64_t handle)
+        {
+            return { static_cast<int>(point), handle };
+        }
+
+        void OnPoint(Point point, uint64_t handle)
+        {
+            std::unique_lock<std::mutex> lock(m_mutex);
+            ++m_counts[Key(point, handle)];
+            auto it = m_holds.find(Key(point, handle));
+            if (it != m_holds.end() && !it->second.held && !it->second.released)
+            {
+                it->second.held = true;
+                m_cv.notify_all();
+                m_cv.wait_for(lock, kWaitTimeout, [&] { return it->second.released; });
+            }
+        }
+
+        mutable std::mutex m_mutex;
+        std::condition_variable m_cv;
+        std::map<std::pair<int, uint64_t>, Hold> m_holds;
+        std::map<std::pair<int, uint64_t>, size_t> m_counts;
+    };
+
+    // Runs `release` on scope exit; declare it after the scheduler so blocked
+    // reads and held hooks are released before the scheduler joins.
+    struct OnExit
+    {
+        std::function<void()> release;
+        ~OnExit() { release(); }
+    };
+
+    using Mode = ControlledSource::Mode;
+    using Point = DecodeScheduler::TestPoint;
+
+    bool Idle(DecodeScheduler& scheduler)
+    {
+        return WaitUntil([&] { return scheduler.LiveRequestCount() == 0 && scheduler.PrefetchedTaskCount() == 0; });
+    }
+
+    size_t DeliveryCount(Completions& done)
+    {
+        std::lock_guard<std::mutex> lock(done.mutex);
+        return done.entries.size();
+    }
+}
+
+IC_TEST(ReadCancel_CancelReleasesBlockedThumbnailRead)
+{
+    // A thumbnail read blocked on its token (on the serialized prefetch thread)
+    // is released by Cancel, and the next queued request is read and delivered
+    // without the blocked read ever completing normally (it is never released).
+    const auto& files = Files();
+    FileByteCache& cache = FileByteCache::Instance();
+    Completions done;
+    HookProbe probe;
+    Watchdog watchdog("thumbnail read cancel", std::chrono::seconds(60));
+    ControlledSource source(files.dir);
+    const std::wstring a = source.Entry(files.thumbs[0]);
+    const std::wstring b = source.Entry(files.thumbs[1]);
+    source.SetMode(a, Mode::Cooperative);
+    {
+        DecodeScheduler scheduler;
+        scheduler.SetTestHook(probe.Hook());
+        scheduler.SetThreadCount(2);
+        OnExit release { [&] { source.Release(); } };
+
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(a, ImagePurpose::Thumbnail, 1, done.Callback(1))));
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(b, ImagePurpose::Thumbnail, 2, done.Callback(2))));
+        IC_REQUIRE(source.WaitEntered(a));
+        IC_CHECK(source.Reads(b) == 0);  // serialized behind the blocked read
+
+        const auto canceledAt = std::chrono::steady_clock::now();
+        scheduler.Cancel(1);
+        IC_REQUIRE(WaitUntil([&] { return Delivered(done, 2); }));
+        const auto latency = std::chrono::steady_clock::now() - canceledAt;
+        IC_CHECK(latency < std::chrono::seconds(5));
+        IC_CHECK(SUCCEEDED(DeliveredHr(done, 2)));
+        IC_REQUIRE(Idle(scheduler));
+        IC_REQUIRE(WaitUntil([&] { return cache.Count() == 0; }));
+        std::printf("  thumbnail: next request delivered %lld ms after Cancel\n",
+            static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(latency).count()));
+    }
+    IC_CHECK(source.StoppedReturns(a) == 1);
+    IC_CHECK(probe.Count(Point::DecodeStart, 1) == 0);
+    IC_CHECK(DeliveredHr(done, 1) == E_PENDING);
+}
+
+IC_TEST(ReadCancel_CancelReleasesBlockedFullResolutionArchiveRead)
+{
+    // The same on a full-resolution worker: the archive read is released by
+    // Cancel and the worker takes the next full-resolution request.
+    const auto& files = Files();
+    Completions done;
+    HookProbe probe;
+    Watchdog watchdog("full-resolution read cancel", std::chrono::seconds(60));
+    ControlledSource source(files.dir);
+    const std::wstring a = source.Entry(files.thumbs[2]);
+    const std::wstring b = source.Entry(files.thumbs[3]);
+    source.SetMode(a, Mode::Cooperative);
+    {
+        DecodeScheduler scheduler;
+        scheduler.SetTestHook(probe.Hook());
+        scheduler.SetThreadCount(1);
+        OnExit release { [&] { source.Release(); } };
+
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(a, ImagePurpose::FullResolution, 1, done.Callback(1))));
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(b, ImagePurpose::FullResolution, 2, done.Callback(2))));
+        IC_REQUIRE(source.WaitEntered(a));
+
+        const auto canceledAt = std::chrono::steady_clock::now();
+        scheduler.Cancel(1);
+        IC_REQUIRE(WaitUntil([&] { return Delivered(done, 2); }));
+        IC_CHECK(std::chrono::steady_clock::now() - canceledAt < std::chrono::seconds(5));
+        IC_CHECK(SUCCEEDED(DeliveredHr(done, 2)));
+        IC_REQUIRE(Idle(scheduler));
+    }
+    IC_CHECK(source.StoppedReturns(a) == 1);
+    IC_CHECK(probe.Count(Point::DecodeStart, 1) == 0);
+    IC_CHECK(probe.Count(Point::DecodeStart, 2) == 1);
+    IC_CHECK(DeliveredHr(done, 1) == E_PENDING);
+}
+
+IC_TEST(ReadCancel_PreCanceledRequestsNeverReadOrDecode)
+{
+    // Requests canceled while still queued are never read, never decoded and
+    // never delivered: thumbnails (plain file and archive entry) behind a blocked
+    // prefetch read, and full-resolution requests (archive and plain file)
+    // behind a held worker.
+    const auto& files = Files();
+    Completions done;
+    HookProbe probe;
+    WorkerGate gate;
+    Watchdog watchdog("pre-canceled requests", std::chrono::seconds(60));
+    ControlledSource source(files.dir);
+    const std::wstring blocker = source.Entry(files.thumbs[4]);
+    const std::wstring plainThumb = files.thumbs[5];
+    const std::wstring archiveThumb = source.Entry(files.thumbs[6]);
+    const std::wstring archiveFull = source.Entry(files.thumbs[7]);
+    source.SetMode(blocker, Mode::Cooperative);
+    {
+        DecodeScheduler scheduler;
+        scheduler.SetTestHook(probe.Hook());
+        scheduler.SetThreadCount(1);
+        OnExit release { [&] { gate.Release(); source.Release(); } };
+
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 1, gate.Callback(done, 1))));
+        IC_REQUIRE(gate.WaitEntered());
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(blocker, ImagePurpose::Thumbnail, 2, done.Callback(2))));
+        IC_REQUIRE(source.WaitEntered(blocker));
+
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(plainThumb, ImagePurpose::Thumbnail, 10, done.Callback(10))));
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(archiveThumb, ImagePurpose::Thumbnail, 11, done.Callback(11))));
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(archiveFull, ImagePurpose::FullResolution, 12, done.Callback(12))));
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 13, done.Callback(13))));
+        for (uint64_t handle = 10; handle <= 13; ++handle)
+        {
+            scheduler.Cancel(handle);
+        }
+        IC_CHECK(scheduler.LiveRequestCount() == 1);  // the blocked read
+
+        scheduler.Cancel(2);
+        gate.Release();
+        IC_REQUIRE(done.WaitFor(1));
+        IC_REQUIRE(Idle(scheduler));
+    }
+    IC_CHECK(source.Reads(plainThumb) == 0);
+    IC_CHECK(source.Reads(archiveThumb) == 0);
+    IC_CHECK(source.Reads(archiveFull) == 0);
+    for (uint64_t handle : { 2u, 10u, 11u, 12u, 13u })
+    {
+        IC_CHECK(probe.Count(Point::DecodeStart, handle) == 0);
+        IC_CHECK(DeliveredHr(done, handle) == E_PENDING);
+    }
+    IC_CHECK(DeliveryCount(done) == 1);
+}
+
+IC_TEST(ReadCancel_CanceledRequestsNeverReachDecode)
+{
+    // The decode stage never runs for a request canceled before decode
+    // eligibility, so the decoders' path fallback (which would succeed here for
+    // the real on-disk image) never re-reads the file:
+    //   (a) thumbnail of a plain file whose read is canceled (it returns nothing);
+    //   (b) full-resolution archive entry whose read is canceled;
+    //   (c) full-resolution plain file canceled after a worker took it, before
+    //       its decode started.
+    const auto& files = Files();
+    Completions done;
+    HookProbe probe;
+    Watchdog watchdog("canceled never decodes", std::chrono::seconds(60));
+    ControlledSource source(files.dir);
+    const std::wstring plainThumb = files.thumbs[8];
+    const std::wstring archiveFull = source.Entry(files.thumbs[9]);
+    source.SetMode(plainThumb, Mode::Cooperative, 1, false);
+    source.SetMode(archiveFull, Mode::Cooperative);
+    probe.HoldAt(Point::TaskTaken, 3);
+    {
+        DecodeScheduler scheduler;
+        scheduler.SetTestHook(probe.Hook());
+        scheduler.SetThreadCount(2);
+        OnExit release { [&] { probe.ReleaseAll(); source.Release(); } };
+
+        // (a)
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(plainThumb, ImagePurpose::Thumbnail, 1, done.Callback(1))));
+        IC_REQUIRE(source.WaitEntered(plainThumb));
+        scheduler.Cancel(1);
+        // (b)
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(archiveFull, ImagePurpose::FullResolution, 2, done.Callback(2))));
+        IC_REQUIRE(source.WaitEntered(archiveFull));
+        scheduler.Cancel(2);
+        // (c)
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 3, done.Callback(3))));
+        IC_REQUIRE(probe.WaitHeld(Point::TaskTaken, 3));
+        scheduler.Cancel(3);
+        probe.Release(Point::TaskTaken, 3);
+
+        // An uncanceled request of each kind still decodes.
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(plainThumb, ImagePurpose::Thumbnail, 4, done.Callback(4))));
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 5, done.Callback(5))));
+        IC_REQUIRE(done.WaitFor(2));
+        IC_REQUIRE(Idle(scheduler));
+    }
+    IC_CHECK(source.StoppedReturns(plainThumb) == 1);
+    IC_CHECK(source.StoppedReturns(archiveFull) == 1);
+    for (uint64_t handle : { 1u, 2u, 3u })
+    {
+        IC_CHECK(probe.Count(Point::DecodeStart, handle) == 0);
+        IC_CHECK(DeliveredHr(done, handle) == E_PENDING);
+    }
+    IC_CHECK(probe.Count(Point::DecodeStart, 4) == 1);
+    IC_CHECK(SUCCEEDED(DeliveredHr(done, 4)));
+    IC_CHECK(SUCCEEDED(DeliveredHr(done, 5)));
+}
+
+IC_TEST(ReadCancel_CanceledReadNeverPopulatesByteCache)
+{
+    // A canceled read returns a partial prefix. It must not be cached: the
+    // same-path request queued behind it performs its own read and decodes the
+    // full bytes (a virtual archive entry decodes only from the bytes read).
+    const auto& files = Files();
+    FileByteCache& cache = FileByteCache::Instance();
+    Completions done;
+    HookProbe probe;
+    Watchdog watchdog("canceled read not cached", std::chrono::seconds(60));
+    ControlledSource source(files.dir);
+    const std::wstring entry = source.Entry(files.thumbs[10]);
+    source.SetMode(entry, Mode::Cooperative);  // first read only
+    {
+        DecodeScheduler scheduler;
+        scheduler.SetTestHook(probe.Hook());
+        scheduler.SetThreadCount(2);
+        OnExit release { [&] { source.Release(); } };
+
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(entry, ImagePurpose::Thumbnail, 1, done.Callback(1))));
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(entry, ImagePurpose::Thumbnail, 2, done.Callback(2))));
+        IC_REQUIRE(source.WaitEntered(entry));
+        scheduler.Cancel(1);
+
+        IC_REQUIRE(WaitUntil([&] { return Delivered(done, 2); }));
+        IC_CHECK(SUCCEEDED(DeliveredHr(done, 2)));
+        IC_REQUIRE(Idle(scheduler));
+        IC_REQUIRE(WaitUntil([&] { return cache.Count() == 0; }));
+    }
+    IC_CHECK(source.StoppedReturns(entry) == 1);
+    IC_CHECK(source.Reads(entry) == 2);  // the uncanceled request read for itself
+    IC_CHECK(probe.Count(Point::DecodeStart, 1) == 0);
+    IC_CHECK(DeliveredHr(done, 1) == E_PENDING);
+}
+
+IC_TEST(ReadCancel_CancelRacingReadCompletionStress)
+{
+    // Cancels land at random points around read completion (before, during and
+    // after short reads that honour the token) on thumbnail and full-resolution archive
+    // requests. Nothing may deliver a partial-read failure, every uncanceled
+    // request completes once, and request, slot and cache state drains to zero.
+    const auto& files = Files();
+    FileByteCache& cache = FileByteCache::Instance();
+    constexpr uint64_t kRequests = 400;
+    std::mutex mutex;
+    std::unordered_map<uint64_t, int> deliveries;
+    std::unordered_map<uint64_t, HRESULT> results;
+    std::unordered_set<uint64_t> canceled;
+    {
+        Watchdog watchdog("cancel race stress", std::chrono::seconds(90));
+        ControlledSource source(files.dir);
+        source.SetJitter(2000);
+        DecodeScheduler scheduler;
+        scheduler.SetThreadCount(3);
+        OnExit release { [&] { source.Release(); } };
+
+        uint32_t rng = 777;
+        const auto next = [&rng]() { rng = rng * 1664525u + 1013904223u; return rng >> 8; };
+        std::vector<uint64_t> pending;
+        for (uint64_t handle = 1; handle <= kRequests; ++handle)
+        {
+            const std::wstring entry = source.Entry(files.thumbs[handle % files.thumbs.size()]);
+            const bool full = (next() % 4) == 0;
+            IC_REQUIRE(scheduler.Enqueue(MakeTask(entry, full ? ImagePurpose::FullResolution : ImagePurpose::Thumbnail,
+                handle, [&, handle](PipelineResult&& result)
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    ++deliveries[handle];
+                    results[handle] = result.hr;
+                })));
+            pending.push_back(handle);
+            if (next() % 3 == 0 && !pending.empty())
+            {
+                const size_t index = next() % pending.size();
+                const uint64_t victim = pending[index];
+                if (next() % 2 == 0)
+                {
+                    std::this_thread::sleep_for(std::chrono::microseconds(next() % 500));
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    canceled.insert(victim);
+                }
+                scheduler.Cancel(victim);
+            }
+        }
+
+        IC_REQUIRE(WaitUntil([&]
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            for (uint64_t handle = 1; handle <= kRequests; ++handle)
+            {
+                if (canceled.count(handle) == 0 && deliveries.count(handle) == 0)
+                {
+                    return false;
+                }
+            }
+            return true;
+        }));
+        IC_REQUIRE(Idle(scheduler));
+        IC_REQUIRE(WaitUntil([&] { return cache.Count() == 0; }));
+    }
+
+    std::lock_guard<std::mutex> lock(mutex);
+    for (uint64_t handle = 1; handle <= kRequests; ++handle)
+    {
+        const auto it = deliveries.find(handle);
+        const int count = (it == deliveries.end()) ? 0 : it->second;
+        IC_CHECK(count <= 1);
+        if (canceled.count(handle) == 0)
+        {
+            IC_CHECK(count == 1);
+        }
+        if (count == 1)
+        {
+            IC_CHECK(SUCCEEDED(results[handle]));
+        }
+    }
+    std::printf("  cancel race: %zu delivered, %zu canceled of %llu\n",
+        deliveries.size(), canceled.size(), static_cast<unsigned long long>(kRequests));
+}
+
+IC_TEST(ReadCancel_CancelInterruptsBlockedSynchronousRead)
+{
+    // A source that ignores its token and blocks in a synchronous ReadFile (a
+    // pipe here; a network path or online-only file in practice) is released by
+    // the CancelSynchronousIo attempt that Cancel makes on the reading thread:
+    // on the prefetch thread (thumbnail) and on a decode worker (full resolution).
+    const auto& files = Files();
+    Completions done;
+    HookProbe probe;
+    Watchdog watchdog("OS cancel of a blocked read", std::chrono::seconds(60));
+    ControlledSource source(files.dir);
+    const std::wstring thumb = source.Entry(files.thumbs[11]);
+    const std::wstring full = source.Entry(files.thumbs[12]);
+    source.SetMode(thumb, Mode::Pipe);
+    source.SetMode(full, Mode::Pipe);
+    {
+        DecodeScheduler scheduler;
+        scheduler.SetTestHook(probe.Hook());
+        scheduler.SetThreadCount(1);
+        OnExit release { [&] { for (int i = 0; i < 4; ++i) { source.WritePipe(); } } };
+
+        for (const auto& [path, purpose, handle] : {
+            std::tuple { thumb, ImagePurpose::Thumbnail, uint64_t { 1 } },
+            std::tuple { full, ImagePurpose::FullResolution, uint64_t { 2 } } })
+        {
+            IC_REQUIRE(scheduler.Enqueue(MakeTask(path, purpose, handle, done.Callback(handle))));
+            IC_REQUIRE(source.WaitEntered(path));
+            // Let the thread reach ReadFile (CancelSynchronousIo affects only an
+            // operation already in progress).
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            scheduler.Cancel(handle);
+            IC_CHECK(source.WaitReturned(path, 1, std::chrono::milliseconds(5000)));
+            IC_CHECK(source.Aborted(path) == 1);
+            IC_CHECK(probe.Count(Point::CancelDispatch, handle) == 1);
+        }
+
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 3, done.Callback(3))));
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[13], ImagePurpose::Thumbnail, 4, done.Callback(4))));
+        IC_REQUIRE(done.WaitFor(2));
+        IC_REQUIRE(Idle(scheduler));
+    }
+    IC_CHECK(probe.Count(Point::DecodeStart, 1) == 0);
+    IC_CHECK(probe.Count(Point::DecodeStart, 2) == 0);
+    IC_CHECK(DeliveryCount(done) == 2);
+}
+
+IC_TEST(ReadCancel_StopCallbackMayReenterScheduler)
+{
+    // The stop callback runs on the scheduler's stop-dispatch thread. It
+    // queries the scheduler, cancels and re-prioritizes other requests and
+    // enqueues a new one; a probe thread meanwhile needs the queue lock. Neither
+    // may block: the callback runs with no scheduler lock held.
+    const auto& files = Files();
+    Completions done;
+    Watchdog watchdog("re-entrant stop callback", std::chrono::seconds(60));
+    ControlledSource source(files.dir);
+    const std::wstring entry = source.Entry(files.thumbs[14]);
+    source.SetMode(entry, Mode::Cooperative);
+    // Written by the stop callback on the scheduler's stop-dispatch thread.
+    std::atomic<bool> reentered { false };
+    std::atomic<bool> probeFinished { false };
+    std::atomic<bool> enqueued { false };
+    {
+        DecodeScheduler scheduler;
+        scheduler.SetThreadCount(2);
+        OnExit release { [&] { source.Release(); } };
+
+        source.SetOnStop([&]
+        {
+            (void)scheduler.LiveRequestCount();
+            (void)scheduler.PrefetchedTaskCount();
+            scheduler.SetPriority(2, RequestPriority::MainImage);
+            scheduler.Cancel(2);
+            enqueued = scheduler.Enqueue(MakeTask(files.thumbs[15], ImagePurpose::Thumbnail, 3, done.Callback(3)));
+
+            std::mutex m;
+            std::condition_variable cv;
+            bool finished = false;
+            std::thread probeThread([&]
+            {
+                (void)scheduler.LiveRequestCount();
+                std::lock_guard<std::mutex> lock(m);
+                finished = true;
+                cv.notify_all();
+            });
+            {
+                std::unique_lock<std::mutex> lock(m);
+                probeFinished = cv.wait_for(lock, std::chrono::seconds(5), [&] { return finished; });
+            }
+            probeThread.join();
+            reentered = true;
+        });
+
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(entry, ImagePurpose::Thumbnail, 1, done.Callback(1))));
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[16], ImagePurpose::Thumbnail, 2, done.Callback(2))));
+        IC_REQUIRE(source.WaitEntered(entry));
+        scheduler.Cancel(1);
+        IC_REQUIRE(WaitUntil([&] { return reentered.load(); }));
+        IC_CHECK(probeFinished.load());
+        IC_CHECK(enqueued.load());
+        IC_CHECK(source.StopCallbackThread() != 0);
+        IC_CHECK(source.StopCallbackThread() != GetCurrentThreadId());
+        IC_CHECK(source.StopCallbackThread() != source.LastReadThread(entry));
+        IC_REQUIRE(WaitUntil([&] { return Delivered(done, 3); }));
+        IC_REQUIRE(Idle(scheduler));
+        source.SetOnStop({});
+    }
+    IC_CHECK(DeliveredHr(done, 1) == E_PENDING);
+    IC_CHECK(DeliveredHr(done, 2) == E_PENDING);
+    IC_CHECK(SUCCEEDED(DeliveredHr(done, 3)));
+}
+
+IC_TEST(ReadCancel_LegacyReadAllSourceStillWorks)
+{
+    // A source that implements only ReadAll(path) keeps working: the stop-aware
+    // overload's default delegates to it. Its reads are not interruptible, but a
+    // read canceled meanwhile is still discarded once it returns.
+    const auto& files = Files();
+    Completions done;
+    HookProbe probe;
+    {
+        Watchdog watchdog("legacy byte source", std::chrono::seconds(60));
+        VirtualArchiveSource source(files.dir);
+        const std::wstring entry = source.Entry(files.thumbs[17]);
+        const IPathByteSource& base = source;
+        IC_CHECK(base.ReadAll(entry, std::stop_token {}) == source.ReadAll(entry));
+
+        DecodeScheduler scheduler;
+        scheduler.SetTestHook(probe.Hook());
+        scheduler.SetThreadCount(2);
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(entry, ImagePurpose::Thumbnail, 1, done.Callback(1))));
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(source.Entry(files.thumbs[18]), ImagePurpose::FullResolution, 2,
+            done.Callback(2))));
+        IC_REQUIRE(done.WaitFor(2));
+        IC_CHECK(SUCCEEDED(DeliveredHr(done, 1)));
+        IC_CHECK(SUCCEEDED(DeliveredHr(done, 2)));
+        IC_REQUIRE(Idle(scheduler));
+    }
+    {
+        // Canceled during a blocked legacy read: discarded after it returns.
+        Watchdog watchdog("legacy blocked read", std::chrono::seconds(60));
+        GatedByteSource source;
+        source.archivePath = files.thumbs[19];
+        source.gatedRead = files.thumbs[19];
+        DecodeScheduler scheduler;
+        scheduler.SetTestHook(probe.Hook());
+        scheduler.SetThreadCount(1);
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[19], ImagePurpose::FullResolution, 3, done.Callback(3))));
+        IC_REQUIRE(source.WaitEntered());
+        scheduler.Cancel(3);
+        source.Release();
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 4, done.Callback(4))));
+        IC_REQUIRE(WaitUntil([&] { return Delivered(done, 4); }));
+        IC_REQUIRE(Idle(scheduler));
+    }
+    IC_CHECK(probe.Count(Point::DecodeStart, 3) == 0);
+    IC_CHECK(DeliveredHr(done, 3) == E_PENDING);
+}
+
+namespace
+{
+    // Barrier test for the read lease. Request A's read on thread T finishes;
+    // A's cancellation is delivered late, while T moves on to request B, whose
+    // read blocks in a real (cancellable) pipe ReadFile. B's read must not be
+    // aborted and B must complete. `cancelAt`:
+    //   BeforeReadRegister - Cancel while T is about to register A's read: A is
+    //                        then never read and no OS cancel is dispatched;
+    //   BeforeReadRetire   - Cancel after A's read returned, before T retires it:
+    //                        the OS cancel hits T while it is outside any I/O;
+    //   CancelDispatch     - the canceler is held between finding A's read on
+    //                        the lease and dispatching CancelSynchronousIo, while
+    //                        T tries to retire A and start B: T must not start B
+    //                        until the dispatch is done.
+    void RunLateCancelBarrier(ImagePurpose purpose, Point cancelAt)
+    {
+        const auto& files = Files();
+        Completions done;
+        HookProbe probe;
+        Watchdog watchdog("late cancel barrier", std::chrono::seconds(60));
+        ControlledSource source(files.dir);
+        const std::wstring a = source.Entry(files.thumbs[20]);
+        const std::wstring b = source.Entry(files.thumbs[21]);
+        source.SetMode(b, Mode::Pipe);
+        const Point holdAt = (cancelAt == Point::CancelDispatch) ? Point::BeforeReadRetire : cancelAt;
+        probe.HoldAt(holdAt, 1);
+        if (cancelAt == Point::CancelDispatch)
+        {
+            probe.HoldAt(Point::CancelDispatch, 1);
+        }
+        bool bStartedEarly = false;
+        {
+            DecodeScheduler scheduler;
+            scheduler.SetTestHook(probe.Hook());
+            scheduler.SetThreadCount(1);
+            OnExit release { [&] { probe.ReleaseAll(); for (int i = 0; i < 4; ++i) { source.WritePipe(); } } };
+
+            IC_REQUIRE(scheduler.Enqueue(MakeTask(a, purpose, 1, done.Callback(1))));
+            IC_REQUIRE(scheduler.Enqueue(MakeTask(b, purpose, 2, done.Callback(2))));
+            IC_REQUIRE(probe.WaitHeld(holdAt, 1));
+
+            std::thread canceler;
+            if (cancelAt == Point::CancelDispatch)
+            {
+                // Cancel returns at once; the dispatch thread is held at the
+                // dispatch point under the lease mutex.
+                canceler = std::thread([&] { scheduler.Cancel(1); });
+                IC_REQUIRE(probe.WaitHeld(Point::CancelDispatch, 1));
+                probe.Release(holdAt, 1);
+                // T now waits to retire A; it must not reach B's read.
+                std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                bStartedEarly = source.Reads(b) != 0;
+                probe.Release(Point::CancelDispatch, 1);
+                canceler.join();
+            }
+            else
+            {
+                // The stop (and any OS cancel) is dispatched asynchronously;
+                // release T only once it is done, so it lands at `cancelAt`.
+                scheduler.Cancel(1);
+                IC_REQUIRE(WaitUntil([&] { return probe.Count(Point::StopDispatched, 1) == 1; }));
+                probe.Release(holdAt, 1);
+            }
+
+            IC_REQUIRE(source.WaitEntered(b));
+            // B's read is in ReadFile on the same thread; any stray OS cancel
+            // would abort it. Then let it complete.
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            IC_CHECK(source.Aborted(b) == 0);
+            source.WritePipe();
+            IC_REQUIRE(WaitUntil([&] { return Delivered(done, 2); }));
+            IC_REQUIRE(Idle(scheduler));
+        }
+        IC_CHECK(!bStartedEarly);
+        IC_CHECK(source.Aborted(b) == 0);
+        IC_CHECK(SUCCEEDED(DeliveredHr(done, 2)));
+        IC_CHECK(DeliveredHr(done, 1) == E_PENDING);
+        IC_CHECK(probe.Count(Point::DecodeStart, 1) == 0);
+        IC_CHECK(probe.Count(Point::CancelDispatch, 2) == 0);
+        if (cancelAt == Point::BeforeReadRegister)
+        {
+            IC_CHECK(source.Reads(a) == 0);
+            IC_CHECK(probe.Count(Point::CancelDispatch, 1) == 0);
+        }
+        else
+        {
+            IC_CHECK(source.Reads(a) == 1);
+            IC_CHECK(probe.Count(Point::CancelDispatch, 1) == 1);
+        }
+    }
+}
+
+IC_TEST(ReadCancel_LateCancelDispatchNeverReachesTheNextRead)
+{
+    RunLateCancelBarrier(ImagePurpose::Thumbnail, Point::CancelDispatch);
+    RunLateCancelBarrier(ImagePurpose::FullResolution, Point::CancelDispatch);
+}
+
+IC_TEST(ReadCancel_CancelImmediatelyBeforeReadRegistration)
+{
+    RunLateCancelBarrier(ImagePurpose::Thumbnail, Point::BeforeReadRegister);
+    RunLateCancelBarrier(ImagePurpose::FullResolution, Point::BeforeReadRegister);
+}
+
+IC_TEST(ReadCancel_CancelImmediatelyBeforeReadRetirement)
+{
+    RunLateCancelBarrier(ImagePurpose::Thumbnail, Point::BeforeReadRetire);
+    RunLateCancelBarrier(ImagePurpose::FullResolution, Point::BeforeReadRetire);
+}
+
+IC_TEST(ReadCancel_CancelAfterRetirementNeverTargetsTheNextRead)
+{
+    // A's thumbnail read has retired and A waits for the (held) decode worker,
+    // while B's read blocks in a pipe ReadFile on the same prefetch thread.
+    // Canceling A must not OS-cancel B's read.
+    const auto& files = Files();
+    Completions done;
+    HookProbe probe;
+    WorkerGate gate;
+    Watchdog watchdog("cancel after retirement", std::chrono::seconds(60));
+    ControlledSource source(files.dir);
+    const std::wstring a = source.Entry(files.thumbs[22]);
+    const std::wstring b = source.Entry(files.thumbs[23]);
+    source.SetMode(b, Mode::Pipe);
+    {
+        DecodeScheduler scheduler;
+        scheduler.SetTestHook(probe.Hook());
+        scheduler.SetThreadCount(1);
+        OnExit release { [&] { gate.Release(); for (int i = 0; i < 4; ++i) { source.WritePipe(); } } };
+
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 9, gate.Callback(done, 9))));
+        IC_REQUIRE(gate.WaitEntered());
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(a, ImagePurpose::Thumbnail, 1, done.Callback(1))));
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(b, ImagePurpose::Thumbnail, 2, done.Callback(2))));
+        IC_REQUIRE(source.WaitEntered(b));
+        IC_CHECK(scheduler.PrefetchedTaskCount() == 1);  // A, waiting for decode
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        scheduler.Cancel(1);
+        IC_CHECK(scheduler.PrefetchedTaskCount() == 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        IC_CHECK(source.Aborted(b) == 0);
+
+        source.WritePipe();
+        gate.Release();
+        IC_REQUIRE(WaitUntil([&] { return Delivered(done, 2); }));
+        IC_REQUIRE(Idle(scheduler));
+    }
+    IC_CHECK(probe.Count(Point::CancelDispatch, 1) == 0);
+    IC_CHECK(source.Aborted(b) == 0);
+    IC_CHECK(SUCCEEDED(DeliveredHr(done, 2)));
+    IC_CHECK(DeliveredHr(done, 1) == E_PENDING);
+    IC_CHECK(probe.Count(Point::DecodeStart, 1) == 0);
+}
+
+IC_TEST(ReadCancel_TokenReleasesWaitForOtherThreadWork)
+{
+    // The host read waits (on its token) for work running on another thread,
+    // here a pipe ReadFile on a helper thread. Cancel releases the read through
+    // the token; the OS cancel attempt targets only the reading thread, so the
+    // helper's ReadFile is not aborted and completes once data arrives.
+    const auto& files = Files();
+    Completions done;
+    HookProbe probe;
+    Watchdog watchdog("token wait for other-thread work", std::chrono::seconds(60));
+    ControlledSource source(files.dir);
+    const std::wstring entry = source.Entry(files.thumbs[24]);
+    source.SetMode(entry, Mode::OtherThread);
+    // Keeps the read registered until the OS cancel attempt has been made.
+    probe.HoldAt(Point::BeforeReadRetire, 1);
+    DWORD readingThread = 0;
+    {
+        DecodeScheduler scheduler;
+        scheduler.SetTestHook(probe.Hook());
+        scheduler.SetThreadCount(1);
+        OnExit release { [&] { probe.ReleaseAll(); for (int i = 0; i < 4; ++i) { source.WritePipe(); } } };
+
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(entry, ImagePurpose::Thumbnail, 1, done.Callback(1))));
+        IC_REQUIRE(source.WaitEntered(entry));
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));  // helper is in ReadFile
+        scheduler.Cancel(1);
+        IC_CHECK(source.WaitReturned(entry, 1, std::chrono::milliseconds(5000)));
+        IC_CHECK(source.StoppedReturns(entry) == 1);
+        IC_CHECK(probe.WaitHeld(Point::BeforeReadRetire, 1));
+        IC_CHECK(WaitUntil([&] { return probe.Count(Point::CancelDispatch, 1) == 1; }));
+        probe.Release(Point::BeforeReadRetire, 1);
+        readingThread = source.LastReadThread(entry);
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        IC_CHECK(source.HelperAborted() == 0);
+        IC_CHECK(source.HelperCompleted() == 0);  // still pending, untouched
+        source.WritePipe();
+        IC_CHECK(source.WaitHelperCompleted(1));
+        IC_CHECK(source.HelperCompleted() == 1);
+        IC_REQUIRE(Idle(scheduler));
+    }
+    IC_CHECK(readingThread != 0 && readingThread != GetCurrentThreadId());
+    IC_CHECK(probe.Count(Point::CancelDispatch, 1) == 1);
+    IC_CHECK(probe.Count(Point::DecodeStart, 1) == 0);
+    IC_CHECK(DeliveryCount(done) == 0);
+}
+
+// ---------------------------------------------------------------------------
+// Bounded shutdown.
+
+namespace
+{
+    std::unordered_set<DWORD> ProcessThreadIds()
+    {
+        std::unordered_set<DWORD> ids;
+        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snapshot == INVALID_HANDLE_VALUE)
+        {
+            return ids;
+        }
+        THREADENTRY32 entry { sizeof(entry) };
+        for (BOOL ok = Thread32First(snapshot, &entry); ok; ok = Thread32Next(snapshot, &entry))
+        {
+            if (entry.th32OwnerProcessID == GetCurrentProcessId())
+            {
+                ids.insert(entry.th32ThreadID);
+            }
+        }
+        CloseHandle(snapshot);
+        return ids;
+    }
+
+    bool IsSubset(const std::unordered_set<DWORD>& subset, const std::unordered_set<DWORD>& set)
+    {
+        return std::all_of(subset.begin(), subset.end(), [&](DWORD id) { return set.count(id) != 0; });
+    }
+
+    // Owns a SYNCHRONIZE handle to a thread, so its exit can be checked
+    // without thread-id reuse.
+    class ThreadWatch
+    {
+    public:
+        explicit ThreadWatch(DWORD id)
+            : m_handle(OpenThread(SYNCHRONIZE, FALSE, id))
+        {
+        }
+        ~ThreadWatch()
+        {
+            if (m_handle)
+            {
+                CloseHandle(m_handle);
+            }
+        }
+        ThreadWatch(const ThreadWatch&) = delete;
+        ThreadWatch& operator=(const ThreadWatch&) = delete;
+
+        bool Running() const { return m_handle && WaitForSingleObject(m_handle, 0) == WAIT_TIMEOUT; }
+        bool Exited() const { return m_handle && WaitForSingleObject(m_handle, 0) == WAIT_OBJECT_0; }
+
+    private:
+        HANDLE m_handle;
+    };
+
+    long long ElapsedMs(std::chrono::steady_clock::time_point since)
+    {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - since).count();
+    }
+}
+
+IC_TEST(ReadCancel_BoundedShutdownReleasesCooperativeReads)
+{
+    // Reads blocked on their tokens on both decode workers (full resolution)
+    // and on the prefetch thread, a prefetched thumbnail waiting for decode
+    // (holding a prefetch slot) and queued requests: Shutdown(bound) releases the
+    // reads, joins every thread well within the bound, invokes no callback and
+    // leaves no request or slot behind.
+    const auto& files = Files();
+    FileByteCache& cache = FileByteCache::Instance();
+    Completions done;
+    HookProbe probe;
+    Watchdog watchdog("bounded shutdown, cooperative", std::chrono::seconds(60));
+    ControlledSource source(files.dir);
+    const std::wstring fullB = source.Entry(files.thumbs[25]);
+    const std::wstring fullD = source.Entry(files.thumbs[26]);
+    const std::wstring thumbA = source.Entry(files.thumbs[27]);
+    source.SetMode(fullB, Mode::Cooperative);
+    source.SetMode(fullD, Mode::Cooperative);
+    source.SetMode(thumbA, Mode::Cooperative);
+    bool ok = false;
+    long long elapsed = 0;
+    {
+        DecodeScheduler scheduler;
+        scheduler.SetTestHook(probe.Hook());
+        scheduler.SetThreadCount(2);
+        OnExit release { [&] { source.Release(); } };
+
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(fullB, ImagePurpose::FullResolution, 1, done.Callback(1))));
+        IC_REQUIRE(source.WaitEntered(fullB));
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(fullD, ImagePurpose::FullResolution, 2, done.Callback(2))));
+        IC_REQUIRE(source.WaitEntered(fullD));
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(source.Entry(files.thumbs[28]), ImagePurpose::Thumbnail, 3, done.Callback(3))));
+        IC_REQUIRE(WaitUntil([&] { return scheduler.PrefetchedTaskCount() == 1; }));
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(thumbA, ImagePurpose::Thumbnail, 4, done.Callback(4))));
+        IC_REQUIRE(source.WaitEntered(thumbA));
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[29], ImagePurpose::Thumbnail, 5, done.Callback(5))));
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 6, done.Callback(6))));
+
+        const auto start = std::chrono::steady_clock::now();
+        ok = scheduler.Shutdown(std::chrono::milliseconds(5000));
+        elapsed = ElapsedMs(start);
+        IC_CHECK(ok);
+        IC_CHECK(elapsed < 2000);
+        IC_CHECK(scheduler.WorkerCount() == 0);
+        IC_CHECK(scheduler.LiveRequestCount() == 0);
+        IC_CHECK(scheduler.PrefetchedTaskCount() == 0);
+        IC_CHECK(cache.Count() == 0);
+        IC_CHECK(!scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 7, done.Callback(7))));
+    }
+    std::printf("  bounded shutdown (cooperative reads): %s in %lld ms\n", ok ? "joined" : "timed out", elapsed);
+    IC_CHECK(source.StoppedReturns(fullB) == 1);
+    IC_CHECK(source.StoppedReturns(fullD) == 1);
+    IC_CHECK(source.StoppedReturns(thumbA) == 1);
+    for (uint64_t handle = 1; handle <= 6; ++handle)
+    {
+        IC_CHECK(probe.Count(Point::DecodeStart, handle) == 0);
+    }
+    IC_CHECK(DeliveryCount(done) == 0);
+}
+
+IC_TEST(ReadCancel_BoundedShutdownOsCancelsBlockedSynchronousRead)
+{
+    // Reads that ignore their token but block in a cancellable ReadFile, on the
+    // prefetch thread and on the decode worker, are released by the OS cancel
+    // attempt Shutdown(bound) makes through the read leases.
+    const auto& files = Files();
+    Completions done;
+    Watchdog watchdog("bounded shutdown, OS cancel", std::chrono::seconds(60));
+    ControlledSource source(files.dir);
+    const std::wstring thumb = source.Entry(files.thumbs[30]);
+    const std::wstring full = source.Entry(files.thumbs[31]);
+    source.SetMode(thumb, Mode::Pipe);
+    source.SetMode(full, Mode::Pipe);
+    {
+        DecodeScheduler scheduler;
+        scheduler.SetThreadCount(1);
+        OnExit release { [&] { for (int i = 0; i < 4; ++i) { source.WritePipe(); } } };
+
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(full, ImagePurpose::FullResolution, 1, done.Callback(1))));
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(thumb, ImagePurpose::Thumbnail, 2, done.Callback(2))));
+        IC_REQUIRE(source.WaitEntered(full));
+        IC_REQUIRE(source.WaitEntered(thumb));
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));  // both in ReadFile
+
+        const auto start = std::chrono::steady_clock::now();
+        IC_CHECK(scheduler.Shutdown(std::chrono::milliseconds(5000)));
+        IC_CHECK(ElapsedMs(start) < 2000);
+        IC_CHECK(scheduler.LiveRequestCount() == 0);
+        IC_CHECK(scheduler.PrefetchedTaskCount() == 0);
+    }
+    IC_CHECK(source.Aborted(thumb) == 1);
+    IC_CHECK(source.Aborted(full) == 1);
+    IC_CHECK(DeliveryCount(done) == 0);
+}
+
+IC_TEST(ReadCancel_BoundedShutdownTimesOutOnNonCooperativeRead)
+{
+    // Reads that ignore both the token and OS cancellation, on the decode
+    // worker and on the prefetch thread. Shutdown(bound) returns false after
+    // about the bound without detaching: the stuck threads keep running, no new
+    // request is accepted, and SetThreadCount neither restarts nor blocks. Once
+    // the source is released a second call joins every thread; afterwards the
+    // scheduler restarts normally.
+    const auto& files = Files();
+    Completions done;
+    Watchdog watchdog("bounded shutdown, non-cooperative", std::chrono::seconds(60));
+    ControlledSource source(files.dir);
+    const std::wstring thumb = source.Entry(files.thumbs[32]);
+    const std::wstring full = source.Entry(files.thumbs[33]);
+    source.SetMode(thumb, Mode::IgnoreToken);
+    source.SetMode(full, Mode::IgnoreToken);
+    {
+        DecodeScheduler scheduler;
+        scheduler.SetThreadCount(2);
+        OnExit release { [&] { source.Release(); } };
+
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(full, ImagePurpose::FullResolution, 1, done.Callback(1))));
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(thumb, ImagePurpose::Thumbnail, 2, done.Callback(2))));
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[34], ImagePurpose::Thumbnail, 3, done.Callback(3))));
+        IC_REQUIRE(source.WaitEntered(full));
+        IC_REQUIRE(source.WaitEntered(thumb));
+        const ThreadWatch stuckWorker(source.LastReadThread(full));
+        const ThreadWatch stuckPrefetch(source.LastReadThread(thumb));
+        const size_t workers = scheduler.WorkerCount();
+        IC_REQUIRE(workers == 2);
+
+        auto start = std::chrono::steady_clock::now();
+        IC_CHECK(!scheduler.Shutdown(std::chrono::milliseconds(300)));
+        const long long elapsed = ElapsedMs(start);
+        IC_CHECK(elapsed >= 290);
+        IC_CHECK(elapsed < 2000);
+        std::printf("  bounded shutdown (non-cooperative reads): timed out after %lld ms (bound 300 ms)\n", elapsed);
+        IC_CHECK(stuckWorker.Running());
+        IC_CHECK(stuckPrefetch.Running());
+        IC_CHECK(!scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 4, done.Callback(4))));
+        IC_CHECK(scheduler.WorkerCount() == workers);
+
+        // SetThreadCount neither restarts nor waits for the stuck threads.
+        const auto threadsBefore = ProcessThreadIds();
+        start = std::chrono::steady_clock::now();
+        scheduler.SetThreadCount(3);
+        IC_CHECK(ElapsedMs(start) < 1000);
+        IC_CHECK(scheduler.WorkerCount() == workers);
+        IC_CHECK(IsSubset(ProcessThreadIds(), threadsBefore));
+        IC_CHECK(!scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 5, done.Callback(5))));
+
+        // Still stuck: a retry times out again.
+        IC_CHECK(!scheduler.Shutdown(std::chrono::milliseconds(100)));
+
+        source.Release();
+        IC_CHECK(scheduler.Shutdown(std::chrono::milliseconds(5000)));
+        IC_CHECK(stuckWorker.Exited());
+        IC_CHECK(stuckPrefetch.Exited());
+        IC_CHECK(scheduler.WorkerCount() == 0);
+        IC_CHECK(scheduler.LiveRequestCount() == 0);
+        IC_CHECK(scheduler.PrefetchedTaskCount() == 0);
+        IC_CHECK(scheduler.Shutdown(std::chrono::milliseconds(100)));
+        scheduler.Shutdown();
+
+        // Restart after the successful join.
+        scheduler.SetThreadCount(2);
+        IC_CHECK(scheduler.WorkerCount() == 2);
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 6, done.Callback(6))));
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[35], ImagePurpose::Thumbnail, 7, done.Callback(7))));
+        IC_REQUIRE(done.WaitFor(2));
+        IC_CHECK(SUCCEEDED(DeliveredHr(done, 6)));
+        IC_CHECK(SUCCEEDED(DeliveredHr(done, 7)));
+    }
+    IC_CHECK(DeliveryCount(done) == 2);
+}
+
+IC_TEST(ReadCancel_BoundedShutdownBeforeRequestsAndRepeated)
+{
+    const auto& files = Files();
+    Completions done;
+    Watchdog watchdog("bounded shutdown, idle", std::chrono::seconds(60));
+    DecodeScheduler scheduler;
+    IC_CHECK(scheduler.Shutdown(std::chrono::milliseconds(2000)));
+    IC_CHECK(scheduler.Shutdown(std::chrono::milliseconds(2000)));
+    IC_CHECK(scheduler.Shutdown(std::chrono::milliseconds(0)));  // nothing left to join
+    scheduler.Shutdown();
+    IC_CHECK(scheduler.WorkerCount() == 0);
+    IC_CHECK(!scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 1, done.Callback(1))));
+
+    scheduler.SetThreadCount(1);
+    IC_REQUIRE(scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 2, done.Callback(2))));
+    IC_REQUIRE(done.WaitFor(1));
+    IC_CHECK(scheduler.Shutdown(std::chrono::milliseconds(2000)));
+    IC_CHECK(DeliveryCount(done) == 1);
+}
+
+IC_TEST(ReadCancel_StopCallbackDuringShutdownMayReenterScheduler)
+{
+    // Shutdown(bound) signals stop with no scheduler lock held: a stop callback
+    // that queries the scheduler, cancels and enqueues (rejected) does not
+    // deadlock, and a probe thread can take the queue lock meanwhile.
+    const auto& files = Files();
+    Completions done;
+    Watchdog watchdog("re-entrant stop callback at shutdown", std::chrono::seconds(60));
+    ControlledSource source(files.dir);
+    const std::wstring entry = source.Entry(files.thumbs[36]);
+    source.SetMode(entry, Mode::Cooperative);
+    std::atomic<bool> reentered { false };
+    std::atomic<bool> probeFinished { false };
+    std::atomic<bool> enqueued { true };
+    {
+        DecodeScheduler scheduler;
+        scheduler.SetThreadCount(1);
+        OnExit release { [&] { source.Release(); } };
+        source.SetOnStop([&]
+        {
+            (void)scheduler.LiveRequestCount();
+            (void)scheduler.WorkerCount();
+            scheduler.SetPriority(2, RequestPriority::MainImage);
+            scheduler.Cancel(2);
+            enqueued = scheduler.Enqueue(MakeTask(files.thumbs[37], ImagePurpose::Thumbnail, 3, done.Callback(3)));
+            std::mutex m;
+            std::condition_variable cv;
+            bool finished = false;
+            std::thread probeThread([&]
+            {
+                (void)scheduler.PrefetchedTaskCount();
+                std::lock_guard<std::mutex> lock(m);
+                finished = true;
+                cv.notify_all();
+            });
+            {
+                std::unique_lock<std::mutex> lock(m);
+                probeFinished = cv.wait_for(lock, std::chrono::seconds(5), [&] { return finished; });
+            }
+            probeThread.join();
+            reentered = true;
+        });
+
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(entry, ImagePurpose::Thumbnail, 1, done.Callback(1))));
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[38], ImagePurpose::Thumbnail, 2, done.Callback(2))));
+        IC_REQUIRE(source.WaitEntered(entry));
+        IC_CHECK(scheduler.Shutdown(std::chrono::milliseconds(5000)));
+        source.SetOnStop({});
+    }
+    IC_CHECK(source.StopCallbackThread() != 0);
+    IC_CHECK(source.StopCallbackThread() != GetCurrentThreadId());
+    IC_CHECK(source.StopCallbackThread() != source.LastReadThread(entry));
+    IC_CHECK(reentered.load());
+    IC_CHECK(probeFinished.load());
+    IC_CHECK(!enqueued.load());
+    IC_CHECK(DeliveryCount(done) == 0);
+}
+
+namespace
+{
+    // A host stop callback blocks (as one waiting on a mutex held by a stuck
+    // read would). Neither Cancel nor a bounded Shutdown may run it on the
+    // caller's thread: Cancel returns at once, and Shutdown(bound) times out
+    // (keeping its threads) until the callback is released; a retry then joins.
+    void RunBlockedStopCallback(bool cancelFirst)
+    {
+        const auto& files = Files();
+        Completions done;
+        Watchdog watchdog("blocked stop callback", std::chrono::seconds(60));
+        ControlledSource source(files.dir);
+        const std::wstring entry = source.Entry(files.thumbs[cancelFirst ? 1 : 0]);
+        source.SetMode(entry, Mode::Cooperative);
+        HANDLE gate = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        HANDLE entered = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        std::atomic<DWORD> callbackThread { 0 };
+        source.SetOnStop([&]
+        {
+            callbackThread = GetCurrentThreadId();
+            SetEvent(entered);
+            (void)WaitForSingleObject(gate, 10000);
+        });
+        {
+            DecodeScheduler scheduler;
+            scheduler.SetThreadCount(1);
+            OnExit release { [&] { SetEvent(gate); source.Release(); } };
+
+            IC_REQUIRE(scheduler.Enqueue(MakeTask(entry, ImagePurpose::Thumbnail, 1, done.Callback(1))));
+            IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[2], ImagePurpose::Thumbnail, 2, done.Callback(2))));
+            IC_REQUIRE(source.WaitEntered(entry));
+
+            if (cancelFirst)
+            {
+                const auto start = std::chrono::steady_clock::now();
+                scheduler.Cancel(1);
+                IC_CHECK(ElapsedMs(start) < 200);
+                IC_REQUIRE(WaitForSingleObject(entered, 10000) == WAIT_OBJECT_0);
+                IC_CHECK(callbackThread.load() != GetCurrentThreadId());
+                IC_CHECK(callbackThread.load() != source.LastReadThread(entry));
+                // Other scheduler calls keep working while the callback blocks.
+                IC_CHECK(scheduler.LiveRequestCount() == 1);
+            }
+
+            auto start = std::chrono::steady_clock::now();
+            IC_CHECK(!scheduler.Shutdown(std::chrono::milliseconds(300)));
+            const long long elapsed = ElapsedMs(start);
+            IC_CHECK(elapsed >= 290);
+            IC_CHECK(elapsed < 2000);
+            IC_CHECK(WaitForSingleObject(entered, 0) == WAIT_OBJECT_0);
+            IC_CHECK(callbackThread.load() != 0);
+            IC_CHECK(callbackThread.load() != GetCurrentThreadId());
+            IC_CHECK(callbackThread.load() != source.LastReadThread(entry));
+            IC_CHECK(!scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 3, done.Callback(3))));
+            IC_CHECK(scheduler.WorkerCount() == 1);
+            std::printf("  blocked stop callback (%s): Shutdown(300 ms) timed out after %lld ms\n",
+                cancelFirst ? "after Cancel" : "from Shutdown", elapsed);
+
+            SetEvent(gate);
+            start = std::chrono::steady_clock::now();
+            IC_CHECK(scheduler.Shutdown(std::chrono::milliseconds(5000)));
+            IC_CHECK(ElapsedMs(start) < 2000);
+            IC_CHECK(scheduler.WorkerCount() == 0);
+            IC_CHECK(scheduler.LiveRequestCount() == 0);
+            IC_CHECK(scheduler.PrefetchedTaskCount() == 0);
+        }
+        source.SetOnStop({});
+        CloseHandle(gate);
+        CloseHandle(entered);
+        IC_CHECK(source.StoppedReturns(entry) == 1);
+        IC_CHECK(DeliveryCount(done) == 0);
+    }
+}
+
+IC_TEST(ReadCancel_BlockedStopCallbackDuringShutdownTimesOut)
+{
+    RunBlockedStopCallback(false);
+}
+
+IC_TEST(ReadCancel_BlockedStopCallbackAfterCancelTimesOutShutdown)
+{
+    RunBlockedStopCallback(true);
+}
+
+namespace
+{
+    // A thread_local whose destructor blocks on a gate (bounded): it runs after
+    // the scheduler thread function returned, during thread exit.
+    HANDLE g_tlsGate = nullptr;
+
+    struct BlockingTlsObject
+    {
+        bool touched { false };
+        ~BlockingTlsObject()
+        {
+            if (touched && g_tlsGate)
+            {
+                (void)WaitForSingleObject(g_tlsGate, 10000);
+            }
+        }
+    };
+
+    thread_local BlockingTlsObject t_blockingTls;
+
+    // Filesystem source whose reads create the blocking thread_local on the
+    // reading thread (as a host library might).
+    class TlsTouchingSource final : public IPathByteSource
+    {
+    public:
+        TlsTouchingSource() : m_previous(GetPathByteSource()) { SetPathByteSource(this); }
+        ~TlsTouchingSource() override { SetPathByteSource(m_previous); }
+
+        std::wstring ResolveHostPath(const std::wstring& path) const override { return path; }
+
+        std::vector<uint8_t> ReadAll(const std::wstring& path) const override
+        {
+            t_blockingTls.touched = true;
+            std::ifstream in(std::filesystem::path(path), std::ios::binary);
+            return std::vector<uint8_t>(std::istreambuf_iterator<char>(in), {});
+        }
+
+    private:
+        IPathByteSource* m_previous;
+    };
+}
+
+IC_TEST(ReadCancel_BoundedShutdownWaitsForThreadTermination)
+{
+    // The prefetch thread signals exit, but its thread_local destructor then
+    // blocks. Shutdown(bound) must wait for real thread termination within the
+    // bound and return false (keeping the thread) instead of blocking in join();
+    // once the destructor is released a retry joins.
+    const auto& files = Files();
+    Completions done;
+    Watchdog watchdog("TLS destructor at thread exit", std::chrono::seconds(60));
+    g_tlsGate = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    {
+        TlsTouchingSource source;
+        DecodeScheduler scheduler;
+        scheduler.SetThreadCount(1);
+        OnExit release { [&] { SetEvent(g_tlsGate); } };
+
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[3], ImagePurpose::Thumbnail, 1, done.Callback(1))));
+        IC_REQUIRE(done.WaitFor(1));
+        IC_CHECK(SUCCEEDED(DeliveredHr(done, 1)));
+
+        auto start = std::chrono::steady_clock::now();
+        IC_CHECK(!scheduler.Shutdown(std::chrono::milliseconds(300)));
+        const long long elapsed = ElapsedMs(start);
+        IC_CHECK(elapsed >= 290);
+        IC_CHECK(elapsed < 2000);
+        IC_CHECK(scheduler.WorkerCount() == 1);
+        IC_CHECK(!scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 2, done.Callback(2))));
+        std::printf("  TLS destructor: Shutdown(300 ms) timed out after %lld ms\n", elapsed);
+
+        // Still blocked: a retry times out again without blocking.
+        start = std::chrono::steady_clock::now();
+        IC_CHECK(!scheduler.Shutdown(std::chrono::milliseconds(100)));
+        IC_CHECK(ElapsedMs(start) < 2000);
+
+        SetEvent(g_tlsGate);
+        IC_CHECK(scheduler.Shutdown(std::chrono::milliseconds(5000)));
+        IC_CHECK(scheduler.WorkerCount() == 0);
+        IC_CHECK(scheduler.LiveRequestCount() == 0);
+    }
+    CloseHandle(g_tlsGate);
+    g_tlsGate = nullptr;
+    IC_CHECK(DeliveryCount(done) == 1);
+}
+
+IC_TEST(ReadCancel_ShutdownWhileCancelIsPublishingStillStopsTheRead)
+{
+    // Cancel is paused right after it removed the request from the live table
+    // (CancelPublished). A Shutdown running then no longer finds the request in
+    // the table, so the stop must already be queued for the dispatch thread:
+    // the token-only read is released and Shutdown(bound) joins in time.
+    const auto& files = Files();
+    Completions done;
+    HookProbe probe;
+    Watchdog watchdog("shutdown during cancel publication", std::chrono::seconds(60));
+    ControlledSource source(files.dir);
+    const std::wstring entry = source.Entry(files.thumbs[4]);
+    source.SetMode(entry, Mode::Cooperative);
+    probe.HoldAt(Point::CancelPublished, 1);
+    bool ok = false;
+    long long elapsed = 0;
+    {
+        DecodeScheduler scheduler;
+        scheduler.SetTestHook(probe.Hook());
+        scheduler.SetThreadCount(1);
+        OnExit release { [&] { probe.ReleaseAll(); source.Release(); } };
+
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(entry, ImagePurpose::Thumbnail, 1, done.Callback(1))));
+        IC_REQUIRE(source.WaitEntered(entry));
+        std::thread canceler([&] { scheduler.Cancel(1); });
+        IC_REQUIRE(probe.WaitHeld(Point::CancelPublished, 1));
+        IC_CHECK(scheduler.LiveRequestCount() == 0);
+
+        const auto start = std::chrono::steady_clock::now();
+        ok = scheduler.Shutdown(std::chrono::milliseconds(3000));
+        elapsed = ElapsedMs(start);
+        probe.Release(Point::CancelPublished, 1);
+        canceler.join();
+        IC_CHECK(ok);
+        IC_CHECK(elapsed < 2000);
+    }
+    std::printf("  shutdown during cancel publication: %s in %lld ms\n", ok ? "joined" : "timed out", elapsed);
+    IC_CHECK(source.StoppedReturns(entry) == 1);
+    IC_CHECK(DeliveryCount(done) == 0);
+}
+
+namespace
+{
+    // A handle-0 task is in no live table, so Shutdown can stop its read only
+    // through the lease scan. Hold the reading thread just before it registers
+    // the read, start Shutdown, let it scan the leases (nothing registered) and
+    // wait until the drained dispatch thread has exited, then let the thread
+    // register: the read must not start, and Shutdown(bound) joins in time.
+    void RunRegisterAfterShutdownBegan(ImagePurpose purpose)
+    {
+        const auto& files = Files();
+        Completions done;
+        HookProbe probe;
+        Watchdog watchdog("read registering after shutdown began", std::chrono::seconds(60));
+        ControlledSource source(files.dir);
+        const std::wstring entry = source.Entry(files.thumbs[purpose == ImagePurpose::Thumbnail ? 5 : 6]);
+        source.SetMode(entry, Mode::Cooperative);
+        probe.HoldAt(Point::BeforeReadRegister, 0);
+        std::atomic<bool> ok { false };
+        std::atomic<long long> elapsed { 0 };
+        {
+            DecodeScheduler scheduler;
+            scheduler.SetTestHook(probe.Hook());
+            scheduler.SetThreadCount(1);
+            OnExit release { [&] { probe.ReleaseAll(); source.Release(); } };
+
+            IC_REQUIRE(scheduler.Enqueue(MakeTask(entry, purpose, 0, done.Callback(0))));
+            IC_REQUIRE(probe.WaitHeld(Point::BeforeReadRegister, 0));
+            IC_CHECK(scheduler.LiveRequestCount() == 0);
+
+            // SetThreadCount may have retired an earlier dispatch thread.
+            const size_t exitsBefore = probe.Count(Point::StopDispatchExit, 0);
+            std::thread shutdownThread([&]
+            {
+                const auto start = std::chrono::steady_clock::now();
+                ok = scheduler.Shutdown(std::chrono::milliseconds(3000));
+                elapsed = ElapsedMs(start);
+            });
+            IC_CHECK(WaitUntil([&] { return probe.Count(Point::StopDispatchExit, 0) == exitsBefore + 1; }));
+            probe.Release(Point::BeforeReadRegister, 0);
+            shutdownThread.join();
+            IC_CHECK(ok.load());
+            IC_CHECK(elapsed.load() < 2000);
+        }
+        std::printf("  %s read registering after shutdown began: %s in %lld ms\n",
+            purpose == ImagePurpose::Thumbnail ? "thumbnail" : "full-resolution",
+            ok.load() ? "joined" : "timed out", elapsed.load());
+        IC_CHECK(source.Reads(entry) == 0);
+        IC_CHECK(probe.Count(Point::DecodeStart, 0) == 0);
+        IC_CHECK(DeliveryCount(done) == 0);
+    }
+}
+
+IC_TEST(ReadCancel_ReadRegisteringAfterShutdownBeganDoesNotStart)
+{
+    RunRegisterAfterShutdownBegan(ImagePurpose::Thumbnail);
+    RunRegisterAfterShutdownBegan(ImagePurpose::FullResolution);
+}
+
+IC_TEST(ReadCancel_CancelFinishShutdownRaceStress)
+{
+    // Cancel, read completion and bounded shutdown race: a canceler thread keeps
+    // canceling (also after Shutdown returned, when the lease handles are
+    // closed) while requests read, decode and finish. Every cycle must join
+    // within the bound, deliver nothing after Shutdown returned and leave no
+    // request or prefetch slot behind.
+    const auto& files = Files();
+    constexpr int kCycles = 150;
+    Watchdog watchdog("cancel/finish/shutdown stress", std::chrono::seconds(90));
+    int timedOut = 0;
+    int lateDeliveries = 0;
+    for (int cycle = 0; cycle < kCycles; ++cycle)
+    {
+        ControlledSource source(files.dir);
+        source.SetJitter(500);
+        std::atomic<bool> shutDown { false };
+        std::atomic<int> late { 0 };
+        {
+            DecodeScheduler scheduler;
+            scheduler.SetThreadCount(1 + (cycle % 3));
+            OnExit release { [&] { source.Release(); } };
+
+            constexpr uint64_t kRequests = 24;
+            for (uint64_t handle = 1; handle <= kRequests; ++handle)
+            {
+                const std::wstring entry = source.Entry(files.thumbs[(cycle + handle) % files.thumbs.size()]);
+                const bool full = (handle % 3) == 0;
+                scheduler.Enqueue(MakeTask(entry, full ? ImagePurpose::FullResolution : ImagePurpose::Thumbnail, handle,
+                    [&](PipelineResult&&)
+                    {
+                        if (shutDown.load())
+                        {
+                            late.fetch_add(1);
+                        }
+                    }));
+            }
+            std::atomic<bool> stop { false };
+            std::thread canceler([&]
+            {
+                uint32_t rng = static_cast<uint32_t>(cycle) * 2654435761u;
+                while (!stop.load())
+                {
+                    rng = rng * 1664525u + 1013904223u;
+                    scheduler.Cancel(1 + (rng >> 8) % kRequests);
+                    std::this_thread::yield();
+                }
+            });
+            std::this_thread::sleep_for(std::chrono::microseconds((cycle * 37) % 3000));
+            if (!scheduler.Shutdown(std::chrono::milliseconds(5000)))
+            {
+                ++timedOut;
+            }
+            shutDown.store(true);
+            IC_CHECK(scheduler.LiveRequestCount() == 0);
+            IC_CHECK(scheduler.PrefetchedTaskCount() == 0);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            stop.store(true);
+            canceler.join();
+        }
+        lateDeliveries += late.load();
+    }
+    IC_CHECK(timedOut == 0);
+    IC_CHECK(lateDeliveries == 0);
 }

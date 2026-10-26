@@ -9,15 +9,38 @@
 
 namespace ImageCore
 {
+    namespace
+    {
+        // Set when the Instance() static begins construction.
+        std::atomic<bool> s_instantiated { false };
+    }
+
     ImageLoader& ImageLoader::Instance()
     {
         static ImageLoader instance;
         return instance;
     }
 
+    bool ImageLoader::IsInstantiated()
+    {
+        return s_instantiated.load();
+    }
+
+    bool ImageLoader::ShutdownIfCreated(std::chrono::milliseconds bound)
+    {
+        if (!s_instantiated.load())
+        {
+            return true;
+        }
+        // Constructed, or being constructed: Instance() waits for the
+        // initialization of its static to finish.
+        return Instance().Shutdown(bound);
+    }
+
     ImageLoader::ImageLoader()
         : m_nextHandle(1)
     {
+        s_instantiated.store(true);
         Initialize();
     }
 
@@ -55,6 +78,26 @@ namespace ImageCore
             scheduler->Shutdown();
         }
         m_cache.reset();
+    }
+
+    bool ImageLoader::Shutdown(std::chrono::milliseconds bound)
+    {
+        std::shared_ptr<DecodeScheduler> scheduler = Scheduler();
+        if (scheduler && !scheduler->Shutdown(bound))
+        {
+            // Threads are still running: keep the scheduler and the cache they
+            // may use. The scheduler rejects requests meanwhile.
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_scheduler == scheduler)
+            {
+                m_scheduler.reset();
+            }
+        }
+        m_cache.reset();
+        return true;
     }
 
     ImageHandle ImageLoader::RequestDecoded(

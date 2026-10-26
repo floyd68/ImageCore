@@ -90,7 +90,7 @@ namespace ImageCore
             return desc.IncursSeekPenalty ? true : false;
         }
 
-        static std::shared_ptr<std::vector<uint8_t>> ReadWholeFileBytes(const std::wstring& path)
+        static std::shared_ptr<std::vector<uint8_t>> ReadWholeFileBytes(const std::wstring& path, std::stop_token stop)
         {
             IPathByteSource* source = GetPathByteSource();
             if (!source)
@@ -99,7 +99,7 @@ namespace ImageCore
             }
 
             // Host adapter reads disk files and archive entries.
-            std::vector<uint8_t> data = source->ReadAll(path);
+            std::vector<uint8_t> data = source->ReadAll(path, stop);
             if (data.empty())
             {
                 return nullptr;
@@ -128,6 +128,49 @@ namespace ImageCore
         }
 
         // (debug-only tracing removed)
+    }
+
+    struct ReadLease
+    {
+        // Guards both fields. OS cancellation is issued under it, so retiring a
+        // read (which takes it) waits for any CancelSynchronousIo aimed at that
+        // read, and a late cancel can never hit the thread's next operation.
+        std::mutex mutex;
+        HANDLE thread { nullptr };                    // real handle of the owning thread
+        std::shared_ptr<DecodeRequestState> active;   // request whose read runs there
+
+        ~ReadLease()
+        {
+            if (thread)
+            {
+                CloseHandle(thread);
+            }
+        }
+    };
+
+    struct DecodeScheduler::ThreadSlot
+    {
+        std::thread thread;
+        std::shared_ptr<ReadLease> lease { std::make_shared<ReadLease>() };
+        bool exited { false };  // guarded by m_exitMutex
+    };
+
+    namespace
+    {
+        // Gives the calling thread's lease a real handle of the thread, for
+        // CancelSynchronousIo from other threads (GetCurrentThread() is a
+        // pseudo handle).
+        void BindLeaseToCurrentThread(ReadLease& lease)
+        {
+            HANDLE handle = nullptr;
+            if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &handle,
+                0, FALSE, DUPLICATE_SAME_ACCESS))
+            {
+                handle = nullptr;
+            }
+            std::lock_guard<std::mutex> lock(lease.mutex);
+            lease.thread = handle;
+        }
     }
 
     void PriorityTaskQueue::Push(DecodeTask task, DecodeRequestState::Stage stage)
@@ -188,7 +231,7 @@ namespace ImageCore
 
     size_t DecodeScheduler::WorkerCount() const
     {
-        return m_highWorkers.size() + m_backgroundWorkers.size();
+        return m_workerCount.load();
     }
 
     size_t DecodeScheduler::LiveRequestCount() const
@@ -233,6 +276,140 @@ namespace ImageCore
         return incursSeek ? 2 : 4;
     }
 
+    void DecodeScheduler::SetTestHook(TestHook hook)
+    {
+        m_testHook = std::move(hook);
+    }
+
+    void DecodeScheduler::RunTestHook(TestPoint point, uint64_t handle) const
+    {
+        if (m_testHook)
+        {
+            m_testHook(point, handle);
+        }
+    }
+
+    std::shared_ptr<std::vector<uint8_t>> DecodeScheduler::LeasedRead(
+        ReadLease& lease,
+        const std::shared_ptr<DecodeRequestState>& state,
+        uint64_t handle,
+        const std::wstring& path,
+        bool& stopped)
+    {
+        const std::stop_token stop = state->stop.get_token();
+        RunTestHook(TestPoint::BeforeReadRegister, handle);
+        {
+            std::lock_guard<std::mutex> lock(lease.mutex);
+            lease.active = state;
+        }
+
+        // Registered before the check: a Cancel that this check misses has its
+        // stop dispatched later, and the dispatch then finds the read on the
+        // lease. The canceled flag is checked too: Cancel sets it at once, while
+        // the token is signaled by the stop-dispatch thread. So is the shutdown
+        // flag: a read that registers after Shutdown scanned the leases (which
+        // the dispatch thread may outlive only briefly) must not start, and one
+        // registered before the scan is found by it and stopped.
+        std::shared_ptr<std::vector<uint8_t>> bytes;
+        if (!stop.stop_requested() && !state->canceled.load() && !m_shutdown.load())
+        {
+            try
+            {
+                bytes = ReadWholeFileBytes(path, stop);
+            }
+            catch (...)
+            {
+                // Never let a host exception kill the thread or skip retirement.
+                bytes.reset();
+            }
+        }
+
+        RunTestHook(TestPoint::BeforeReadRetire, handle);
+        {
+            // Waits for an OS cancel aimed at this read that is still in progress.
+            std::lock_guard<std::mutex> lock(lease.mutex);
+            lease.active.reset();
+        }
+
+        stopped = stop.stop_requested() || state->canceled.load() || m_shutdown.load();
+        if (stopped)
+        {
+            bytes.reset();  // empty or partial: never cached, never decoded
+        }
+        return bytes;
+    }
+
+    void DecodeScheduler::StopRequest(const std::shared_ptr<DecodeRequestState>& state)
+    {
+        // Host stop callbacks run synchronously here; no scheduler lock is held.
+        state->stop.request_stop();
+
+        std::shared_ptr<ReadLease> lease;
+        {
+            std::lock_guard<std::mutex> lock(m_queueMutex);
+            lease = state->readLease;
+        }
+        if (!lease)
+        {
+            return;  // not taken by a thread yet: it is skipped when taken
+        }
+
+        // Best effort: unblocks a synchronous OS call (network path, online-only
+        // file) that ignores the token. Issued only while this request's read is
+        // registered, under the lease mutex, so it cannot reach another request.
+        std::lock_guard<std::mutex> lock(lease->mutex);
+        if (lease->active == state && lease->thread)
+        {
+            RunTestHook(TestPoint::CancelDispatch, state->handle);
+            (void)CancelSynchronousIo(lease->thread);
+        }
+    }
+
+    void DecodeScheduler::CancelActiveReadsIo()
+    {
+        // Only CancelSynchronousIo (no host code), so the caller's deadline
+        // holds. Every read registered during shutdown belongs to a canceled
+        // request; the lease mutex keeps the call on that read.
+        for (const auto& slot : m_threads)
+        {
+            ReadLease& lease = *slot->lease;
+            std::lock_guard<std::mutex> lock(lease.mutex);
+            if (lease.active && lease.active->canceled.load() && lease.thread)
+            {
+                RunTestHook(TestPoint::CancelDispatch, lease.active->handle);
+                (void)CancelSynchronousIo(lease.thread);
+            }
+        }
+    }
+
+    void DecodeScheduler::StopDispatchThread(ThreadSlot* slot)
+    {
+        // Runs every stop request (and so every host stop callback) for Cancel
+        // and Shutdown, so neither blocks its caller on host code. Exits once
+        // shutdown has begun and the queue is drained; Shutdown counts it among
+        // the threads it joins, so a stop callback that never returns makes a
+        // bounded Shutdown time out instead of hanging it.
+        for (;;)
+        {
+            std::shared_ptr<DecodeRequestState> state;
+            {
+                std::unique_lock<std::mutex> lock(m_stopMutex);
+                m_stopCondition.wait(lock, [this] { return !m_stopQueue.empty() || m_stopExit; });
+                if (m_stopQueue.empty())
+                {
+                    break;
+                }
+                state = std::move(m_stopQueue.front());
+                m_stopQueue.pop_front();
+            }
+            StopRequest(state);
+            RunTestHook(TestPoint::StopDispatched, state->handle);
+        }
+
+        RunTestHook(TestPoint::StopDispatchExit, 0);
+        SignalExit(*slot);
+    }
+
     void DecodeScheduler::Finish_NoLock(const DecodeTask& task)
     {
         auto it = m_liveRequests.find(task.handle);
@@ -275,8 +452,18 @@ namespace ImageCore
 
     void DecodeScheduler::SetThreadCount(size_t count)
     {
+        std::lock_guard<std::mutex> lifecycle(m_lifecycleMutex);
+        if (m_joinPending)
+        {
+            // Restarting would need the unbounded join, which would block on the
+            // thread a bounded Shutdown could not join.
+            IC_LOG_WARN("[DecodeScheduler] SetThreadCount({}) ignored: threads from a timed-out Shutdown are still running.",
+                count);
+            return;
+        }
+
         // Shutdown also resets volume tuning and FileByteCache (restart semantics).
-        Shutdown();
+        (void)StopAndJoin(std::nullopt);
 
         m_threadCount = std::clamp<size_t>(count, 1, kMaxDecodeWorkers);
         {
@@ -284,12 +471,18 @@ namespace ImageCore
             m_shutdown = false;
         }
 
+        const auto startWorker = [this](WorkerKind kind)
+        {
+            auto slot = std::make_unique<ThreadSlot>();
+            slot->thread = std::thread(&DecodeScheduler::WorkerThread, this, kind, slot.get());
+            m_threads.push_back(std::move(slot));
+        };
         if (m_threadCount == 1)
         {
             // A single worker must serve both queues: full-res first, background work only
             // when the high queue is empty. Worst-case main-image latency is therefore one
             // in-flight thumbnail decode, never the queued backlog.
-            m_highWorkers.emplace_back(&DecodeScheduler::WorkerThread, this, WorkerKind::Shared);
+            startWorker(WorkerKind::Shared);
         }
         else
         {
@@ -301,17 +494,34 @@ namespace ImageCore
 
             for (size_t i = 0; i < highCount; ++i)
             {
-                m_highWorkers.emplace_back(&DecodeScheduler::WorkerThread, this, WorkerKind::HighPriority);
+                startWorker(WorkerKind::HighPriority);
             }
             for (size_t i = 0; i < bgCount; ++i)
             {
-                m_backgroundWorkers.emplace_back(&DecodeScheduler::WorkerThread, this, WorkerKind::Background);
+                startWorker(WorkerKind::Background);
             }
         }
+        m_workerCount = m_threads.size();
 
         // One serialized thumbnail I/O thread: reads files sequentially into memory, then schedules CPU work.
         // This avoids HDD seek thrashing while still allowing CPU decode/resize to run in parallel.
-        m_thumbPrefetchWorker = std::thread(&DecodeScheduler::ThumbPrefetchThread, this);
+        {
+            auto slot = std::make_unique<ThreadSlot>();
+            slot->thread = std::thread(&DecodeScheduler::ThumbPrefetchThread, this, slot.get());
+            m_threads.push_back(std::move(slot));
+        }
+
+        // Stop dispatch (host stop callbacks, OS cancellation) off the callers' threads.
+        {
+            std::lock_guard<std::mutex> lock(m_stopMutex);
+            m_stopQueue.clear();
+            m_stopExit = false;
+        }
+        {
+            auto slot = std::make_unique<ThreadSlot>();
+            slot->thread = std::thread(&DecodeScheduler::StopDispatchThread, this, slot.get());
+            m_threads.push_back(std::move(slot));
+        }
 
         // Start with a conservative global cap; it will be auto-tuned as volumes are observed.
         m_globalPrefetchCap = 4;
@@ -335,6 +545,7 @@ namespace ImageCore
 
         task.state = std::make_shared<DecodeRequestState>();
         task.state->priority = task.priority;
+        task.state->handle = task.handle;
 
         {
             std::lock_guard<std::mutex> lock(m_queueMutex);
@@ -435,6 +646,7 @@ namespace ImageCore
         // bytes until the decode finishes.
         std::wstring releasedPath;
         bool releasedSlot = false;
+        std::shared_ptr<DecodeRequestState> canceledState;
         {
             std::lock_guard<std::mutex> lock(m_queueMutex);
             auto it = m_liveRequests.find(handle);
@@ -442,6 +654,7 @@ namespace ImageCore
             {
                 return;
             }
+            canceledState = it->second;
             DecodeRequestState& state = *it->second;
             state.canceled.store(true);
             if (!state.decoding && state.holdsPrefetchSlot)
@@ -450,7 +663,18 @@ namespace ImageCore
                 releasedSlot = ReleasePrefetch_NoLock(state);
             }
             m_liveRequests.erase(it);
+
+            // A read in progress is released through the request's token (and
+            // OS cancellation), both dispatched on the stop-dispatch thread, so
+            // no host stop callback runs on (or can block) the caller. The stop
+            // is published in the same critical section that removes the
+            // request: a Shutdown either finds it in the live table or runs
+            // after it is queued, so the dispatch thread cannot retire first.
+            std::lock_guard<std::mutex> stopLock(m_stopMutex);
+            m_stopQueue.push_back(std::move(canceledState));
         }
+        m_stopCondition.notify_all();
+        RunTestHook(TestPoint::CancelPublished, handle);
 
         // The request no longer holds its bytes; drop the shared cache entry if
         // nothing else uses it, then wake the prefetch stage for the free slot.
@@ -463,43 +687,178 @@ namespace ImageCore
 
     void DecodeScheduler::Shutdown()
     {
+        std::lock_guard<std::mutex> lifecycle(m_lifecycleMutex);
+        (void)StopAndJoin(std::nullopt);
+    }
+
+    bool DecodeScheduler::Shutdown(std::chrono::milliseconds bound)
+    {
+        std::lock_guard<std::mutex> lifecycle(m_lifecycleMutex);
+        return StopAndJoin(std::chrono::steady_clock::now() + bound);
+    }
+
+    void DecodeScheduler::SignalExit(ThreadSlot& slot)
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_exitMutex);
+            slot.exited = true;
+        }
+        m_exitCondition.notify_all();
+    }
+
+    bool DecodeScheduler::StopAndJoin(std::optional<std::chrono::steady_clock::time_point> deadline)
+    {
         // The shutdown flag is part of every wait predicate, so it must change
         // under m_queueMutex: a waiter that has just evaluated its predicate still
         // holds the mutex until it blocks, and a notification sent before that
         // point is lost. Setting the flag outside the lock let notify_all() race
         // that window, leaving a worker asleep forever and the join below hanging.
+        std::vector<std::shared_ptr<DecodeRequestState>> live;
         {
             std::lock_guard<std::mutex> lock(m_queueMutex);
-            if (m_shutdown)
+            if (m_shutdown && !m_joinPending)
             {
-                return;
+                return true;
             }
             m_shutdown = true;
+            // Every live request is dropped: none is delivered from here on.
+            live.reserve(m_liveRequests.size());
+            for (const auto& [handle, state] : m_liveRequests)
+            {
+                state->canceled.store(true);
+                live.push_back(state);
+            }
         }
         m_queueCondition.notify_all();
 
-        for (auto& worker : m_highWorkers)
+        // Every read registered now is stopped too: one for a request outside
+        // the live table (handle 0), and one whose Cancel already removed it
+        // from the table (stopping twice is harmless). A read that registers
+        // after this scan sees m_shutdown and does not start (see LeasedRead),
+        // so the dispatch thread may retire once this queue is drained.
+        for (const auto& slot : m_threads)
         {
-            if (worker.joinable())
+            std::lock_guard<std::mutex> lock(slot->lease->mutex);
+            if (slot->lease->active)
             {
-                worker.join();
-            }
-        }
-        for (auto& worker : m_backgroundWorkers)
-        {
-            if (worker.joinable())
-            {
-                worker.join();
+                slot->lease->active->canceled.store(true);
+                live.push_back(slot->lease->active);
             }
         }
 
-        if (m_thumbPrefetchWorker.joinable())
+        // Stop tokens are signaled on the stop-dispatch thread (host stop
+        // callbacks never run here), which then exits; it is joined with the
+        // other threads, within the deadline. The OS cancel attempt is made here
+        // directly as well, since it runs no host code.
         {
-            m_thumbPrefetchWorker.join();
+            std::lock_guard<std::mutex> lock(m_stopMutex);
+            for (auto& state : live)
+            {
+                m_stopQueue.push_back(std::move(state));
+            }
+            m_stopExit = true;
+        }
+        m_stopCondition.notify_all();
+        CancelActiveReadsIo();
+
+        // Wait for the threads to exit, re-trying the OS cancel meanwhile: it only
+        // reaches a call already blocked, and a read may block after an attempt.
+        std::vector<ThreadSlot*> exited;
+        {
+            const auto allExited = [this]
+            {
+                return std::all_of(m_threads.begin(), m_threads.end(),
+                    [](const std::unique_ptr<ThreadSlot>& slot) { return slot->exited; });
+            };
+            constexpr auto kRetryInterval = std::chrono::milliseconds(50);
+            std::unique_lock<std::mutex> lock(m_exitMutex);
+            while (!allExited())
+            {
+                auto wait = std::chrono::steady_clock::duration(kRetryInterval);
+                if (deadline)
+                {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now >= *deadline)
+                    {
+                        break;
+                    }
+                    wait = (std::min)(wait, *deadline - now);
+                }
+                if (m_exitCondition.wait_for(lock, wait, allExited))
+                {
+                    break;
+                }
+                lock.unlock();
+                CancelActiveReadsIo();
+                lock.lock();
+            }
+            for (const auto& slot : m_threads)
+            {
+                if (slot->exited)
+                {
+                    exited.push_back(slot.get());
+                }
+            }
         }
 
-        m_highWorkers.clear();
-        m_backgroundWorkers.clear();
+        // Join only threads that have terminated; a stuck one is left running and
+        // owned (never detached) for a later call. Signaling exit is the last
+        // step of the thread function, but TLS destructors and thread-detach
+        // processing still run after it, and they can block (a thread_local
+        // created by a byte source or decoder), so wait for the native handle,
+        // within the remaining budget, before join().
+        size_t joined = 0;
+        for (const auto& slot : m_threads)
+        {
+            if (!slot->thread.joinable())
+            {
+                ++joined;  // joined by an earlier call
+            }
+        }
+        for (ThreadSlot* slot : exited)
+        {
+            if (!slot->thread.joinable())
+            {
+                continue;
+            }
+            DWORD waitMs = INFINITE;
+            if (deadline)
+            {
+                const auto remaining = *deadline - std::chrono::steady_clock::now();
+                waitMs = remaining > std::chrono::steady_clock::duration::zero()
+                    ? static_cast<DWORD>(std::chrono::ceil<std::chrono::milliseconds>(remaining).count())
+                    : 0;
+            }
+            if (WaitForSingleObject(static_cast<HANDLE>(slot->thread.native_handle()), waitMs) == WAIT_OBJECT_0)
+            {
+                slot->thread.join();
+                ++joined;
+            }
+        }
+        if (joined != m_threads.size())
+        {
+            m_joinPending = true;
+            IC_LOG_WARN("[DecodeScheduler] Shutdown: {} of {} threads still running after the bound; not joined.",
+                m_threads.size() - joined, m_threads.size());
+            return false;
+        }
+        m_joinPending = false;
+
+        // Every read retired before its thread exited; close the lease handles
+        // under the lease mutex, so a concurrent Cancel (which only dispatches to
+        // a registered read) never uses a closed handle.
+        for (auto& slot : m_threads)
+        {
+            std::lock_guard<std::mutex> lock(slot->lease->mutex);
+            slot->lease->active.reset();
+            if (slot->lease->thread)
+            {
+                CloseHandle(slot->lease->thread);
+                slot->lease->thread = nullptr;
+            }
+        }
+        m_threads.clear();
+        m_workerCount = 0;
 
         // Drop queued work (no callbacks) and reset per-run state, so a restart
         // cannot inherit stale volume tuning or orphaned prefetched bytes.
@@ -518,12 +877,19 @@ namespace ImageCore
             std::lock_guard<std::mutex> lock(m_seekPenaltyMutex);
             m_seekPenaltyByVolume.clear();
         }
+        {
+            std::lock_guard<std::mutex> lock(m_stopMutex);
+            m_stopQueue.clear();
+        }
         FileByteCache::Instance().Clear();
         FileByteCache::Instance().SetMaxEntries(m_globalPrefetchCap);
+        return true;
     }
 
-    void DecodeScheduler::WorkerThread(WorkerKind kind)
+    void DecodeScheduler::WorkerThread(WorkerKind kind, ThreadSlot* slot)
     {
+        BindLeaseToCurrentThread(*slot->lease);
+
         // Thread scheduling priority follows the task, not the worker:
         // - full-resolution (high queue) work runs above normal for main-image response;
         // - background (thumbnail) work runs in background mode, which lowers CPU and
@@ -596,7 +962,8 @@ namespace ImageCore
                     });
                 }
 
-                if (m_shutdown && m_highQueue.empty() && m_backgroundQueue.Empty())
+                // Queued work is dropped at shutdown (Shutdown canceled it).
+                if (m_shutdown)
                 {
                     break;
                 }
@@ -649,22 +1016,30 @@ namespace ImageCore
                     continue;
                 }
 
-                // From here on Cancel leaves the bytes to this worker.
+                // From here on Cancel leaves the bytes to this worker, and finds a
+                // read this worker runs for the task through its lease.
                 if (task.state)
                 {
                     task.state->decoding = true;
+                    task.state->readLease = slot->lease;
                     bytesHold = task.state->prefetched;
                 }
             }
 
+            RunTestHook(TestPoint::TaskTaken, task.handle);
+
             // Run this task at its own priority (see above).
             setBackgroundMode(tookBackgroundTask);
 
-            // Run decode through the dispatcher (includes format routing + decoder selection)
+            // Run decode through the dispatcher (includes format routing + decoder selection).
+            // A request canceled before its decode starts is neither decoded nor
+            // delivered: without bytes the decoders would open the path themselves,
+            // re-reading the file with no way to cancel it.
             PipelineResult result;
+            bool skipped = false;
             {
                 DecodeInput input {};
-                
+
                 const std::wstring& src = task.request.source;
                 const bool isArchivePath = IsArchiveBackedPath(src);
 
@@ -680,11 +1055,16 @@ namespace ImageCore
                         input.header = std::span<const uint8_t>(bytesHold->data(), headerSize);
                     }
                 }
-                else if (isArchivePath)
+                else if (isArchivePath && task.state)
                 {
                     // FullResolution from archive: must read via the host byte source
-                    auto bytes = ReadWholeFileBytes(task.request.source);
-                    if (bytes && !bytes->empty())
+                    bool stopped = false;
+                    auto bytes = LeasedRead(*slot->lease, task.state, task.handle, task.request.source, stopped);
+                    if (stopped)
+                    {
+                        skipped = true;
+                    }
+                    else if (bytes && !bytes->empty())
                     {
                         bytesHold = bytes;
                         input.bytes = std::span<const uint8_t>(bytesHold->data(), bytesHold->size());
@@ -697,21 +1077,32 @@ namespace ImageCore
                     }
                 }
 
-                try
+                // Work taken just before shutdown began is dropped as well (a
+                // handle-0 task is in no live table, so Shutdown cannot mark it).
+                if ((task.state && task.state->canceled.load()) || m_shutdown.load())
                 {
-                    result = dispatcher.Decode(task.request, nullptr, input);
-                }
-                catch (...)
-                {
-                    // Never let an exception kill the worker thread.
-                    result = PipelineResult(E_FAIL);
+                    skipped = true;
                 }
 
-                if (FAILED(result.hr))
+                if (!skipped)
                 {
-                    IC_LOG_ERROR("[DecodeScheduler] Decode failed ({}): 0x{:08X}",
-                        Log::ToUtf8(src),
-                        static_cast<unsigned>(result.hr));
+                    RunTestHook(TestPoint::DecodeStart, task.handle);
+                    try
+                    {
+                        result = dispatcher.Decode(task.request, nullptr, input);
+                    }
+                    catch (...)
+                    {
+                        // Never let an exception kill the worker thread.
+                        result = PipelineResult(E_FAIL);
+                    }
+
+                    if (FAILED(result.hr))
+                    {
+                        IC_LOG_ERROR("[DecodeScheduler] Decode failed ({}): 0x{:08X}",
+                            Log::ToUtf8(src),
+                            static_cast<unsigned>(result.hr));
+                    }
                 }
             }
 
@@ -721,7 +1112,7 @@ namespace ImageCore
             bool deliver = false;
             {
                 std::lock_guard<std::mutex> lock(m_queueMutex);
-                deliver = !(task.state && task.state->canceled.load());
+                deliver = !skipped && !(task.state && task.state->canceled.load());
                 Finish_NoLock(task);
             }
             if (deliver && task.callback)
@@ -766,10 +1157,14 @@ namespace ImageCore
         {
             (void)SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
         }
+
+        SignalExit(*slot);
     }
 
-    void DecodeScheduler::ThumbPrefetchThread()
+    void DecodeScheduler::ThumbPrefetchThread(ThreadSlot* slot)
     {
+        BindLeaseToCurrentThread(*slot->lease);
+
         // Make thumbnail prefetch low priority (CPU + I/O).
         (void)SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
 
@@ -784,7 +1179,8 @@ namespace ImageCore
                     return !m_thumbIoQueue.Empty() || m_shutdown;
                 });
 
-                if (m_shutdown && m_thumbIoQueue.Empty())
+                // Queued work is dropped at shutdown (Shutdown canceled it).
+                if (m_shutdown)
                 {
                     break;
                 }
@@ -800,6 +1196,10 @@ namespace ImageCore
                 {
                     Finish_NoLock(task);
                     continue;
+                }
+                if (task.state)
+                {
+                    task.state->readLease = slot->lease;
                 }
             }
 
@@ -866,24 +1266,26 @@ namespace ImageCore
 
             // Read file bytes sequentially on this single thread. The shared cache
             // only de-duplicates reads for same-path tasks; the bytes are attached
-            // to this task, which owns them from here on.
+            // to this task, which owns them from here on. A canceled read is never
+            // cached, so a same-path request behind it reads its own bytes.
             std::shared_ptr<const std::vector<uint8_t>> bytes = FileByteCache::Instance().Get(task.request.source);
+            bool stopped = false;
             if (!bytes)
             {
-                auto read = ReadWholeFileBytes(task.request.source);
-                if (read)
+                auto read = LeasedRead(*slot->lease, task.state, task.handle, task.request.source, stopped);
+                if (read && !task.state->canceled.load())
                 {
                     FileByteCache::Instance().Put(task.request.source, read);
                     bytes = std::move(read);
                 }
             }
 
-            // Schedule CPU decode work regardless; the decoder falls back to the file
-            // path if the prefetch failed.
+            // Schedule CPU decode work unless canceled; the decoder falls back to the
+            // file path if an uncanceled prefetch failed.
             bool canceled = false;
             {
                 std::lock_guard<std::mutex> lock(m_queueMutex);
-                canceled = task.state && task.state->canceled.load();
+                canceled = stopped || task.state->canceled.load();
                 if (canceled)
                 {
                     // Canceled while its bytes were being read (it was in no queue).
@@ -913,6 +1315,8 @@ namespace ImageCore
         }
 
         (void)SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
+
+        SignalExit(*slot);
     }
 }
 
