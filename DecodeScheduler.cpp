@@ -294,6 +294,11 @@ namespace ImageCore
         m_testHook = std::move(hook);
     }
 
+    void DecodeScheduler::SetBackgroundWorkPriority(BackgroundWorkPriority priority)
+    {
+        m_backgroundWorkPriority.store(priority, std::memory_order_relaxed);
+    }
+
     void DecodeScheduler::RunTestHook(TestPoint point, uint64_t handle) const
     {
         if (m_testHook)
@@ -999,25 +1004,40 @@ namespace ImageCore
         // a background task. A thread waiting in background mode would wake (for a
         // stolen full-resolution task, or for shutdown) at background priority, which
         // normal-priority load starves for seconds before it can even leave the mode.
+        // With BackgroundWorkPriority::Normal (a test seam) background tasks run at
+        // normal priority instead, still below full-resolution work.
         bool inBackgroundMode = false;
-        auto setBackgroundMode = [&inBackgroundMode, slot](bool background)
+        bool inBackgroundTask = false;
+        auto setBackgroundTask = [this, &inBackgroundMode, &inBackgroundTask, slot](bool background)
         {
-            if (background == inBackgroundMode)
+            if (background == inBackgroundTask)
             {
                 return;
             }
             if (background)
             {
-                slot->backgroundMode.store(true, std::memory_order_relaxed);
-                (void)SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+                if (m_backgroundWorkPriority.load(std::memory_order_relaxed) == BackgroundWorkPriority::BackgroundMode)
+                {
+                    slot->backgroundMode.store(true, std::memory_order_relaxed);
+                    (void)SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+                    inBackgroundMode = true;
+                }
+                else
+                {
+                    (void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+                }
             }
             else
             {
-                (void)SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
-                slot->backgroundMode.store(false, std::memory_order_relaxed);
+                if (inBackgroundMode)
+                {
+                    (void)SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
+                    slot->backgroundMode.store(false, std::memory_order_relaxed);
+                    inBackgroundMode = false;
+                }
                 (void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
             }
-            inBackgroundMode = background;
+            inBackgroundTask = background;
         };
         (void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
 
@@ -1127,7 +1147,7 @@ namespace ImageCore
             RunTestHook(TestPoint::TaskTaken, task.handle);
 
             // Run this task at its own priority (see above).
-            setBackgroundMode(tookBackgroundTask);
+            setBackgroundTask(tookBackgroundTask);
 
             // Run decode through the dispatcher (includes format routing + decoder selection).
             // A request canceled before its decode starts is neither decoded nor
@@ -1240,7 +1260,7 @@ namespace ImageCore
                 }
             }
 
-            setBackgroundMode(false);
+            setBackgroundTask(false);
         }
 
         slot->Publish(Diagnostics::Phase::Exited, 0);
@@ -1379,11 +1399,19 @@ namespace ImageCore
             if (!bytes)
             {
                 slot->Publish(Diagnostics::Phase::Reading, task.handle);
-                slot->backgroundMode.store(true, std::memory_order_relaxed);
-                (void)SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+                const bool backgroundMode = m_backgroundWorkPriority.load(std::memory_order_relaxed) ==
+                    BackgroundWorkPriority::BackgroundMode;
+                if (backgroundMode)
+                {
+                    slot->backgroundMode.store(true, std::memory_order_relaxed);
+                    (void)SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+                }
                 auto read = LeasedRead(*slot->lease, task.state, task.handle, task.request.source, stopped);
-                (void)SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
-                slot->backgroundMode.store(false, std::memory_order_relaxed);
+                if (backgroundMode)
+                {
+                    (void)SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
+                    slot->backgroundMode.store(false, std::memory_order_relaxed);
+                }
                 if (read && !task.state->canceled.load())
                 {
                     FileByteCache::Instance().Put(task.request.source, read);

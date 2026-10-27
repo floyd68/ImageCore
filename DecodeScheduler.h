@@ -294,6 +294,26 @@ namespace ImageCore
         // synchronization by the scheduler threads).
         void SetTestHook(TestHook hook);
 
+        // How thumbnail/preview work (the prefetch read and the background
+        // decode) runs. BackgroundMode, the default and the only mode used in
+        // production, enters THREAD_MODE_BACKGROUND_BEGIN (low CPU and I/O
+        // priority). Under normal-priority load on every CPU such a thread runs
+        // only when the OS starvation boost picks it, every few seconds, so its
+        // progress has no useful bound (see floyd68/ImageCore#15). Normal runs
+        // that work at THREAD_PRIORITY_NORMAL with normal I/O priority.
+        enum class BackgroundWorkPriority
+        {
+            BackgroundMode,
+            Normal,
+        };
+
+        // Test seam: tests of scheduling logic (ordering, backpressure,
+        // cancellation) select Normal so that their progress deadlines do not
+        // depend on the absence of other load on the machine; tests of the
+        // priority policy keep BackgroundMode. Each thread reads it when it
+        // starts a task, so it may be called at any time.
+        void SetBackgroundWorkPriority(BackgroundWorkPriority priority);
+
     private:
         enum class WorkerKind
         {
@@ -380,6 +400,7 @@ namespace ImageCore
         bool m_stopExit { false };
         std::atomic<size_t> m_workerCount { 0 };  // decode workers in m_threads
         TestHook m_testHook;
+        std::atomic<BackgroundWorkPriority> m_backgroundWorkPriority { BackgroundWorkPriority::BackgroundMode };
 
         std::queue<DecodeTask> m_highQueue;
         PriorityTaskQueue m_thumbIoQueue;     // serialized disk reads (thumbnail/preview)
