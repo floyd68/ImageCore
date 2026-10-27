@@ -1352,6 +1352,119 @@ IC_TEST(DecodeScheduler_BulkCancelOfLargeBacklogIsLinear)
     IC_CHECK(done.entries.size() == 1);
 }
 
+namespace
+{
+    std::unordered_set<DWORD> ProcessThreadIds();  // defined with the read-cancel tests
+
+    // Lowest priority among the process threads not in `excluded`.
+    int LowestThreadPriority(const std::unordered_set<DWORD>& excluded)
+    {
+        int lowest = THREAD_PRIORITY_TIME_CRITICAL;
+        for (DWORD id : ProcessThreadIds())
+        {
+            if (excluded.count(id) != 0)
+            {
+                continue;
+            }
+            HANDLE thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, id);
+            if (!thread)
+            {
+                continue;  // already gone
+            }
+            const int priority = GetThreadPriority(thread);
+            CloseHandle(thread);
+            if (priority != THREAD_PRIORITY_ERROR_RETURN)
+            {
+                lowest = (std::min)(lowest, priority);
+            }
+        }
+        return lowest;
+    }
+}
+
+IC_TEST(DecodeScheduler_IdleThreadsWaitOutsideBackgroundMode)
+{
+    // A thread waiting in background mode would wake (for a stolen full-
+    // resolution task, or for shutdown) at background priority, which normal-
+    // priority load starves for seconds (floyd68/ImageCore#21). Background work
+    // still runs in background mode; the idle workers and the idle prefetch
+    // thread wait at normal priority or above.
+    const auto& files = Files();
+    Completions done;
+    DecodeScheduler scheduler;
+    const auto before = ProcessThreadIds();
+    scheduler.SetThreadCount(3);  // high-priority worker, two background workers
+
+    // Through the prefetch read and a background decode, then idle again.
+    IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[2], ImagePurpose::Thumbnail, 1, done.Callback(1))));
+    IC_REQUIRE(done.WaitFor(1));
+    IC_CHECK(done.entries[0].threadPriority < THREAD_PRIORITY_NORMAL);
+
+    // The decoding worker leaves background mode just after its callback.
+    const auto deadline = std::chrono::steady_clock::now() + kWaitTimeout;
+    int lowest = LowestThreadPriority(before);
+    while (lowest < THREAD_PRIORITY_NORMAL && std::chrono::steady_clock::now() < deadline)
+    {
+        Sleep(1);
+        lowest = LowestThreadPriority(before);
+    }
+    IC_CHECK(lowest >= THREAD_PRIORITY_NORMAL);
+}
+
+namespace
+{
+    // Fails the process with a message if Advance() is not called for `limit`.
+    // It catches one stuck step of a long loop without bounding the sum of
+    // many short steps, which a loaded machine stretches.
+    class StallWatchdog
+    {
+    public:
+        StallWatchdog(const char* what, std::chrono::seconds limit)
+            : m_done(CreateEventW(nullptr, TRUE, FALSE, nullptr))
+            , m_thread([this, what, limit]()
+            {
+                int seen = m_progress.load();
+                auto lastChange = std::chrono::steady_clock::now();
+                while (WaitForSingleObject(m_done, 250) != WAIT_OBJECT_0)
+                {
+                    const int progress = m_progress.load();
+                    const auto now = std::chrono::steady_clock::now();
+                    if (progress != seen)
+                    {
+                        seen = progress;
+                        lastChange = now;
+                    }
+                    else if (now - lastChange > limit)
+                    {
+                        std::fprintf(stderr, "  watchdog: %s: step %d did not finish within %lld s; terminating\n",
+                            what, progress, static_cast<long long>(limit.count()));
+                        std::fflush(stderr);
+                        TerminateProcess(GetCurrentProcess(), 3);
+                    }
+                }
+            })
+        {
+        }
+
+        ~StallWatchdog()
+        {
+            SetEvent(m_done);
+            m_thread.join();
+            CloseHandle(m_done);
+        }
+
+        void Advance()
+        {
+            ++m_progress;
+        }
+
+    private:
+        HANDLE m_done;
+        std::atomic<int> m_progress { 0 };
+        std::thread m_thread;
+    };
+}
+
 // Kept last: it creates and destroys many schedulers.
 IC_TEST(DecodeScheduler_ShutdownCyclesNeverHang)
 {
@@ -1359,12 +1472,19 @@ IC_TEST(DecodeScheduler_ShutdownCyclesNeverHang)
     // its predicate just before the flag flipped) and with queued and in-flight
     // full-resolution work. Full-resolution tasks bypass the FileByteCache, so
     // dropped tasks leave no stale cache entries behind for later cycles.
+    //
+    // A hang is one cycle that never ends, so the watchdog bounds each cycle,
+    // not the run: under CPU saturation every cycle waits for its share of the
+    // processors (more busy threads than CPUs: 50-190 ms per cycle on average,
+    // the longest measured cycle 150 ms in an instrumented Debug run), and
+    // 1,000 such cycles took 51-190 s, past a 90 s budget for the whole run
+    // (floyd68/ImageCore#21).
     const auto& files = Files();
     constexpr int kCycles = 1000;
-    Watchdog watchdog("shutdown cycles", std::chrono::seconds(90));
+    StallWatchdog watchdog("shutdown cycles", std::chrono::seconds(30));
 
     int completed = 0;
-    for (int cycle = 0; cycle < kCycles; ++cycle)
+    for (int cycle = 0; cycle < kCycles; ++cycle, watchdog.Advance())
     {
         Completions done;
         DecodeScheduler scheduler;
@@ -3144,6 +3264,251 @@ IC_TEST(ReadCancel_BoundedShutdownBeforeRequestsAndRepeated)
     IC_REQUIRE(done.WaitFor(1));
     IC_CHECK(scheduler.Shutdown(std::chrono::milliseconds(2000)));
     IC_CHECK(DeliveryCount(done) == 1);
+}
+
+// Background mode (thumbnail decodes, the prefetch read) runs a thread at base
+// priority 4, which normal-priority load starves for seconds at a time, so a
+// thread in it could not reach its exit within a shutdown bound. Shutdown
+// raises every scheduler thread through its handle; these observe the raise
+// from inside the in-flight work, so they need no CPU load.
+
+namespace
+{
+    // Polls the calling thread's priority until it is at least `atLeast` or
+    // the wait times out; returns the last value read.
+    int WaitForOwnPriority(int atLeast)
+    {
+        const auto deadline = std::chrono::steady_clock::now() + kWaitTimeout;
+        int priority = GetThreadPriority(GetCurrentThread());
+        while (priority < atLeast && std::chrono::steady_clock::now() < deadline)
+        {
+            Sleep(1);
+            priority = GetThreadPriority(GetCurrentThread());
+        }
+        return priority;
+    }
+
+    // Filesystem byte source whose read of one path records the reading
+    // thread's priority, waits for the stop token, then waits for the thread's
+    // priority to be raised (see WaitForOwnPriority) and returns nothing.
+    class PriorityProbeSource final : public ScopedFileByteSource
+    {
+    public:
+        using ScopedFileByteSource::ReadAll;
+
+        explicit PriorityProbeSource(std::wstring probedPath)
+            : m_probedPath(std::move(probedPath))
+        {
+        }
+
+        std::vector<uint8_t> ReadAll(const std::wstring& path, std::stop_token stop) const override
+        {
+            if (path != m_probedPath)
+            {
+                return ScopedFileByteSource::ReadAll(path);
+            }
+            const int before = GetThreadPriority(GetCurrentThread());
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_before = before;
+                m_entered = true;
+            }
+            m_cv.notify_all();
+
+            // Registered without m_mutex held: it runs inline if stop is
+            // already requested.
+            std::stop_callback onStop(stop, [this]()
+            {
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    m_stopped = true;
+                }
+                m_cv.notify_all();
+            });
+            {
+                std::unique_lock<std::mutex> lock(m_mutex);
+                (void)m_cv.wait_for(lock, kWaitTimeout, [&] { return m_stopped; });
+            }
+            const int after = WaitForOwnPriority(THREAD_PRIORITY_NORMAL);
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_after = after;
+            return {};
+        }
+
+        bool WaitEntered()
+        {
+            std::unique_lock<std::mutex> lock(m_mutex);
+            return m_cv.wait_for(lock, kWaitTimeout, [&] { return m_entered; });
+        }
+
+        int Before() const { std::lock_guard<std::mutex> lock(m_mutex); return m_before; }
+        int After() const { std::lock_guard<std::mutex> lock(m_mutex); return m_after; }
+        bool Stopped() const { std::lock_guard<std::mutex> lock(m_mutex); return m_stopped; }
+
+    private:
+        std::wstring m_probedPath;
+        mutable std::mutex m_mutex;
+        mutable std::condition_variable m_cv;
+        mutable bool m_entered { false };
+        mutable bool m_stopped { false };
+        mutable int m_before { THREAD_PRIORITY_ERROR_RETURN };
+        mutable int m_after { THREAD_PRIORITY_ERROR_RETURN };
+    };
+}
+
+IC_TEST(ReadCancel_ShutdownRaisesInFlightBackgroundDecode)
+{
+    // The callback of a thumbnail decode runs on the worker in background mode;
+    // its delivery started before Shutdown, so it runs to completion while
+    // Shutdown waits for the worker.
+    const auto& files = Files();
+    Watchdog watchdog("shutdown raises an in-flight decode", std::chrono::seconds(60));
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool entered = false;
+    std::atomic<int> before { THREAD_PRIORITY_ERROR_RETURN };
+    std::atomic<int> after { THREAD_PRIORITY_ERROR_RETURN };
+
+    DecodeScheduler scheduler;
+    scheduler.SetThreadCount(1);
+    IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[0], ImagePurpose::Thumbnail, 1,
+        [&](PipelineResult&&)
+        {
+            before = GetThreadPriority(GetCurrentThread());
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                entered = true;
+            }
+            cv.notify_all();
+            after = WaitForOwnPriority(THREAD_PRIORITY_NORMAL);
+        })));
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        IC_REQUIRE(cv.wait_for(lock, kWaitTimeout, [&] { return entered; }));
+    }
+
+    IC_CHECK(scheduler.Shutdown(std::chrono::seconds(30)));
+    IC_CHECK(before.load() < THREAD_PRIORITY_NORMAL);
+    IC_CHECK(after.load() == THREAD_PRIORITY_ABOVE_NORMAL);
+}
+
+IC_TEST(ReadCancel_ShutdownRaisesInFlightPrefetchRead)
+{
+    // The prefetch thread reads thumbnail bytes in background mode; the read
+    // honours its stop token, but must still be scheduled to return.
+    const auto& files = Files();
+    Watchdog watchdog("shutdown raises an in-flight prefetch read", std::chrono::seconds(60));
+    PriorityProbeSource source(files.thumbs[1]);
+    Completions done;
+
+    DecodeScheduler scheduler;
+    scheduler.SetThreadCount(1);
+    IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[1], ImagePurpose::Thumbnail, 1, done.Callback(1))));
+    IC_REQUIRE(source.WaitEntered());
+
+    IC_CHECK(scheduler.Shutdown(std::chrono::seconds(30)));
+    IC_CHECK(source.Stopped());
+    IC_CHECK(source.Before() < THREAD_PRIORITY_NORMAL);
+    IC_CHECK(source.After() == THREAD_PRIORITY_ABOVE_NORMAL);
+    IC_CHECK(DeliveryCount(done) == 0);
+}
+
+// ---------------------------------------------------------------------------
+// Shutdown under CPU saturation (floyd68/ImageCore#21). Opt-in: it loads every
+// logical CPU for several seconds, so it is in no CTest group and does nothing
+// unless IMAGECORE_LOAD_TESTS=1. Run it with
+//   set IMAGECORE_LOAD_TESTS=1 && ImageCoreTests LoadShutdown_
+
+namespace
+{
+    // Normal-priority busy threads, more than there are logical CPUs, until
+    // destroyed.
+    class CpuSaturation
+    {
+    public:
+        CpuSaturation()
+        {
+            const unsigned count = (std::max)(std::thread::hardware_concurrency(), 1u) + 4;
+            for (unsigned i = 0; i < count; ++i)
+            {
+                m_threads.emplace_back([this]()
+                {
+                    while (!m_stop.load(std::memory_order_relaxed))
+                    {
+                    }
+                });
+            }
+        }
+
+        ~CpuSaturation()
+        {
+            m_stop = true;
+            for (auto& thread : m_threads)
+            {
+                thread.join();
+            }
+        }
+
+    private:
+        std::atomic<bool> m_stop { false };
+        std::vector<std::thread> m_threads;
+    };
+
+    bool LoadTestsEnabled()
+    {
+        char value[8] {};
+        return GetEnvironmentVariableA("IMAGECORE_LOAD_TESTS", value, sizeof(value)) > 0 && value[0] == '1';
+    }
+}
+
+IC_TEST(LoadShutdown_BoundedUnderCpuSaturation)
+{
+    if (!LoadTestsEnabled())
+    {
+        std::printf("  skipped: set IMAGECORE_LOAD_TESTS=1 to run\n");
+        return;
+    }
+    const auto& files = Files();
+    Completions done;
+    Watchdog watchdog("shutdown under CPU saturation", std::chrono::seconds(120));
+    CpuSaturation load;
+
+    // The idle case of ReadCancel_BoundedShutdownBeforeRequestsAndRepeated:
+    // threads that have just started (and, before the fix, entered background
+    // mode) must still exit within the bound.
+    constexpr int kRounds = 10;
+    for (int round = 0; round < kRounds; ++round)
+    {
+        DecodeScheduler scheduler;
+        IC_CHECK(scheduler.Shutdown(std::chrono::milliseconds(2000)));
+        scheduler.SetThreadCount(1 + (round % 2));
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution,
+            static_cast<uint64_t>(round) + 1, done.Callback(static_cast<uint64_t>(round) + 1))));
+        IC_REQUIRE(done.WaitFor(static_cast<size_t>(round) + 1));
+        IC_CHECK(scheduler.Shutdown(std::chrono::milliseconds(2000)));
+    }
+
+    // Construct/shutdown cycles as in DecodeScheduler_ShutdownCyclesNeverHang.
+    // A starved cycle takes seconds (11-40 s measured without the priority
+    // raise); with it, a cycle only waits for its share of the loaded CPUs.
+    constexpr int kCycles = 50;
+    std::vector<double> cycleMs;
+    const auto start = std::chrono::steady_clock::now();
+    for (int cycle = 0; cycle < kCycles; ++cycle)
+    {
+        const auto cycleStart = std::chrono::steady_clock::now();
+        {
+            DecodeScheduler scheduler;
+            scheduler.SetThreadCount(1 + (cycle % 2));
+        }
+        cycleMs.push_back(std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - cycleStart).count());
+    }
+    const double totalMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    std::sort(cycleMs.begin(), cycleMs.end());
+    std::printf("  %d cycles under load: total %.0f ms, median %.1f ms, max %.1f ms\n",
+        kCycles, totalMs, cycleMs[cycleMs.size() / 2], cycleMs.back());
+    IC_CHECK(cycleMs.back() < 2000.0);
 }
 
 IC_TEST(ReadCancel_StopCallbackDuringShutdownMayReenterScheduler)
