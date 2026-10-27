@@ -1352,6 +1352,65 @@ IC_TEST(DecodeScheduler_BulkCancelOfLargeBacklogIsLinear)
     IC_CHECK(done.entries.size() == 1);
 }
 
+namespace
+{
+    std::unordered_set<DWORD> ProcessThreadIds();  // defined with the read-cancel tests
+
+    // Lowest priority among the process threads not in `excluded`.
+    int LowestThreadPriority(const std::unordered_set<DWORD>& excluded)
+    {
+        int lowest = THREAD_PRIORITY_TIME_CRITICAL;
+        for (DWORD id : ProcessThreadIds())
+        {
+            if (excluded.count(id) != 0)
+            {
+                continue;
+            }
+            HANDLE thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, id);
+            if (!thread)
+            {
+                continue;  // already gone
+            }
+            const int priority = GetThreadPriority(thread);
+            CloseHandle(thread);
+            if (priority != THREAD_PRIORITY_ERROR_RETURN)
+            {
+                lowest = (std::min)(lowest, priority);
+            }
+        }
+        return lowest;
+    }
+}
+
+IC_TEST(DecodeScheduler_IdleThreadsWaitOutsideBackgroundMode)
+{
+    // A thread waiting in background mode would wake (for a stolen full-
+    // resolution task, or for shutdown) at background priority, which normal-
+    // priority load starves for seconds (floyd68/ImageCore#21). Background work
+    // still runs in background mode; the idle workers and the idle prefetch
+    // thread wait at normal priority or above.
+    const auto& files = Files();
+    Completions done;
+    DecodeScheduler scheduler;
+    const auto before = ProcessThreadIds();
+    scheduler.SetThreadCount(3);  // high-priority worker, two background workers
+
+    // Through the prefetch read and a background decode, then idle again.
+    IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[2], ImagePurpose::Thumbnail, 1, done.Callback(1))));
+    IC_REQUIRE(done.WaitFor(1));
+    IC_CHECK(done.entries[0].threadPriority < THREAD_PRIORITY_NORMAL);
+
+    // The decoding worker leaves background mode just after its callback.
+    const auto deadline = std::chrono::steady_clock::now() + kWaitTimeout;
+    int lowest = LowestThreadPriority(before);
+    while (lowest < THREAD_PRIORITY_NORMAL && std::chrono::steady_clock::now() < deadline)
+    {
+        Sleep(1);
+        lowest = LowestThreadPriority(before);
+    }
+    IC_CHECK(lowest >= THREAD_PRIORITY_NORMAL);
+}
+
 // Kept last: it creates and destroys many schedulers.
 IC_TEST(DecodeScheduler_ShutdownCyclesNeverHang)
 {

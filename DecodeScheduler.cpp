@@ -917,9 +917,10 @@ namespace ImageCore
         // - full-resolution (high queue) work runs above normal for main-image response;
         // - background (thumbnail) work runs in background mode, which lowers CPU and
         //   I/O priority (important for HDD bottlenecks).
-        // Background workers idle in background mode and leave it while they run a
-        // stolen full-resolution task; the high-priority and shared workers idle above
-        // normal and enter background mode only for a background task.
+        // Every worker idles above normal and is in background mode only while it runs
+        // a background task. A thread waiting in background mode would wake (for a
+        // stolen full-resolution task, or for shutdown) at background priority, which
+        // normal-priority load starves for seconds before it can even leave the mode.
         bool inBackgroundMode = false;
         auto setBackgroundMode = [&inBackgroundMode](bool background)
         {
@@ -938,15 +939,7 @@ namespace ImageCore
             }
             inBackgroundMode = background;
         };
-        const bool idleInBackground = (kind == WorkerKind::Background);
-        if (idleInBackground)
-        {
-            setBackgroundMode(true);
-        }
-        else
-        {
-            (void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
-        }
+        (void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
 
         // Each worker thread must initialize COM to use WIC/COM components safely.
         bool coInitialized = false;
@@ -1162,7 +1155,7 @@ namespace ImageCore
                 }
             }
 
-            setBackgroundMode(idleInBackground);
+            setBackgroundMode(false);
         }
 
         // Drop this thread's cached COM objects while the apartment is still alive.
@@ -1188,8 +1181,9 @@ namespace ImageCore
     {
         BindLeaseToCurrentThread(*slot->lease);
 
-        // Make thumbnail prefetch low priority (CPU + I/O).
-        (void)SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+        // The read runs in background mode (low CPU and I/O priority); the thread
+        // waits and schedules outside it, at normal priority, so it wakes for
+        // shutdown or a new task without being starved by normal-priority load.
 
         while (!m_shutdown)
         {
@@ -1295,7 +1289,9 @@ namespace ImageCore
             bool stopped = false;
             if (!bytes)
             {
+                (void)SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
                 auto read = LeasedRead(*slot->lease, task.state, task.handle, task.request.source, stopped);
+                (void)SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
                 if (read && !task.state->canceled.load())
                 {
                     FileByteCache::Instance().Put(task.request.source, read);
@@ -1336,8 +1332,6 @@ namespace ImageCore
             }
             m_queueCondition.notify_all();
         }
-
-        (void)SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
 
         SignalExit(*slot);
     }
