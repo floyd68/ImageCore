@@ -66,6 +66,13 @@ namespace
         out.write(reinterpret_cast<const char*>(pixels.data()), static_cast<std::streamsize>(pixels.size()));
     }
 
+    void ReadBack(const std::filesystem::path& path)
+    {
+        std::ifstream in(path, std::ios::binary);
+        std::vector<char> bytes((std::istreambuf_iterator<char>(in)), {});
+        (void)bytes;
+    }
+
     struct Fixture
     {
         std::filesystem::path dir;
@@ -91,6 +98,17 @@ namespace
             }
             WriteBmp(dir / L"full.bmp", 16, 8);
             fullRes = (dir / L"full.bmp").wstring();
+
+            // Read every file back once, here, at normal priority. The first open
+            // of a freshly written file can block in NtCreateFile for seconds
+            // (on-access scanning); from a background-mode thread on a busy
+            // machine that was captured at more than 10 s, inside the timed part
+            // of a test (floyd68/ImageCore#24, #15).
+            for (const auto& path : thumbs)
+            {
+                ReadBack(path);
+            }
+            ReadBack(fullRes);
 
             RegisterBuiltInDecoders();
             ImageCoreTest::RegisterTeardown([this]()
