@@ -183,7 +183,9 @@ namespace ImageCore
         // the stop-dispatch thread included; queued and in-flight
         // requests are dropped without callbacks. Clears volume tuning and
         // FileByteCache so a later SetThreadCount starts from a clean state.
-        // Enqueue fails afterwards.
+        // Enqueue fails afterwards. The threads are raised above normal priority
+        // for their exit, out of background mode's starvation-prone priority, so
+        // a CPU-saturated machine does not stretch the join to seconds.
         //
         // The join has no bound: a byte-source read that honours neither its
         // token nor OS cancellation (or a decode or stop callback that never
@@ -265,6 +267,12 @@ namespace ImageCore
         // OS-cancels every read registered on a lease for a canceled request.
         // Runs no host code. Requires m_lifecycleMutex (it walks m_threads).
         void CancelActiveReadsIo();
+
+        // Raises every scheduler thread above normal priority through its
+        // handle, overriding background mode, so a thread starved by other
+        // processes still reaches its exit within a shutdown bound. Requires
+        // m_lifecycleMutex (it walks m_threads).
+        void RaiseThreadPriorities();
 
         void StopDispatchThread(ThreadSlot* slot);
 

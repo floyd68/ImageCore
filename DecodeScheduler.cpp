@@ -410,6 +410,25 @@ namespace ImageCore
         SignalExit(*slot);
     }
 
+    void DecodeScheduler::RaiseThreadPriorities()
+    {
+        // A thread in background mode runs at base priority 4, below every
+        // normal-priority thread: on a CPU-saturated machine it is scheduled only
+        // by the OS starvation boost, once every few seconds, so it cannot see the
+        // shutdown flag and exit within a bound (an unbounded join just takes that
+        // long). Only the thread itself can leave background mode, but setting its
+        // priority through its handle replaces the background CPU priority, so it
+        // runs to its exit. Joinable handles stay valid until joined.
+        for (const auto& slot : m_threads)
+        {
+            if (slot->thread.joinable())
+            {
+                (void)SetThreadPriority(static_cast<HANDLE>(slot->thread.native_handle()),
+                    THREAD_PRIORITY_ABOVE_NORMAL);
+            }
+        }
+    }
+
     void DecodeScheduler::Finish_NoLock(const DecodeTask& task)
     {
         auto it = m_liveRequests.find(task.handle);
@@ -730,6 +749,7 @@ namespace ImageCore
             }
         }
         m_queueCondition.notify_all();
+        RaiseThreadPriorities();
 
         // Every read registered now is stopped too: one for a request outside
         // the live table (handle 0), and one whose Cancel already removed it
@@ -763,6 +783,8 @@ namespace ImageCore
 
         // Wait for the threads to exit, re-trying the OS cancel meanwhile: it only
         // reaches a call already blocked, and a read may block after an attempt.
+        // The priority raise is repeated too: a thread that took a background
+        // task just before shutdown may enter background mode after the raise.
         std::vector<ThreadSlot*> exited;
         {
             const auto allExited = [this]
@@ -790,6 +812,7 @@ namespace ImageCore
                 }
                 lock.unlock();
                 CancelActiveReadsIo();
+                RaiseThreadPriorities();
                 lock.lock();
             }
             for (const auto& slot : m_threads)
