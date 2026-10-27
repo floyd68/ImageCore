@@ -107,6 +107,154 @@ namespace
         return fixture;
     }
 
+    // Progress-wait diagnostics. Every scheduler a test creates registers here
+    // (TestScheduler), so a timed-out wait can print what each one was doing:
+    // queue and admission state, and per thread its phase, request, background
+    // mode, priority and CPU time over a short sample. A starved thread shows
+    // a phase with work but (almost) no CPU time in the sample while the
+    // machine is busy; a lost wakeup shows idle threads next to queued work.
+    std::mutex g_schedulersMutex;
+    std::vector<const DecodeScheduler*> g_schedulers;
+
+    class TestScheduler : public DecodeScheduler
+    {
+    public:
+        TestScheduler()
+        {
+            std::lock_guard<std::mutex> lock(g_schedulersMutex);
+            g_schedulers.push_back(this);
+        }
+
+        ~TestScheduler()
+        {
+            std::lock_guard<std::mutex> lock(g_schedulersMutex);
+            g_schedulers.erase(std::find(g_schedulers.begin(), g_schedulers.end(), this));
+        }
+
+        TestScheduler(const TestScheduler&) = delete;
+        TestScheduler& operator=(const TestScheduler&) = delete;
+    };
+
+    const char* RoleName(DecodeScheduler::Diagnostics::Role role)
+    {
+        using Role = DecodeScheduler::Diagnostics::Role;
+        switch (role)
+        {
+        case Role::HighPriority: return "high";
+        case Role::Background: return "background";
+        case Role::Shared: return "shared";
+        case Role::Prefetch: return "prefetch";
+        case Role::StopDispatch: return "stop-dispatch";
+        }
+        return "?";
+    }
+
+    const char* PhaseName(DecodeScheduler::Diagnostics::Phase phase)
+    {
+        using Phase = DecodeScheduler::Diagnostics::Phase;
+        switch (phase)
+        {
+        case Phase::Starting: return "starting";
+        case Phase::Idle: return "idle";
+        case Phase::Taken: return "taken";
+        case Phase::WaitingForSlot: return "waiting-for-slot";
+        case Phase::Reading: return "reading";
+        case Phase::Decoding: return "decoding";
+        case Phase::Delivering: return "delivering";
+        case Phase::Stopping: return "stopping";
+        case Phase::Exited: return "exited";
+        }
+        return "?";
+    }
+
+    // Busy fraction of all logical CPUs between two GetSystemTimes samples.
+    struct SystemTimes
+    {
+        uint64_t idle { 0 };
+        uint64_t total { 0 };
+
+        static SystemTimes Now()
+        {
+            FILETIME idle {}, kernel {}, user {};
+            (void)GetSystemTimes(&idle, &kernel, &user);
+            const auto ticks = [](const FILETIME& time)
+            {
+                return (static_cast<uint64_t>(time.dwHighDateTime) << 32) | time.dwLowDateTime;
+            };
+            return { ticks(idle), ticks(kernel) + ticks(user) };  // kernel time includes idle
+        }
+    };
+
+    // Prints the state of every live TestScheduler after the wait `what` timed
+    // out. Called only on a timeout, so the half-second sample costs nothing on
+    // a passing run.
+    void ReportStall(const char* what)
+    {
+        std::vector<const DecodeScheduler*> schedulers;
+        {
+            std::lock_guard<std::mutex> lock(g_schedulersMutex);
+            schedulers = g_schedulers;
+        }
+
+        std::vector<DecodeScheduler::Diagnostics> first;
+        for (const DecodeScheduler* scheduler : schedulers)
+        {
+            first.push_back(scheduler->GetDiagnostics());
+        }
+        const SystemTimes before = SystemTimes::Now();
+        constexpr int kSampleMs = 500;
+        Sleep(kSampleMs);
+        const SystemTimes after = SystemTimes::Now();
+        const uint64_t total = after.total - before.total;
+        const double busy = total ? 100.0 * static_cast<double>(total - (after.idle - before.idle)) / total : 0.0;
+
+        std::fprintf(stderr, "  stall: %s timed out after %lld s; system CPU busy %.0f%% over %d ms (%u logical CPUs)\n",
+            what, static_cast<long long>(kWaitTimeout.count()), busy, kSampleMs, std::thread::hardware_concurrency());
+        for (size_t i = 0; i < schedulers.size(); ++i)
+        {
+            const auto now = schedulers[i]->GetDiagnostics();
+            std::fprintf(stderr, "  scheduler %zu: shutdown=%d queued high=%zu io=%zu decode=%zu live=%zu admitted=%zu/%zu\n",
+                i, now.shutdown ? 1 : 0, now.highQueued, now.ioQueued, now.decodeQueued, now.liveRequests,
+                now.prefetchedTasks, now.prefetchCap);
+            if (!now.threadsListed)
+            {
+                std::fprintf(stderr, "    threads not listed (restart or shutdown in progress)\n");
+            }
+            for (size_t t = 0; t < now.threads.size(); ++t)
+            {
+                const auto& thread = now.threads[t];
+                double sampleCpuMs = -1.0;
+                if (i < first.size() && t < first[i].threads.size() && first[i].threads[t].threadId == thread.threadId)
+                {
+                    sampleCpuMs = thread.cpuMs - first[i].threads[t].cpuMs;
+                }
+                std::fprintf(stderr, "    thread %lu %-13s %-16s handle=%llu background=%d priority=%d cpu=%.1f ms (+%.1f ms in sample)\n",
+                    thread.threadId, RoleName(thread.role), PhaseName(thread.phase),
+                    static_cast<unsigned long long>(thread.handle), thread.backgroundMode ? 1 : 0, thread.priority,
+                    thread.cpuMs, sampleCpuMs);
+            }
+        }
+        std::fflush(stderr);
+    }
+
+    // Waits (bounded) on `cv` until `predicate` holds. On a timeout it reports
+    // the scheduler state, with `mutex` released so that callbacks waiting for
+    // it are not mistaken for stalled threads.
+    template <typename Predicate>
+    bool WaitOn(std::mutex& mutex, std::condition_variable& cv, Predicate predicate, const char* what)
+    {
+        bool ok = false;
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            ok = cv.wait_for(lock, kWaitTimeout, predicate);
+        }
+        if (!ok)
+        {
+            ReportStall(what);
+        }
+        return ok;
+    }
+
     // Collects completions in arrival order.
     struct Completions
     {
@@ -134,8 +282,7 @@ namespace
 
         bool WaitFor(size_t count)
         {
-            std::unique_lock<std::mutex> lock(mutex);
-            return cv.wait_for(lock, kWaitTimeout, [&]() { return entries.size() >= count; });
+            return WaitOn(mutex, cv, [&]() { return entries.size() >= count; }, "completion wait");
         }
     };
 
@@ -273,7 +420,7 @@ IC_TEST(DecodeScheduler_DefaultWorkerCountNeverZero)
 
 IC_TEST(DecodeScheduler_WorkerCountMatchesConfiguration)
 {
-    DecodeScheduler scheduler;
+    TestScheduler scheduler;
 
     scheduler.SetThreadCount(1);
     IC_CHECK(scheduler.WorkerCount() == 1);
@@ -300,7 +447,7 @@ IC_TEST(DecodeScheduler_SingleWorkerCompletesThumbnails)
     const auto& files = Files();
     Completions done;
     {
-        DecodeScheduler scheduler;
+        TestScheduler scheduler;
         scheduler.SetThreadCount(DecodeScheduler::DefaultWorkerCount(2));
         IC_REQUIRE(scheduler.WorkerCount() == 1);
 
@@ -325,7 +472,7 @@ IC_TEST(DecodeScheduler_SingleWorkerPrioritiesPerTask)
     const auto& files = Files();
     Completions done;
     {
-        DecodeScheduler scheduler;
+        TestScheduler scheduler;
         scheduler.SetThreadCount(1);
 
         scheduler.Enqueue(MakeTask(files.thumbs[0], ImagePurpose::Thumbnail, 1, done.Callback(1)));
@@ -358,7 +505,7 @@ IC_TEST(DecodeScheduler_SingleWorkerPrefersQueuedFullResolution)
     bool released = false;
 
     {
-        DecodeScheduler scheduler;
+        TestScheduler scheduler;
         scheduler.SetThreadCount(1);
         GateRelease releaseOnExit { gateMutex, gateCv, released };
 
@@ -374,10 +521,7 @@ IC_TEST(DecodeScheduler_SingleWorkerPrefersQueuedFullResolution)
         };
         scheduler.Enqueue(MakeTask(files.thumbs[0], ImagePurpose::Thumbnail, 1, gatedCallback));
 
-        {
-            std::unique_lock<std::mutex> lock(gateMutex);
-            IC_REQUIRE(gateCv.wait_for(lock, kWaitTimeout, [&]() { return entered; }));
-        }
+        IC_REQUIRE(WaitOn(gateMutex, gateCv, [&]() { return entered; }, "gate entry"));
 
         // Queue a thumbnail backlog, then a full-resolution request, while the
         // worker is busy. The full-resolution request is in the high queue before
@@ -439,7 +583,7 @@ IC_TEST(DecodeScheduler_BackpressureBlocksAtCapAndResumes)
     {
         Watchdog watchdog("backpressure test", std::chrono::seconds(60));
         ScopedFileByteSource byteSource;
-        DecodeScheduler scheduler;
+        TestScheduler scheduler;
         scheduler.SetThreadCount(1);
         GateRelease releaseOnExit { gateMutex, gateCv, released };
 
@@ -464,10 +608,7 @@ IC_TEST(DecodeScheduler_BackpressureBlocksAtCapAndResumes)
         IC_REQUIRE(effectiveCap >= 1);
         IC_REQUIRE(effectiveCap < files.thumbs.size());
 
-        {
-            std::unique_lock<std::mutex> lock(gateMutex);
-            IC_REQUIRE(gateCv.wait_for(lock, kWaitTimeout, [&]() { return entered; }));
-        }
+        IC_REQUIRE(WaitOn(gateMutex, gateCv, [&]() { return entered; }, "gate entry"));
 
         // Fill phase: wait until the read count stops changing for 500 ms.
         {
@@ -592,8 +733,7 @@ namespace
 
         bool WaitEntered() const
         {
-            std::unique_lock<std::mutex> lock(m_mutex);
-            return m_cv.wait_for(lock, kWaitTimeout, [&]() { return m_entered; });
+            return WaitOn(m_mutex, m_cv, [&]() { return m_entered; }, "gate entry");
         }
 
         void Release() const
@@ -630,6 +770,7 @@ namespace
         {
             if (std::chrono::steady_clock::now() >= deadline)
             {
+                ReportStall("condition wait");
                 return false;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -657,7 +798,7 @@ IC_TEST(DecodeScheduler_LateCancelLeavesNoState)
     // requests leave nothing in the live-request table.
     const auto& files = Files();
     Completions done;
-    DecodeScheduler scheduler;
+    TestScheduler scheduler;
     scheduler.SetThreadCount(2);
 
     constexpr uint64_t kCount = 20;
@@ -690,7 +831,7 @@ IC_TEST(DecodeScheduler_CancelReloadStressStaysBounded)
     const auto& files = Files();
     Watchdog watchdog("cancel/reload stress", std::chrono::seconds(60));
     Completions done;
-    DecodeScheduler scheduler;
+    TestScheduler scheduler;
     scheduler.SetThreadCount(3);
 
     constexpr uint64_t kRounds = 300;
@@ -747,7 +888,7 @@ IC_TEST(DecodeScheduler_QueuedCancelSuppressesCallback)
     bool entered = false;
     bool released = false;
     {
-        DecodeScheduler scheduler;
+        TestScheduler scheduler;
         scheduler.SetThreadCount(1);
         GateRelease releaseOnExit { gateMutex, gateCv, released };
 
@@ -762,10 +903,7 @@ IC_TEST(DecodeScheduler_QueuedCancelSuppressesCallback)
             inner(std::move(result));
         };
         IC_REQUIRE(scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 1, gatedCallback)));
-        {
-            std::unique_lock<std::mutex> lock(gateMutex);
-            IC_REQUIRE(gateCv.wait_for(lock, kWaitTimeout, [&]() { return entered; }));
-        }
+        IC_REQUIRE(WaitOn(gateMutex, gateCv, [&]() { return entered; }, "gate entry"));
 
         // Task 1 is being delivered (it already left the live table); 2 and 3 queue.
         IC_REQUIRE(scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 2, done.Callback(2))));
@@ -804,7 +942,7 @@ IC_TEST(DecodeScheduler_CancelDuringDecodeSuppressesCallback)
         GatedByteSource source;
         source.archivePath = files.thumbs[30];
         source.gatedRead = files.thumbs[30];
-        DecodeScheduler scheduler;
+        TestScheduler scheduler;
         scheduler.SetThreadCount(1);
 
         IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[30], ImagePurpose::FullResolution, 1, done.Callback(1))));
@@ -835,7 +973,7 @@ IC_TEST(DecodeScheduler_StolenFullResolutionRunsAboveNormal)
     DWORD gatedThread = 0;
     DWORD otherThread = 0;
     {
-        DecodeScheduler scheduler;
+        TestScheduler scheduler;
         scheduler.SetThreadCount(2);  // one high-priority worker + one background worker
         GateRelease releaseOnExit { gateMutex, gateCv, released };
 
@@ -851,10 +989,7 @@ IC_TEST(DecodeScheduler_StolenFullResolutionRunsAboveNormal)
             inner(std::move(result));
         };
         IC_REQUIRE(scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 1, gatedCallback)));
-        {
-            std::unique_lock<std::mutex> lock(gateMutex);
-            IC_REQUIRE(gateCv.wait_for(lock, kWaitTimeout, [&]() { return entered; }));
-        }
+        IC_REQUIRE(WaitOn(gateMutex, gateCv, [&]() { return entered; }, "gate entry"));
 
         auto inner2 = done.Callback(2);
         IC_REQUIRE(scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 2,
@@ -896,7 +1031,7 @@ IC_TEST(DecodeScheduler_EnqueueAfterShutdownIsRejected)
 {
     const auto& files = Files();
     Completions done;
-    DecodeScheduler scheduler;
+    TestScheduler scheduler;
     scheduler.SetThreadCount(2);
     scheduler.Shutdown();
     scheduler.Shutdown();  // idempotent
@@ -924,7 +1059,7 @@ IC_TEST(DecodeScheduler_RestartClearsTuningAndPrefetchedBytes)
     {
         Watchdog watchdog("restart test", std::chrono::seconds(60));
         ScopedFileByteSource byteSource;
-        DecodeScheduler scheduler;
+        TestScheduler scheduler;
         scheduler.SetThreadCount(1);
         GateRelease releaseOnExit { gateMutex, gateCv, released };
 
@@ -944,10 +1079,7 @@ IC_TEST(DecodeScheduler_RestartClearsTuningAndPrefetchedBytes)
             IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[handle], ImagePurpose::Thumbnail, handle,
                 done.Callback(handle))));
         }
-        {
-            std::unique_lock<std::mutex> lock(gateMutex);
-            IC_REQUIRE(gateCv.wait_for(lock, kWaitTimeout, [&]() { return entered; }));
-        }
+        IC_REQUIRE(WaitOn(gateMutex, gateCv, [&]() { return entered; }, "gate entry"));
         // Prefetch fills the cache while the only worker is held.
         IC_REQUIRE(WaitUntil([&]() { return cache.Count() >= 1; }));
         IC_CHECK(scheduler.VolumeProfileCount() == 1);
@@ -983,7 +1115,7 @@ IC_TEST(DecodeScheduler_TuningQueryRunsOutsideQueueMutex)
         Watchdog watchdog("tuning outside mutex", std::chrono::seconds(60));
         GatedByteSource source;
         source.gatedResolve = files.thumbs[25];
-        DecodeScheduler scheduler;
+        TestScheduler scheduler;
         scheduler.SetThreadCount(1);
 
         std::thread enqueuer([&]()
@@ -1107,8 +1239,7 @@ namespace
 
         bool WaitEntered()
         {
-            std::unique_lock<std::mutex> lock(mutex);
-            return cv.wait_for(lock, kWaitTimeout, [&]() { return entered; });
+            return WaitOn(mutex, cv, [&]() { return entered; }, "gate entry");
         }
 
         void Release()
@@ -1147,7 +1278,7 @@ IC_TEST(DecodeScheduler_CanceledSamePathTaskKeepsNewerArchiveBytes)
     {
         Watchdog watchdog("same-path archive bytes", std::chrono::seconds(60));
         VirtualArchiveSource source(files.dir);
-        DecodeScheduler scheduler;
+        TestScheduler scheduler;
         scheduler.SetThreadCount(1);
         struct ReleaseOnExit { WorkerGate& g; ~ReleaseOnExit() { g.Release(); } } releaseOnExit { gate };
 
@@ -1185,7 +1316,7 @@ IC_TEST(DecodeScheduler_CancelReleasesPrefetchSlotsImmediately)
     {
         Watchdog watchdog("cancel releases slots", std::chrono::seconds(60));
         ScopedFileByteSource byteSource;
-        DecodeScheduler scheduler;
+        TestScheduler scheduler;
         scheduler.SetThreadCount(1);
         struct ReleaseOnExit { WorkerGate& g; ~ReleaseOnExit() { g.Release(); } } releaseOnExit { gate };
 
@@ -1255,7 +1386,7 @@ IC_TEST(DecodeScheduler_SamePathCancelRequeueStressKeepsArchiveBytes)
     {
         Watchdog watchdog("same-path stress", std::chrono::seconds(90));
         VirtualArchiveSource source(files.dir);
-        DecodeScheduler scheduler;
+        TestScheduler scheduler;
         scheduler.SetThreadCount(3);
 
         constexpr uint64_t kRounds = 400;
@@ -1314,7 +1445,7 @@ IC_TEST(DecodeScheduler_BulkCancelOfLargeBacklogIsLinear)
     double largeMs = 0.0;
     {
         Watchdog watchdog("bulk cancel", std::chrono::seconds(120));
-        DecodeScheduler scheduler;
+        TestScheduler scheduler;
         scheduler.SetThreadCount(1);
         struct ReleaseOnExit { WorkerGate& g; ~ReleaseOnExit() { g.Release(); } } releaseOnExit { gate };
 
@@ -1391,7 +1522,7 @@ IC_TEST(DecodeScheduler_IdleThreadsWaitOutsideBackgroundMode)
     // thread wait at normal priority or above.
     const auto& files = Files();
     Completions done;
-    DecodeScheduler scheduler;
+    TestScheduler scheduler;
     const auto before = ProcessThreadIds();
     scheduler.SetThreadCount(3);  // high-priority worker, two background workers
 
@@ -1487,7 +1618,7 @@ IC_TEST(DecodeScheduler_ShutdownCyclesNeverHang)
     for (int cycle = 0; cycle < kCycles; ++cycle, watchdog.Advance())
     {
         Completions done;
-        DecodeScheduler scheduler;
+        TestScheduler scheduler;
         scheduler.SetThreadCount(1 + (cycle % 2));
 
         const int mode = cycle % 3;
@@ -1538,8 +1669,7 @@ namespace
 
         bool WaitEntered()
         {
-            std::unique_lock<std::mutex> lock(m_mutex);
-            return m_cv.wait_for(lock, kWaitTimeout, [&] { return m_entered; });
+            return WaitOn(m_mutex, m_cv, [&] { return m_entered; }, "gate entry");
         }
 
         void Open()
@@ -1586,6 +1716,7 @@ namespace
         {
             if (std::chrono::steady_clock::now() > deadline)
             {
+                ReportStall("condition wait");
                 return false;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -1606,7 +1737,7 @@ IC_TEST(DecodeScheduler_PriorityOrdersAndPromotesInTheIoStage)
     {
         Watchdog watchdog("I/O priority test", std::chrono::seconds(60));
         GatedFileByteSource byteSource(files.thumbs[0]);
-        DecodeScheduler scheduler;
+        TestScheduler scheduler;
         scheduler.SetThreadCount(2);
         ByteGateRelease release { byteSource };
 
@@ -1655,7 +1786,7 @@ IC_TEST(DecodeScheduler_HigherPriorityTakesTheNextPrefetchSlot)
     {
         Watchdog watchdog("prefetch slot test", std::chrono::seconds(60));
         ScopedFileByteSource byteSource;
-        DecodeScheduler scheduler;
+        TestScheduler scheduler;
         scheduler.SetThreadCount(1);
         GateRelease releaseOnExit { gateMutex, gateCv, released };
 
@@ -1677,10 +1808,7 @@ IC_TEST(DecodeScheduler_HigherPriorityTakesTheNextPrefetchSlot)
         }
         const size_t cap = cache.MaxEntries();
         IC_REQUIRE(cap + 2 < backlog);
-        {
-            std::unique_lock<std::mutex> lock(gateMutex);
-            IC_REQUIRE(gateCv.wait_for(lock, kWaitTimeout, [&]() { return entered; }));
-        }
+        IC_REQUIRE(WaitOn(gateMutex, gateCv, [&]() { return entered; }, "gate entry"));
         IC_REQUIRE(WaitUntil([&] { return scheduler.PrefetchedTaskCount() == cap; }));
         std::this_thread::sleep_for(std::chrono::milliseconds(100));   // let the stage block on the slot
         readsAtCap = byteSource.ReadCount();
@@ -1723,7 +1851,7 @@ IC_TEST(DecodeScheduler_PromotionReordersTheDecodeStage)
     {
         Watchdog watchdog("decode priority test", std::chrono::seconds(60));
         ScopedFileByteSource byteSource;
-        DecodeScheduler scheduler;
+        TestScheduler scheduler;
         scheduler.SetThreadCount(1);
         GateRelease releaseOnExit { gateMutex, gateCv, released };
 
@@ -1738,10 +1866,7 @@ IC_TEST(DecodeScheduler_PromotionReordersTheDecodeStage)
             inner(std::move(result));
         };
         scheduler.Enqueue(MakeThumb(files.thumbs[0], 1, RequestPriority::Visible, gated));
-        {
-            std::unique_lock<std::mutex> lock(gateMutex);
-            IC_REQUIRE(gateCv.wait_for(lock, kWaitTimeout, [&]() { return entered; }));
-        }
+        IC_REQUIRE(WaitOn(gateMutex, gateCv, [&]() { return entered; }, "gate entry"));
         scheduler.Enqueue(MakeThumb(files.thumbs[1], 2, RequestPriority::Prefetch, done.Callback(2)));
         scheduler.Enqueue(MakeThumb(files.thumbs[2], 3, RequestPriority::Prefetch, done.Callback(3)));
         scheduler.Enqueue(MakeThumb(files.thumbs[3], 4, RequestPriority::Visible, done.Callback(4)));
@@ -1796,7 +1921,7 @@ IC_TEST(DecodeScheduler_PromotionAndCancelStressUnderTileReuse)
     {
         Watchdog watchdog("priority stress", std::chrono::seconds(90));
         ScopedFileByteSource byteSource;
-        DecodeScheduler scheduler;
+        TestScheduler scheduler;
         scheduler.SetThreadCount(3);
 
         std::vector<uint64_t> tileHandle(kTiles, 0);
@@ -2358,7 +2483,7 @@ IC_TEST(ReadCancel_CancelReleasesBlockedThumbnailRead)
     const std::wstring b = source.Entry(files.thumbs[1]);
     source.SetMode(a, Mode::Cooperative);
     {
-        DecodeScheduler scheduler;
+        TestScheduler scheduler;
         scheduler.SetTestHook(probe.Hook());
         scheduler.SetThreadCount(2);
         OnExit release { [&] { source.Release(); } };
@@ -2397,7 +2522,7 @@ IC_TEST(ReadCancel_CancelReleasesBlockedFullResolutionArchiveRead)
     const std::wstring b = source.Entry(files.thumbs[3]);
     source.SetMode(a, Mode::Cooperative);
     {
-        DecodeScheduler scheduler;
+        TestScheduler scheduler;
         scheduler.SetTestHook(probe.Hook());
         scheduler.SetThreadCount(1);
         OnExit release { [&] { source.Release(); } };
@@ -2437,7 +2562,7 @@ IC_TEST(ReadCancel_PreCanceledRequestsNeverReadOrDecode)
     const std::wstring archiveFull = source.Entry(files.thumbs[7]);
     source.SetMode(blocker, Mode::Cooperative);
     {
-        DecodeScheduler scheduler;
+        TestScheduler scheduler;
         scheduler.SetTestHook(probe.Hook());
         scheduler.SetThreadCount(1);
         OnExit release { [&] { gate.Release(); source.Release(); } };
@@ -2493,7 +2618,7 @@ IC_TEST(ReadCancel_CanceledRequestsNeverReachDecode)
     source.SetMode(archiveFull, Mode::Cooperative);
     probe.HoldAt(Point::TaskTaken, 3);
     {
-        DecodeScheduler scheduler;
+        TestScheduler scheduler;
         scheduler.SetTestHook(probe.Hook());
         scheduler.SetThreadCount(2);
         OnExit release { [&] { probe.ReleaseAll(); source.Release(); } };
@@ -2544,7 +2669,7 @@ IC_TEST(ReadCancel_CanceledReadNeverPopulatesByteCache)
     const std::wstring entry = source.Entry(files.thumbs[10]);
     source.SetMode(entry, Mode::Cooperative);  // first read only
     {
-        DecodeScheduler scheduler;
+        TestScheduler scheduler;
         scheduler.SetTestHook(probe.Hook());
         scheduler.SetThreadCount(2);
         OnExit release { [&] { source.Release(); } };
@@ -2582,7 +2707,7 @@ IC_TEST(ReadCancel_CancelRacingReadCompletionStress)
         Watchdog watchdog("cancel race stress", std::chrono::seconds(90));
         ControlledSource source(files.dir);
         source.SetJitter(2000);
-        DecodeScheduler scheduler;
+        TestScheduler scheduler;
         scheduler.SetThreadCount(3);
         OnExit release { [&] { source.Release(); } };
 
@@ -2668,7 +2793,7 @@ IC_TEST(ReadCancel_CancelInterruptsBlockedSynchronousRead)
     source.SetMode(thumb, Mode::Pipe);
     source.SetMode(full, Mode::Pipe);
     {
-        DecodeScheduler scheduler;
+        TestScheduler scheduler;
         scheduler.SetTestHook(probe.Hook());
         scheduler.SetThreadCount(1);
         OnExit release { [&] { for (int i = 0; i < 4; ++i) { source.WritePipe(); } } };
@@ -2715,7 +2840,7 @@ IC_TEST(ReadCancel_StopCallbackMayReenterScheduler)
     std::atomic<bool> probeFinished { false };
     std::atomic<bool> enqueued { false };
     {
-        DecodeScheduler scheduler;
+        TestScheduler scheduler;
         scheduler.SetThreadCount(2);
         OnExit release { [&] { source.Release(); } };
 
@@ -2779,7 +2904,7 @@ IC_TEST(ReadCancel_LegacyReadAllSourceStillWorks)
         const IPathByteSource& base = source;
         IC_CHECK(base.ReadAll(entry, std::stop_token {}) == source.ReadAll(entry));
 
-        DecodeScheduler scheduler;
+        TestScheduler scheduler;
         scheduler.SetTestHook(probe.Hook());
         scheduler.SetThreadCount(2);
         IC_REQUIRE(scheduler.Enqueue(MakeTask(entry, ImagePurpose::Thumbnail, 1, done.Callback(1))));
@@ -2796,7 +2921,7 @@ IC_TEST(ReadCancel_LegacyReadAllSourceStillWorks)
         GatedByteSource source;
         source.archivePath = files.thumbs[19];
         source.gatedRead = files.thumbs[19];
-        DecodeScheduler scheduler;
+        TestScheduler scheduler;
         scheduler.SetTestHook(probe.Hook());
         scheduler.SetThreadCount(1);
         IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[19], ImagePurpose::FullResolution, 3, done.Callback(3))));
@@ -2843,7 +2968,7 @@ namespace
         }
         bool bStartedEarly = false;
         {
-            DecodeScheduler scheduler;
+            TestScheduler scheduler;
             scheduler.SetTestHook(probe.Hook());
             scheduler.SetThreadCount(1);
             OnExit release { [&] { probe.ReleaseAll(); for (int i = 0; i < 4; ++i) { source.WritePipe(); } } };
@@ -2936,7 +3061,7 @@ IC_TEST(ReadCancel_CancelAfterRetirementNeverTargetsTheNextRead)
     const std::wstring b = source.Entry(files.thumbs[23]);
     source.SetMode(b, Mode::Pipe);
     {
-        DecodeScheduler scheduler;
+        TestScheduler scheduler;
         scheduler.SetTestHook(probe.Hook());
         scheduler.SetThreadCount(1);
         OnExit release { [&] { gate.Release(); for (int i = 0; i < 4; ++i) { source.WritePipe(); } } };
@@ -2983,7 +3108,7 @@ IC_TEST(ReadCancel_TokenReleasesWaitForOtherThreadWork)
     probe.HoldAt(Point::BeforeReadRetire, 1);
     DWORD readingThread = 0;
     {
-        DecodeScheduler scheduler;
+        TestScheduler scheduler;
         scheduler.SetTestHook(probe.Hook());
         scheduler.SetThreadCount(1);
         OnExit release { [&] { probe.ReleaseAll(); for (int i = 0; i < 4; ++i) { source.WritePipe(); } } };
@@ -3097,7 +3222,7 @@ IC_TEST(ReadCancel_BoundedShutdownReleasesCooperativeReads)
     bool ok = false;
     long long elapsed = 0;
     {
-        DecodeScheduler scheduler;
+        TestScheduler scheduler;
         scheduler.SetTestHook(probe.Hook());
         scheduler.SetThreadCount(2);
         OnExit release { [&] { source.Release(); } };
@@ -3149,7 +3274,7 @@ IC_TEST(ReadCancel_BoundedShutdownOsCancelsBlockedSynchronousRead)
     source.SetMode(thumb, Mode::Pipe);
     source.SetMode(full, Mode::Pipe);
     {
-        DecodeScheduler scheduler;
+        TestScheduler scheduler;
         scheduler.SetThreadCount(1);
         OnExit release { [&] { for (int i = 0; i < 4; ++i) { source.WritePipe(); } } };
 
@@ -3187,7 +3312,7 @@ IC_TEST(ReadCancel_BoundedShutdownTimesOutOnNonCooperativeRead)
     source.SetMode(thumb, Mode::IgnoreToken);
     source.SetMode(full, Mode::IgnoreToken);
     {
-        DecodeScheduler scheduler;
+        TestScheduler scheduler;
         scheduler.SetThreadCount(2);
         OnExit release { [&] { source.Release(); } };
 
@@ -3251,7 +3376,7 @@ IC_TEST(ReadCancel_BoundedShutdownBeforeRequestsAndRepeated)
     const auto& files = Files();
     Completions done;
     Watchdog watchdog("bounded shutdown, idle", std::chrono::seconds(60));
-    DecodeScheduler scheduler;
+    TestScheduler scheduler;
     IC_CHECK(scheduler.Shutdown(std::chrono::milliseconds(2000)));
     IC_CHECK(scheduler.Shutdown(std::chrono::milliseconds(2000)));
     IC_CHECK(scheduler.Shutdown(std::chrono::milliseconds(0)));  // nothing left to join
@@ -3337,8 +3462,7 @@ namespace
 
         bool WaitEntered()
         {
-            std::unique_lock<std::mutex> lock(m_mutex);
-            return m_cv.wait_for(lock, kWaitTimeout, [&] { return m_entered; });
+            return WaitOn(m_mutex, m_cv, [&] { return m_entered; }, "gate entry");
         }
 
         int Before() const { std::lock_guard<std::mutex> lock(m_mutex); return m_before; }
@@ -3369,7 +3493,7 @@ IC_TEST(ReadCancel_ShutdownRaisesInFlightBackgroundDecode)
     std::atomic<int> before { THREAD_PRIORITY_ERROR_RETURN };
     std::atomic<int> after { THREAD_PRIORITY_ERROR_RETURN };
 
-    DecodeScheduler scheduler;
+    TestScheduler scheduler;
     scheduler.SetThreadCount(1);
     IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[0], ImagePurpose::Thumbnail, 1,
         [&](PipelineResult&&)
@@ -3401,7 +3525,7 @@ IC_TEST(ReadCancel_ShutdownRaisesInFlightPrefetchRead)
     PriorityProbeSource source(files.thumbs[1]);
     Completions done;
 
-    DecodeScheduler scheduler;
+    TestScheduler scheduler;
     scheduler.SetThreadCount(1);
     IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[1], ImagePurpose::Thumbnail, 1, done.Callback(1))));
     IC_REQUIRE(source.WaitEntered());
@@ -3479,7 +3603,7 @@ IC_TEST(LoadShutdown_BoundedUnderCpuSaturation)
     constexpr int kRounds = 10;
     for (int round = 0; round < kRounds; ++round)
     {
-        DecodeScheduler scheduler;
+        TestScheduler scheduler;
         IC_CHECK(scheduler.Shutdown(std::chrono::milliseconds(2000)));
         scheduler.SetThreadCount(1 + (round % 2));
         IC_REQUIRE(scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution,
@@ -3498,7 +3622,7 @@ IC_TEST(LoadShutdown_BoundedUnderCpuSaturation)
     {
         const auto cycleStart = std::chrono::steady_clock::now();
         {
-            DecodeScheduler scheduler;
+            TestScheduler scheduler;
             scheduler.SetThreadCount(1 + (cycle % 2));
         }
         cycleMs.push_back(std::chrono::duration<double, std::milli>(
@@ -3526,7 +3650,7 @@ IC_TEST(ReadCancel_StopCallbackDuringShutdownMayReenterScheduler)
     std::atomic<bool> probeFinished { false };
     std::atomic<bool> enqueued { true };
     {
-        DecodeScheduler scheduler;
+        TestScheduler scheduler;
         scheduler.SetThreadCount(1);
         OnExit release { [&] { source.Release(); } };
         source.SetOnStop([&]
@@ -3593,7 +3717,7 @@ namespace
             (void)WaitForSingleObject(gate, 10000);
         });
         {
-            DecodeScheduler scheduler;
+            TestScheduler scheduler;
             scheduler.SetThreadCount(1);
             OnExit release { [&] { SetEvent(gate); source.Release(); } };
 
@@ -3707,7 +3831,7 @@ IC_TEST(ReadCancel_BoundedShutdownWaitsForThreadTermination)
     g_tlsGate = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     {
         TlsTouchingSource source;
-        DecodeScheduler scheduler;
+        TestScheduler scheduler;
         scheduler.SetThreadCount(1);
         OnExit release { [&] { SetEvent(g_tlsGate); } };
 
@@ -3756,7 +3880,7 @@ IC_TEST(ReadCancel_ShutdownWhileCancelIsPublishingStillStopsTheRead)
     bool ok = false;
     long long elapsed = 0;
     {
-        DecodeScheduler scheduler;
+        TestScheduler scheduler;
         scheduler.SetTestHook(probe.Hook());
         scheduler.SetThreadCount(1);
         OnExit release { [&] { probe.ReleaseAll(); source.Release(); } };
@@ -3800,7 +3924,7 @@ namespace
         std::atomic<bool> ok { false };
         std::atomic<long long> elapsed { 0 };
         {
-            DecodeScheduler scheduler;
+            TestScheduler scheduler;
             scheduler.SetTestHook(probe.Hook());
             scheduler.SetThreadCount(1);
             OnExit release { [&] { probe.ReleaseAll(); source.Release(); } };
@@ -3857,7 +3981,7 @@ IC_TEST(ReadCancel_CancelFinishShutdownRaceStress)
         std::atomic<bool> shutDown { false };
         std::atomic<int> late { 0 };
         {
-            DecodeScheduler scheduler;
+            TestScheduler scheduler;
             scheduler.SetThreadCount(1 + (cycle % 3));
             OnExit release { [&] { source.Release(); } };
 
