@@ -213,9 +213,35 @@ namespace
         }
     };
 
+    void PrintDiagnostics(size_t index, const char* when, const DecodeScheduler::Diagnostics& state,
+        const DecodeScheduler::Diagnostics* earlier)
+    {
+        std::fprintf(stderr, "  scheduler %zu %s: shutdown=%d queued high=%zu io=%zu decode=%zu live=%zu admitted=%zu/%zu\n",
+            index, when, state.shutdown ? 1 : 0, state.highQueued, state.ioQueued, state.decodeQueued,
+            state.liveRequests, state.prefetchedTasks, state.prefetchCap);
+        if (!state.threadsListed)
+        {
+            std::fprintf(stderr, "    threads not listed (restart or shutdown in progress)\n");
+        }
+        for (size_t t = 0; t < state.threads.size(); ++t)
+        {
+            const auto& thread = state.threads[t];
+            std::fprintf(stderr, "    thread %lu %-13s %-16s handle=%llu background=%d priority=%d cpu=%.1f ms",
+                thread.threadId, RoleName(thread.role), PhaseName(thread.phase),
+                static_cast<unsigned long long>(thread.handle), thread.backgroundMode ? 1 : 0, thread.priority,
+                thread.cpuMs);
+            if (earlier && t < earlier->threads.size() && earlier->threads[t].threadId == thread.threadId)
+            {
+                std::fprintf(stderr, " (+%.1f ms in sample)", thread.cpuMs - earlier->threads[t].cpuMs);
+            }
+            std::fprintf(stderr, "\n");
+        }
+    }
+
     // Prints the state of every live TestScheduler after the wait `what` timed
-    // out. Called only on a timeout, so the half-second sample costs nothing on
-    // a passing run.
+    // out: the snapshot taken at the timeout, then a second one half a second
+    // later for the CPU deltas (a transient stall may have cleared by then).
+    // Called only on a timeout, so the sample costs nothing on a passing run.
     void ReportStall(const char* what)
     {
         std::vector<const DecodeScheduler*> schedulers;
@@ -240,27 +266,9 @@ namespace
             what, static_cast<long long>(kWaitTimeout.count()), busy, kSampleMs, std::thread::hardware_concurrency());
         for (size_t i = 0; i < schedulers.size(); ++i)
         {
-            const auto now = schedulers[i]->GetDiagnostics();
-            std::fprintf(stderr, "  scheduler %zu: shutdown=%d queued high=%zu io=%zu decode=%zu live=%zu admitted=%zu/%zu\n",
-                i, now.shutdown ? 1 : 0, now.highQueued, now.ioQueued, now.decodeQueued, now.liveRequests,
-                now.prefetchedTasks, now.prefetchCap);
-            if (!now.threadsListed)
-            {
-                std::fprintf(stderr, "    threads not listed (restart or shutdown in progress)\n");
-            }
-            for (size_t t = 0; t < now.threads.size(); ++t)
-            {
-                const auto& thread = now.threads[t];
-                double sampleCpuMs = -1.0;
-                if (i < first.size() && t < first[i].threads.size() && first[i].threads[t].threadId == thread.threadId)
-                {
-                    sampleCpuMs = thread.cpuMs - first[i].threads[t].cpuMs;
-                }
-                std::fprintf(stderr, "    thread %lu %-13s %-16s handle=%llu background=%d priority=%d cpu=%.1f ms (+%.1f ms in sample)\n",
-                    thread.threadId, RoleName(thread.role), PhaseName(thread.phase),
-                    static_cast<unsigned long long>(thread.handle), thread.backgroundMode ? 1 : 0, thread.priority,
-                    thread.cpuMs, sampleCpuMs);
-            }
+            PrintDiagnostics(i, "at timeout", first[i], nullptr);
+            const auto later = schedulers[i]->GetDiagnostics();
+            PrintDiagnostics(i, "after sample", later, &first[i]);
         }
         std::fflush(stderr);
     }
