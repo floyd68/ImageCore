@@ -1411,6 +1411,60 @@ IC_TEST(DecodeScheduler_IdleThreadsWaitOutsideBackgroundMode)
     IC_CHECK(lowest >= THREAD_PRIORITY_NORMAL);
 }
 
+namespace
+{
+    // Fails the process with a message if Advance() is not called for `limit`.
+    // It catches one stuck step of a long loop without bounding the sum of
+    // many short steps, which a loaded machine stretches.
+    class StallWatchdog
+    {
+    public:
+        StallWatchdog(const char* what, std::chrono::seconds limit)
+            : m_done(CreateEventW(nullptr, TRUE, FALSE, nullptr))
+            , m_thread([this, what, limit]()
+            {
+                int seen = m_progress.load();
+                auto lastChange = std::chrono::steady_clock::now();
+                while (WaitForSingleObject(m_done, 250) != WAIT_OBJECT_0)
+                {
+                    const int progress = m_progress.load();
+                    const auto now = std::chrono::steady_clock::now();
+                    if (progress != seen)
+                    {
+                        seen = progress;
+                        lastChange = now;
+                    }
+                    else if (now - lastChange > limit)
+                    {
+                        std::fprintf(stderr, "  watchdog: %s: step %d did not finish within %lld s; terminating\n",
+                            what, progress, static_cast<long long>(limit.count()));
+                        std::fflush(stderr);
+                        TerminateProcess(GetCurrentProcess(), 3);
+                    }
+                }
+            })
+        {
+        }
+
+        ~StallWatchdog()
+        {
+            SetEvent(m_done);
+            m_thread.join();
+            CloseHandle(m_done);
+        }
+
+        void Advance()
+        {
+            ++m_progress;
+        }
+
+    private:
+        HANDLE m_done;
+        std::atomic<int> m_progress { 0 };
+        std::thread m_thread;
+    };
+}
+
 // Kept last: it creates and destroys many schedulers.
 IC_TEST(DecodeScheduler_ShutdownCyclesNeverHang)
 {
@@ -1418,12 +1472,19 @@ IC_TEST(DecodeScheduler_ShutdownCyclesNeverHang)
     // its predicate just before the flag flipped) and with queued and in-flight
     // full-resolution work. Full-resolution tasks bypass the FileByteCache, so
     // dropped tasks leave no stale cache entries behind for later cycles.
+    //
+    // A hang is one cycle that never ends, so the watchdog bounds each cycle,
+    // not the run: under CPU saturation every cycle waits for its share of the
+    // processors (more busy threads than CPUs: 50-190 ms per cycle on average,
+    // the longest measured cycle 150 ms in an instrumented Debug run), and
+    // 1,000 such cycles took 51-190 s, past a 90 s budget for the whole run
+    // (floyd68/ImageCore#21).
     const auto& files = Files();
     constexpr int kCycles = 1000;
-    Watchdog watchdog("shutdown cycles", std::chrono::seconds(90));
+    StallWatchdog watchdog("shutdown cycles", std::chrono::seconds(30));
 
     int completed = 0;
-    for (int cycle = 0; cycle < kCycles; ++cycle)
+    for (int cycle = 0; cycle < kCycles; ++cycle, watchdog.Advance())
     {
         Completions done;
         DecodeScheduler scheduler;
