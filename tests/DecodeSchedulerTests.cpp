@@ -134,11 +134,21 @@ namespace
     std::mutex g_schedulersMutex;
     std::vector<const DecodeScheduler*> g_schedulers;
 
+    //
+    // Thumbnail work runs at normal priority in TestScheduler unless a test asks
+    // for background mode. A background-mode thread gets the CPU only when no
+    // normal-priority thread wants it, or through the OS starvation boost every
+    // few seconds, so on a machine busy with other work the scheduling-logic
+    // tests timed out without any scheduler defect (floyd68/ImageCore#24). The
+    // priority policy itself is tested with BackgroundMode explicitly.
+    using BackgroundWorkPriority = DecodeScheduler::BackgroundWorkPriority;
+
     class TestScheduler : public DecodeScheduler
     {
     public:
-        TestScheduler()
+        explicit TestScheduler(BackgroundWorkPriority priority = BackgroundWorkPriority::Normal)
         {
+            SetBackgroundWorkPriority(priority);
             std::lock_guard<std::mutex> lock(g_schedulersMutex);
             g_schedulers.push_back(this);
         }
@@ -303,6 +313,61 @@ namespace
             return WaitOn(mutex, cv, [&]() { return entries.size() >= count; }, "completion wait");
         }
     };
+
+    // Waits for the delivery of `handle` while watching the scheduler threads
+    // that work on it, for the tests of the priority policy (which run with
+    // BackgroundMode). A thread seen in background mode for the request (its
+    // published flag set and its OS priority below normal) is recorded and then
+    // raised above normal through its handle, as Shutdown raises threads:
+    // on a machine whose CPUs are all busy with normal-priority work it would
+    // otherwise run only on the OS starvation boost, every few seconds, and the
+    // wait would depend on that load instead of on the scheduler. The raise
+    // changes only the CPU priority; the I/O priority stays very low (see the
+    // read-back in Fixture). On an idle
+    // machine the work usually finishes between two looks; the callback then
+    // records its own priority, so a test accepts either observation.
+    struct BackgroundWorkSeen
+    {
+        bool delivered { false };
+        bool read { false };    // prefetch read seen in background mode
+        bool decode { false };  // decode or delivery seen in background mode
+    };
+
+    BackgroundWorkSeen WatchBackgroundWork(const DecodeScheduler& scheduler, Completions& done, uint64_t handle)
+    {
+        using Diagnostics = DecodeScheduler::Diagnostics;
+        BackgroundWorkSeen seen;
+        const auto delivered = [&]()
+        {
+            std::lock_guard<std::mutex> lock(done.mutex);
+            return std::any_of(done.entries.begin(), done.entries.end(),
+                [&](const Completions::Entry& entry) { return entry.handle == handle; });
+        };
+        const auto deadline = std::chrono::steady_clock::now() + kWaitTimeout;
+        while (!(seen.delivered = delivered()))
+        {
+            if (std::chrono::steady_clock::now() >= deadline)
+            {
+                ReportStall("background work");
+                break;
+            }
+            for (const auto& thread : scheduler.GetDiagnostics().threads)
+            {
+                if (thread.handle != handle || !thread.backgroundMode || thread.priority >= THREAD_PRIORITY_NORMAL)
+                {
+                    continue;
+                }
+                (thread.role == Diagnostics::Role::Prefetch ? seen.read : seen.decode) = true;
+                if (HANDLE os = OpenThread(THREAD_SET_INFORMATION, FALSE, thread.threadId))
+                {
+                    (void)SetThreadPriority(os, THREAD_PRIORITY_ABOVE_NORMAL);
+                    CloseHandle(os);
+                }
+            }
+            Sleep(1);
+        }
+        return seen;
+    }
 
     // Fails the process with a message if a scope outlives `limit`. Scheduler
     // destruction joins its threads, which cannot be bounded from the test; a
@@ -489,26 +554,31 @@ IC_TEST(DecodeScheduler_SingleWorkerPrioritiesPerTask)
 {
     const auto& files = Files();
     Completions done;
+    BackgroundWorkSeen first;
+    BackgroundWorkSeen third;
     {
-        TestScheduler scheduler;
+        TestScheduler scheduler(BackgroundWorkPriority::BackgroundMode);
         scheduler.SetThreadCount(1);
 
         scheduler.Enqueue(MakeTask(files.thumbs[0], ImagePurpose::Thumbnail, 1, done.Callback(1)));
-        IC_REQUIRE(done.WaitFor(1));
+        first = WatchBackgroundWork(scheduler, done, 1);
+        IC_REQUIRE(first.delivered);
         scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 2, done.Callback(2)));
         IC_REQUIRE(done.WaitFor(2));
         scheduler.Enqueue(MakeTask(files.thumbs[1], ImagePurpose::Thumbnail, 3, done.Callback(3)));
-        IC_REQUIRE(done.WaitFor(3));
+        third = WatchBackgroundWork(scheduler, done, 3);
+        IC_REQUIRE(third.delivered);
     }
 
-    // Background work runs below normal priority; full-resolution work keeps the
-    // worker's above-normal priority, including after a background task.
+    // Background work runs below normal priority (seen by the watcher, or by
+    // the callback); full-resolution work keeps the worker's above-normal
+    // priority, including after a background task.
     IC_CHECK(done.entries[0].handle == 1);
-    IC_CHECK(done.entries[0].threadPriority < THREAD_PRIORITY_NORMAL);
+    IC_CHECK(first.decode || done.entries[0].threadPriority < THREAD_PRIORITY_NORMAL);
     IC_CHECK(done.entries[1].handle == 2);
     IC_CHECK(done.entries[1].threadPriority == THREAD_PRIORITY_ABOVE_NORMAL);
     IC_CHECK(done.entries[2].handle == 3);
-    IC_CHECK(done.entries[2].threadPriority < THREAD_PRIORITY_NORMAL);
+    IC_CHECK(third.decode || done.entries[2].threadPriority < THREAD_PRIORITY_NORMAL);
 }
 
 IC_TEST(DecodeScheduler_SingleWorkerPrefersQueuedFullResolution)
@@ -990,8 +1060,9 @@ IC_TEST(DecodeScheduler_StolenFullResolutionRunsAboveNormal)
     bool released = false;
     DWORD gatedThread = 0;
     DWORD otherThread = 0;
+    BackgroundWorkSeen thumbnail;
     {
-        TestScheduler scheduler;
+        TestScheduler scheduler(BackgroundWorkPriority::BackgroundMode);
         scheduler.SetThreadCount(2);  // one high-priority worker + one background worker
         GateRelease releaseOnExit { gateMutex, gateCv, released };
 
@@ -1027,7 +1098,8 @@ IC_TEST(DecodeScheduler_StolenFullResolutionRunsAboveNormal)
 
         // Background work afterwards still runs in background mode.
         IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[2], ImagePurpose::Thumbnail, 3, done.Callback(3))));
-        IC_REQUIRE(done.WaitFor(3));
+        thumbnail = WatchBackgroundWork(scheduler, done, 3);
+        IC_REQUIRE(thumbnail.delivered);
     }
 
     IC_CHECK(gatedThread != 0 && otherThread != 0 && gatedThread != otherThread);
@@ -1036,7 +1108,7 @@ IC_TEST(DecodeScheduler_StolenFullResolutionRunsAboveNormal)
     {
         if (entry.handle == 3)
         {
-            IC_CHECK(entry.threadPriority < THREAD_PRIORITY_NORMAL);
+            IC_CHECK(thumbnail.decode || entry.threadPriority < THREAD_PRIORITY_NORMAL);
         }
         else
         {
@@ -1531,6 +1603,76 @@ namespace
     }
 }
 
+namespace
+{
+    // Filesystem byte source that records the reading thread's priority.
+    class PriorityRecordingSource final : public ScopedFileByteSource
+    {
+    public:
+        using ScopedFileByteSource::ReadAll;
+
+        std::vector<uint8_t> ReadAll(const std::wstring& path) const override
+        {
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_priorities.push_back(GetThreadPriority(GetCurrentThread()));
+            }
+            return ScopedFileByteSource::ReadAll(path);
+        }
+
+        std::vector<int> Priorities() const
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            return m_priorities;
+        }
+
+    private:
+        mutable std::mutex m_mutex;
+        mutable std::vector<int> m_priorities;
+    };
+}
+
+IC_TEST(DecodeScheduler_BackgroundWorkPriorityAppliesToReadAndDecode)
+{
+    // The thread mode of thumbnail work (the prefetch read and the background
+    // decode) follows SetBackgroundWorkPriority: background mode reads below
+    // normal, the Normal test seam at normal priority. Full-resolution work runs
+    // above normal in both.
+    const auto& files = Files();
+    for (const auto priority : { BackgroundWorkPriority::BackgroundMode, BackgroundWorkPriority::Normal })
+    {
+        const bool backgroundMode = priority == BackgroundWorkPriority::BackgroundMode;
+        Completions done;
+        PriorityRecordingSource source;
+        BackgroundWorkSeen seen;
+        {
+            TestScheduler scheduler(priority);
+            scheduler.SetThreadCount(1);
+            IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[3], ImagePurpose::Thumbnail, 1, done.Callback(1))));
+            seen = WatchBackgroundWork(scheduler, done, 1);
+            IC_REQUIRE(seen.delivered);
+            IC_REQUIRE(scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 2, done.Callback(2))));
+            IC_REQUIRE(done.WaitFor(2));
+        }
+
+        const auto reads = source.Priorities();
+        IC_REQUIRE(reads.size() == 1);  // the thumbnail prefetch (full resolution reads the file itself)
+        IC_REQUIRE(done.entries.size() == 2);
+        if (backgroundMode)
+        {
+            IC_CHECK(seen.read || reads[0] < THREAD_PRIORITY_NORMAL);
+            IC_CHECK(seen.decode || done.entries[0].threadPriority < THREAD_PRIORITY_NORMAL);
+        }
+        else
+        {
+            IC_CHECK(!seen.read && !seen.decode);
+            IC_CHECK(reads[0] == THREAD_PRIORITY_NORMAL);
+            IC_CHECK(done.entries[0].threadPriority == THREAD_PRIORITY_NORMAL);
+        }
+        IC_CHECK(done.entries[1].threadPriority == THREAD_PRIORITY_ABOVE_NORMAL);
+    }
+}
+
 IC_TEST(DecodeScheduler_IdleThreadsWaitOutsideBackgroundMode)
 {
     // A thread waiting in background mode would wake (for a stolen full-
@@ -1540,23 +1682,48 @@ IC_TEST(DecodeScheduler_IdleThreadsWaitOutsideBackgroundMode)
     // thread wait at normal priority or above.
     const auto& files = Files();
     Completions done;
-    TestScheduler scheduler;
+    TestScheduler scheduler(BackgroundWorkPriority::BackgroundMode);
     const auto before = ProcessThreadIds();
     scheduler.SetThreadCount(3);  // high-priority worker, two background workers
 
     // Through the prefetch read and a background decode, then idle again.
     IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[2], ImagePurpose::Thumbnail, 1, done.Callback(1))));
-    IC_REQUIRE(done.WaitFor(1));
-    IC_CHECK(done.entries[0].threadPriority < THREAD_PRIORITY_NORMAL);
+    const auto seen = WatchBackgroundWork(scheduler, done, 1);
+    IC_REQUIRE(seen.delivered);
+    IC_CHECK(seen.decode || done.entries[0].threadPriority < THREAD_PRIORITY_NORMAL);
 
-    // The decoding worker leaves background mode just after its callback.
+    // The decoding worker leaves background mode just after its callback. A
+    // thread the watcher raised reads above normal while still in the mode,
+    // so the published flag (cleared only after THREAD_MODE_BACKGROUND_END)
+    // must be clear as well. A thread still in the mode is raised again, so
+    // that leaving it does not wait for the starvation boost.
+    const auto inBackgroundMode = [&]()
+    {
+        bool any = false;
+        for (const auto& thread : scheduler.GetDiagnostics().threads)
+        {
+            if (thread.backgroundMode)
+            {
+                any = true;
+                if (HANDLE os = OpenThread(THREAD_SET_INFORMATION, FALSE, thread.threadId))
+                {
+                    (void)SetThreadPriority(os, THREAD_PRIORITY_ABOVE_NORMAL);
+                    CloseHandle(os);
+                }
+            }
+        }
+        return any;
+    };
     const auto deadline = std::chrono::steady_clock::now() + kWaitTimeout;
+    bool background = inBackgroundMode();
     int lowest = LowestThreadPriority(before);
-    while (lowest < THREAD_PRIORITY_NORMAL && std::chrono::steady_clock::now() < deadline)
+    while ((background || lowest < THREAD_PRIORITY_NORMAL) && std::chrono::steady_clock::now() < deadline)
     {
         Sleep(1);
+        background = inBackgroundMode();
         lowest = LowestThreadPriority(before);
     }
+    IC_CHECK(!background);
     IC_CHECK(lowest >= THREAD_PRIORITY_NORMAL);
 }
 
@@ -3511,7 +3678,7 @@ IC_TEST(ReadCancel_ShutdownRaisesInFlightBackgroundDecode)
     std::atomic<int> before { THREAD_PRIORITY_ERROR_RETURN };
     std::atomic<int> after { THREAD_PRIORITY_ERROR_RETURN };
 
-    TestScheduler scheduler;
+    TestScheduler scheduler(BackgroundWorkPriority::BackgroundMode);
     scheduler.SetThreadCount(1);
     IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[0], ImagePurpose::Thumbnail, 1,
         [&](PipelineResult&&)
@@ -3543,7 +3710,7 @@ IC_TEST(ReadCancel_ShutdownRaisesInFlightPrefetchRead)
     PriorityProbeSource source(files.thumbs[1]);
     Completions done;
 
-    TestScheduler scheduler;
+    TestScheduler scheduler(BackgroundWorkPriority::BackgroundMode);
     scheduler.SetThreadCount(1);
     IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[1], ImagePurpose::Thumbnail, 1, done.Callback(1))));
     IC_REQUIRE(source.WaitEntered());
@@ -3556,10 +3723,10 @@ IC_TEST(ReadCancel_ShutdownRaisesInFlightPrefetchRead)
 }
 
 // ---------------------------------------------------------------------------
-// Shutdown under CPU saturation (floyd68/ImageCore#21). Opt-in: it loads every
-// logical CPU for several seconds, so it is in no CTest group and does nothing
-// unless IMAGECORE_LOAD_TESTS=1. Run it with
-//   set IMAGECORE_LOAD_TESTS=1 && ImageCoreTests LoadShutdown_
+// Shutdown and thumbnail progress under CPU saturation (floyd68/ImageCore#21,
+// #24). Opt-in: they load every logical CPU for several seconds, so they are in
+// no CTest group and do nothing unless IMAGECORE_LOAD_TESTS=1. Run them with
+//   set IMAGECORE_LOAD_TESTS=1 && ImageCoreTests Load
 
 namespace
 {
@@ -3621,7 +3788,7 @@ IC_TEST(LoadShutdown_BoundedUnderCpuSaturation)
     constexpr int kRounds = 10;
     for (int round = 0; round < kRounds; ++round)
     {
-        TestScheduler scheduler;
+        TestScheduler scheduler(BackgroundWorkPriority::BackgroundMode);
         IC_CHECK(scheduler.Shutdown(std::chrono::milliseconds(2000)));
         scheduler.SetThreadCount(1 + (round % 2));
         IC_REQUIRE(scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution,
@@ -3640,7 +3807,7 @@ IC_TEST(LoadShutdown_BoundedUnderCpuSaturation)
     {
         const auto cycleStart = std::chrono::steady_clock::now();
         {
-            TestScheduler scheduler;
+            TestScheduler scheduler(BackgroundWorkPriority::BackgroundMode);
             scheduler.SetThreadCount(1 + (cycle % 2));
         }
         cycleMs.push_back(std::chrono::duration<double, std::milli>(
@@ -3651,6 +3818,70 @@ IC_TEST(LoadShutdown_BoundedUnderCpuSaturation)
     std::printf("  %d cycles under load: total %.0f ms, median %.1f ms, max %.1f ms\n",
         kCycles, totalMs, cycleMs[cycleMs.size() / 2], cycleMs.back());
     IC_CHECK(cycleMs.back() < 2000.0);
+}
+
+IC_TEST(LoadProgress_ThumbnailsUnderCpuSaturation)
+{
+    // Thumbnail progress under CPU saturation (floyd68/ImageCore#24), opt-in
+    // like LoadShutdown_. At normal priority (the TestScheduler default) the
+    // scheduler threads get their share of the loaded CPUs, so the
+    // scheduling-logic tests keep their progress deadlines. In background mode
+    // (production) the work advances only on the OS starvation boost; that is
+    // measured and printed, not held to a deadline (floyd68/ImageCore#15).
+    if (!LoadTestsEnabled())
+    {
+        std::printf("  skipped: set IMAGECORE_LOAD_TESTS=1 to run\n");
+        return;
+    }
+    const auto& files = Files();
+    Watchdog watchdog("thumbnail progress under CPU saturation", std::chrono::seconds(300));
+    CpuSaturation load;
+
+    for (const size_t workers : { size_t { 1 }, size_t { 3 } })
+    {
+        Completions done;
+        ScopedFileByteSource source;
+        TestScheduler scheduler;
+        scheduler.SetThreadCount(workers);
+        const auto start = std::chrono::steady_clock::now();
+        uint64_t handle = 0;
+        for (const auto& path : files.thumbs)
+        {
+            ++handle;
+            IC_REQUIRE(scheduler.Enqueue(MakeTask(path, ImagePurpose::Thumbnail, handle, done.Callback(handle))));
+        }
+        IC_REQUIRE(done.WaitFor(files.thumbs.size()));
+        std::printf("  normal priority, %zu worker(s): %zu thumbnails in %.0f ms\n", workers, files.thumbs.size(),
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+    }
+
+    {
+        constexpr size_t kCount = 4;
+        Completions done;
+        ScopedFileByteSource source;
+        TestScheduler scheduler(BackgroundWorkPriority::BackgroundMode);
+        scheduler.SetThreadCount(1);
+        const auto start = std::chrono::steady_clock::now();
+        for (uint64_t handle = 1; handle <= kCount; ++handle)
+        {
+            IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[handle], ImagePurpose::Thumbnail, handle,
+                done.Callback(handle))));
+        }
+        size_t withinDeadline = 0;
+        bool all = false;
+        {
+            std::unique_lock<std::mutex> lock(done.mutex);
+            (void)done.cv.wait_until(lock, start + kWaitTimeout, [&]() { return done.entries.size() >= kCount; });
+            withinDeadline = done.entries.size();
+            all = done.cv.wait_until(lock, start + std::chrono::seconds(120),
+                [&]() { return done.entries.size() >= kCount; });
+        }
+        std::printf("  background mode, 1 worker: %zu of %zu thumbnails within %lld s, all %s after %.0f ms\n",
+            withinDeadline, kCount, static_cast<long long>(kWaitTimeout.count()), all ? "delivered" : "NOT delivered",
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+        // Background-mode work is starved, not stopped: the boost moves it on.
+        IC_CHECK(all);
+    }
 }
 
 IC_TEST(ReadCancel_StopCallbackDuringShutdownMayReenterScheduler)
