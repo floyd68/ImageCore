@@ -3859,6 +3859,13 @@ IC_TEST(LoadProgress_ThumbnailsUnderCpuSaturation)
             IC_REQUIRE(scheduler.Enqueue(MakeTask(path, ImagePurpose::Thumbnail, handle, done.Callback(handle))));
         }
         IC_REQUIRE(done.WaitFor(files.thumbs.size()));
+        {
+            std::lock_guard<std::mutex> lock(done.mutex);
+            for (const auto& entry : done.entries)
+            {
+                IC_CHECK(SUCCEEDED(entry.hr));
+            }
+        }
         std::printf("  normal priority, %zu worker(s): %zu thumbnails in %.0f ms\n", workers, files.thumbs.size(),
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
     }
@@ -3883,6 +3890,10 @@ IC_TEST(LoadProgress_ThumbnailsUnderCpuSaturation)
             withinDeadline = done.entries.size();
             all = done.cv.wait_until(lock, start + std::chrono::seconds(120),
                 [&]() { return done.entries.size() >= kCount; });
+            for (const auto& entry : done.entries)
+            {
+                IC_CHECK(SUCCEEDED(entry.hr));
+            }
         }
         std::printf("  background mode, 1 worker: %zu of %zu thumbnails within %lld s, all %s after %.0f ms\n",
             withinDeadline, kCount, static_cast<long long>(kWaitTimeout.count()), all ? "delivered" : "NOT delivered",
