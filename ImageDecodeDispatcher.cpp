@@ -1094,3 +1094,8 @@ void ImageCore::ImageDecodeDispatcher::ReleaseThreadResources()
 {
     ThreadWicFactorySlot().Reset();
 }
+
+bool ImageCore::ImageDecodeDispatcher::HasThreadResources()
+{
+    return ThreadWicFactorySlot() != nullptr;
+}

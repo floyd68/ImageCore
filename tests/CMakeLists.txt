@@ -5,6 +5,7 @@ add_executable(ImageCoreTests
     TestHarness.h
     TestMain.cpp
     DdsMipSelectionTests.cpp
+    DecodeRoutingTests.cpp
     DecodeSchedulerTests.cpp
     ImageLoaderTests.cpp
     IoLaneTests.cpp
@@ -35,9 +36,10 @@ add_test(NAME ImageCore.Lanes COMMAND ImageCoreTests Lanes_)
 add_test(NAME ImageCore.Log COMMAND ImageCoreTests Log_)
 add_test(NAME ImageCore.SrgbConversion COMMAND ImageCoreTests SrgbConversion_)
 add_test(NAME ImageCore.DdsMipSelection COMMAND ImageCoreTests DdsMip_)
+add_test(NAME ImageCore.DecodeRouting COMMAND ImageCoreTests DecodeRouting_)
 # ImageLoader is a process singleton whose Shutdown is final: own process.
 add_test(NAME ImageCore.ImageLoader COMMAND ImageCoreTests ImageLoader_)
 # Safety net only: every wait inside the tests is bounded (10 s; 20 s in the
 # lane tests, each also under a 180 s watchdog).
-set_tests_properties(ImageCore.DecodeScheduler ImageCore.ReadCancel ImageCore.Log ImageCore.SrgbConversion ImageCore.DdsMipSelection ImageCore.ImageLoader PROPERTIES TIMEOUT 120)
+set_tests_properties(ImageCore.DecodeScheduler ImageCore.ReadCancel ImageCore.Log ImageCore.SrgbConversion ImageCore.DdsMipSelection ImageCore.DecodeRouting ImageCore.ImageLoader PROPERTIES TIMEOUT 120)
 set_tests_properties(ImageCore.Lanes PROPERTIES TIMEOUT 600)
