@@ -1570,7 +1570,7 @@ namespace ImageCore
                     slot->Publish(Diagnostics::Phase::Decoding, task.handle);
                     try
                     {
-                        result = dispatcher.Decode(task.request, nullptr, input);
+                        result = dispatcher.Decode(task.request, input);
                     }
                     catch (...)
                     {
