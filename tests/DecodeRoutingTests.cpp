@@ -354,3 +354,44 @@ IC_TEST(DecodeRouting_InMemoryAndPathOnlyRequests)
         }
     }
 }
+
+// A valid DDS saved under another supported extension still decodes: the
+// DirectXTex loader follows the detected format, not the extension, for
+// path-only and in-memory input, and WIC (excluded by the DDS magic) is not
+// involved.
+IC_TEST(DecodeRouting_ValidDdsWithAMismatchingExtensionDecodes)
+{
+    const std::vector<uint8_t> dds = Encode(Format::Dds, kWidth, kHeight);
+    const Outcome reference = Decode(WriteFile(L"reference.dds", dds), ImagePurpose::FullResolution, {});
+    IC_REQUIRE(SUCCEEDED(reference.hr));
+
+    for (const wchar_t* ext : { L".png", L".jpg", L".tga" })
+    {
+        const std::wstring onDisk = WriteFile(std::wstring(L"renamed") + ext, dds);
+        const std::wstring missing = (TempDir() / (std::wstring(L"missing_renamed") + ext)).wstring();
+        IC_REQUIRE(!std::filesystem::exists(missing));
+        for (const ImagePurpose purpose : { ImagePurpose::Thumbnail, ImagePurpose::FullResolution })
+        {
+            const bool thumb = (purpose == ImagePurpose::Thumbnail);
+            const uint32_t expectedWidth = thumb ? static_cast<uint32_t>(kThumbTarget) : static_cast<uint32_t>(kWidth);
+            const uint32_t expectedHeight = thumb ? static_cast<uint32_t>(kThumbTarget / 2) : static_cast<uint32_t>(kHeight);
+            const Outcome pathOnly = Decode(onDisk, purpose, {});
+            const Outcome inMemory = Decode(missing, purpose, dds);
+            for (const Outcome* outcome : { &pathOnly, &inMemory })
+            {
+                if (FAILED(outcome->hr))
+                {
+                    std::fprintf(stderr, "  %ls decode failed: hr=0x%08lX\n", ext, static_cast<unsigned long>(outcome->hr));
+                }
+                IC_CHECK(SUCCEEDED(outcome->hr));
+                IC_CHECK(outcome->width == expectedWidth && outcome->height == expectedHeight);
+                IC_CHECK(!outcome->wicFactoryAfter);
+            }
+            IC_CHECK(pathOnly.pixels == inMemory.pixels);
+            if (!thumb)
+            {
+                IC_CHECK(pathOnly.pixels == reference.pixels);
+            }
+        }
+    }
+}

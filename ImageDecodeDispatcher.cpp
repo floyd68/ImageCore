@@ -393,14 +393,30 @@ namespace ImageCore
                 }
             }
 
+            // The DirectXTex loader for a file: chosen by its detected format
+            // (magic), so a DDS saved under another extension still decodes
+            // here; the extension decides only when the magic does not (TGA
+            // has none).
+            static std::wstring DirectXTexLoaderExtension(const std::wstring& path, std::span<const uint8_t> header)
+            {
+                switch (ImageFormatDetector::DetectByMagic(header).format)
+                {
+                case ImageFormat::DDS: return L".dds";
+                case ImageFormat::HDR: return L".hdr";
+                case ImageFormat::EXR: return L".exr";
+                default: return ImageFormatDetector::GetLowerExtension(path);
+                }
+            }
+
             static HRESULT LoadWithDirectXTex(
                 const ImageRequest& request,
-                std::span<const uint8_t> bytes,
+                const DecodeInput& input,
                 DirectX::ScratchImage& scratchImage,
                 DirectX::TexMetadata& metadata)
             {
                 const std::wstring& path = request.source;
-                const std::wstring ext = ImageFormatDetector::GetLowerExtension(path);
+                const std::span<const uint8_t> bytes = input.bytes;
+                const std::wstring ext = DirectXTexLoaderExtension(path, input.header);
                 if (ext == L".dds")
                 {
                     DirectX::TexMetadata sourceMetadata {};
@@ -629,7 +645,7 @@ namespace ImageCore
 
                 DirectX::ScratchImage scratchImage;
                 DirectX::TexMetadata metadata;
-                HRESULT hr = LoadWithDirectXTex(request, input.bytes, scratchImage, metadata);
+                HRESULT hr = LoadWithDirectXTex(request, input, scratchImage, metadata);
                 if (FAILED(hr))
                 {
                     return PipelineResult(hr);
@@ -755,7 +771,7 @@ namespace ImageCore
 
                 DirectX::ScratchImage scratchImage;
                 DirectX::TexMetadata metadata;
-                HRESULT hr = LoadWithDirectXTex(request, input.bytes, scratchImage, metadata);
+                HRESULT hr = LoadWithDirectXTex(request, input, scratchImage, metadata);
                 if (FAILED(hr))
                 {
                     return PipelineResult(hr);
@@ -999,16 +1015,44 @@ namespace ImageCore
         {
             return PipelineResult(E_INVALIDARG);
         }
-        const std::wstring extension =
-            ImageFormatDetector::GetLowerExtension(
-                request.source);
-        if (request.mipLevel != 0 &&
-            extension != L".dds")
+
+        // safe even if app already called it
+        RegisterBuiltInDecoders();
+
+        // Prefer explicit header bytes if available (avoids extra disk I/O in the dispatcher).
+        // Otherwise fall back to ProbeFile(path).
+        static ImageFormatDetector s_detector;
+        FormatProbe probe {};
+        if (!input.header.empty())
+        {
+            probe.header.assign(input.header.begin(), input.header.end());
+            probe.extensionLower = ImageFormatDetector::GetLowerExtension(request.source);
+            probe.info = ImageFormatDetector::DetectByMagic(probe.header);
+            if (probe.info.format == ImageFormat::Unknown && !probe.extensionLower.empty())
+            {
+                probe.info = ImageFormatDetector::DetectByExtension(probe.extensionLower);
+            }
+        }
+        else
+        {
+            probe = s_detector.ProbeFile(request.source);
+        }
+
+        // Decoders get the probed header, so they route by the detected
+        // format as the candidate factories do (a path-only request has none).
+        DecodeInput routed = input;
+        if (routed.header.empty())
+        {
+            routed.header = std::span<const uint8_t>(probe.header.data(), probe.header.size());
+        }
+
+        // Mips exist only in DDS, detected by magic first as the decoders do.
+        const bool isDds = probe.info.format == ImageFormat::DDS;
+        if (request.mipLevel != 0 && !isDds)
         {
             return PipelineResult(E_INVALIDARG);
         }
-        if (request.mipLevel != 0 &&
-            extension == L".dds")
+        if (request.mipLevel != 0)
         {
             DirectX::TexMetadata metadata {};
             HRESULT metadataResult = E_FAIL;
@@ -1039,28 +1083,6 @@ namespace ImageCore
             }
         }
 
-        // safe even if app already called it
-        RegisterBuiltInDecoders();
-
-        // Prefer explicit header bytes if available (avoids extra disk I/O in the dispatcher).
-        // Otherwise fall back to ProbeFile(path).
-        static ImageFormatDetector s_detector;
-        FormatProbe probe {};
-        if (!input.header.empty())
-        {
-            probe.header.assign(input.header.begin(), input.header.end());
-            probe.extensionLower = ImageFormatDetector::GetLowerExtension(request.source);
-            probe.info = ImageFormatDetector::DetectByMagic(probe.header);
-            if (probe.info.format == ImageFormat::Unknown && !probe.extensionLower.empty())
-            {
-                probe.info = ImageFormatDetector::DetectByExtension(probe.extensionLower);
-            }
-        }
-        else
-        {
-            probe = s_detector.ProbeFile(request.source);
-        }
-
         HRESULT lastHr = E_FAIL;
         auto factories = DecoderRegistry::Instance().GetCandidateFactories(request, probe.header);
 
@@ -1077,7 +1099,7 @@ namespace ImageCore
                 continue;
             }
 
-            PipelineResult result = decoder->Decode(request, input);
+            PipelineResult result = decoder->Decode(request, routed);
             lastHr = result.hr;
             if (SUCCEEDED(result.hr))
             {
