@@ -143,12 +143,22 @@ namespace
     // priority policy itself is tested with BackgroundMode explicitly.
     using BackgroundWorkPriority = DecodeScheduler::BackgroundWorkPriority;
 
+    //
+    // Volume topology is fixed too, so lane keys and admission do not depend
+    // on the disk that holds the temp directory: every volume is its own
+    // device without a seek penalty (prefetch depth 4). Lane tests replace it.
+    DecodeScheduler::VolumeTopology SolidStatePerVolume(const std::wstring& volume)
+    {
+        return { L"test-ssd:" + volume, false };
+    }
+
     class TestScheduler : public DecodeScheduler
     {
     public:
         explicit TestScheduler(BackgroundWorkPriority priority = BackgroundWorkPriority::Normal)
         {
             SetBackgroundWorkPriority(priority);
+            SetVolumeTopologyQuery(&SolidStatePerVolume);
             std::lock_guard<std::mutex> lock(g_schedulersMutex);
             g_schedulers.push_back(this);
         }
@@ -173,6 +183,7 @@ namespace
         case Role::Shared: return "shared";
         case Role::Prefetch: return "prefetch";
         case Role::StopDispatch: return "stop-dispatch";
+        case Role::MainReader: return "main-reader";
         }
         return "?";
     }
@@ -185,7 +196,6 @@ namespace
         case Phase::Starting: return "starting";
         case Phase::Idle: return "idle";
         case Phase::Taken: return "taken";
-        case Phase::WaitingForSlot: return "waiting-for-slot";
         case Phase::Reading: return "reading";
         case Phase::Decoding: return "decoding";
         case Phase::Delivering: return "delivering";
@@ -216,9 +226,9 @@ namespace
     void PrintDiagnostics(size_t index, const char* when, const DecodeScheduler::Diagnostics& state,
         const DecodeScheduler::Diagnostics* earlier)
     {
-        std::fprintf(stderr, "  scheduler %zu %s: shutdown=%d queued high=%zu io=%zu decode=%zu live=%zu admitted=%zu/%zu\n",
-            index, when, state.shutdown ? 1 : 0, state.highQueued, state.ioQueued, state.decodeQueued,
-            state.liveRequests, state.prefetchedTasks, state.prefetchCap);
+        std::fprintf(stderr, "  scheduler %zu %s: shutdown=%d queued high=%zu io=%zu main-io=%zu decode=%zu live=%zu admitted=%zu+%zu reads/%zu main=%zu lanes=%zu\n",
+            index, when, state.shutdown ? 1 : 0, state.highQueued, state.ioQueued, state.mainIoQueued, state.decodeQueued,
+            state.liveRequests, state.prefetchedTasks, state.prefetchReads, state.prefetchCap, state.mainInputs, state.lanes);
         if (!state.threadsListed)
         {
             std::fprintf(stderr, "    threads not listed (restart or shutdown in progress)\n");
@@ -226,8 +236,8 @@ namespace
         for (size_t t = 0; t < state.threads.size(); ++t)
         {
             const auto& thread = state.threads[t];
-            std::fprintf(stderr, "    thread %lu %-13s %-16s handle=%llu background=%d priority=%d cpu=%.1f ms",
-                thread.threadId, RoleName(thread.role), PhaseName(thread.phase),
+            std::fprintf(stderr, "    thread %lu %-13s lane=%d %-16s handle=%llu background=%d priority=%d cpu=%.1f ms",
+                thread.threadId, RoleName(thread.role), static_cast<int>(thread.lane), PhaseName(thread.phase),
                 static_cast<unsigned long long>(thread.handle), thread.backgroundMode ? 1 : 0, thread.priority,
                 thread.cpuMs);
             if (earlier && t < earlier->threads.size() && earlier->threads[t].threadId == thread.threadId)
@@ -2222,7 +2232,6 @@ namespace
         explicit ControlledSource(const std::filesystem::path& dir)
             : m_previous(GetPathByteSource())
             , m_dir(dir)
-            , m_host((dir / L"pack.zip").wstring())
             , m_event(CreateEventW(nullptr, TRUE, FALSE, nullptr))
         {
             (void)CreatePipe(&m_pipeRead, &m_pipeWrite, nullptr, 0);
@@ -2243,9 +2252,10 @@ namespace
             CloseHandle(m_event);
         }
 
-        std::wstring Entry(const std::wstring& realPath) const
+        // `realPath` as an entry of `<dir>\<archive>` (any name ending in .zip).
+        std::wstring Entry(const std::wstring& realPath, const std::wstring& archive = L"pack.zip") const
         {
-            return m_host + L"\\" + std::filesystem::path(realPath).filename().wstring();
+            return (m_dir / archive).wstring() + L"\\" + std::filesystem::path(realPath).filename().wstring();
         }
 
         void SetMode(const std::wstring& path, Mode mode, int times = 1, bool partialOnStop = true)
@@ -2263,7 +2273,8 @@ namespace
 
         std::wstring ResolveHostPath(const std::wstring& path) const override
         {
-            return IsVirtual(path) ? m_host : path;
+            const std::wstring host = HostOf(path);
+            return host.empty() ? path : host;
         }
 
         std::vector<uint8_t> ReadAll(const std::wstring& path) const override
@@ -2389,9 +2400,26 @@ namespace
             DWORD lastThread { 0 };
         };
 
+        // `<dir>\<name>.zip` for a path `<dir>\<name>.zip\<entry>`, else empty.
+        std::wstring HostOf(const std::wstring& path) const
+        {
+            const std::wstring prefix = m_dir.wstring() + L"\\";
+            if (path.size() <= prefix.size() || path.compare(0, prefix.size(), prefix) != 0)
+            {
+                return {};
+            }
+            const size_t slash = path.find(L'\\', prefix.size());
+            if (slash == std::wstring::npos || slash + 1 >= path.size() || slash < prefix.size() + 4 ||
+                path.compare(slash - 4, 4, L".zip") != 0)
+            {
+                return {};
+            }
+            return path.substr(0, slash);
+        }
+
         bool IsVirtual(const std::wstring& path) const
         {
-            return path.size() > m_host.size() && path.compare(0, m_host.size(), m_host) == 0;
+            return !HostOf(path).empty();
         }
 
         std::vector<uint8_t> Load(const std::wstring& path) const
@@ -2533,7 +2561,6 @@ namespace
 
         IPathByteSource* m_previous;
         std::filesystem::path m_dir;
-        std::wstring m_host;
         HANDLE m_event { nullptr };
         HANDLE m_pipeRead { nullptr };
         HANDLE m_pipeWrite { nullptr };
@@ -2741,8 +2768,9 @@ IC_TEST(ReadCancel_PreCanceledRequestsNeverReadOrDecode)
 {
     // Requests canceled while still queued are never read, never decoded and
     // never delivered: thumbnails (plain file and archive entry) behind a blocked
-    // prefetch read, and full-resolution requests (archive and plain file)
-    // behind a held worker.
+    // read of their lane, a full-resolution archive request behind a blocked
+    // main-image read of its archive, and a plain full-resolution request behind
+    // a held worker.
     const auto& files = Files();
     Completions done;
     HookProbe probe;
@@ -2750,10 +2778,14 @@ IC_TEST(ReadCancel_PreCanceledRequestsNeverReadOrDecode)
     Watchdog watchdog("pre-canceled requests", std::chrono::seconds(60));
     ControlledSource source(files.dir);
     const std::wstring blocker = source.Entry(files.thumbs[4]);
+    const std::wstring plainBlocker = files.thumbs[8];
+    const std::wstring fullBlocker = source.Entry(files.thumbs[9]);
     const std::wstring plainThumb = files.thumbs[5];
     const std::wstring archiveThumb = source.Entry(files.thumbs[6]);
     const std::wstring archiveFull = source.Entry(files.thumbs[7]);
     source.SetMode(blocker, Mode::Cooperative);
+    source.SetMode(plainBlocker, Mode::Cooperative);
+    source.SetMode(fullBlocker, Mode::Cooperative);
     {
         TestScheduler scheduler;
         scheduler.SetTestHook(probe.Hook());
@@ -2763,7 +2795,11 @@ IC_TEST(ReadCancel_PreCanceledRequestsNeverReadOrDecode)
         IC_REQUIRE(scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 1, gate.Callback(done, 1))));
         IC_REQUIRE(gate.WaitEntered());
         IC_REQUIRE(scheduler.Enqueue(MakeTask(blocker, ImagePurpose::Thumbnail, 2, done.Callback(2))));
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(plainBlocker, ImagePurpose::Thumbnail, 3, done.Callback(3))));
+        IC_REQUIRE(scheduler.Enqueue(MakeTask(fullBlocker, ImagePurpose::FullResolution, 4, done.Callback(4))));
         IC_REQUIRE(source.WaitEntered(blocker));
+        IC_REQUIRE(source.WaitEntered(plainBlocker));
+        IC_REQUIRE(source.WaitEntered(fullBlocker));
 
         IC_REQUIRE(scheduler.Enqueue(MakeTask(plainThumb, ImagePurpose::Thumbnail, 10, done.Callback(10))));
         IC_REQUIRE(scheduler.Enqueue(MakeTask(archiveThumb, ImagePurpose::Thumbnail, 11, done.Callback(11))));
@@ -2773,9 +2809,12 @@ IC_TEST(ReadCancel_PreCanceledRequestsNeverReadOrDecode)
         {
             scheduler.Cancel(handle);
         }
-        IC_CHECK(scheduler.LiveRequestCount() == 1);  // the blocked read
+        IC_CHECK(scheduler.LiveRequestCount() == 3);  // the three blocked reads
 
-        scheduler.Cancel(2);
+        for (uint64_t handle = 2; handle <= 4; ++handle)
+        {
+            scheduler.Cancel(handle);
+        }
         gate.Release();
         IC_REQUIRE(done.WaitFor(1));
         IC_REQUIRE(Idle(scheduler));
@@ -2783,7 +2822,7 @@ IC_TEST(ReadCancel_PreCanceledRequestsNeverReadOrDecode)
     IC_CHECK(source.Reads(plainThumb) == 0);
     IC_CHECK(source.Reads(archiveThumb) == 0);
     IC_CHECK(source.Reads(archiveFull) == 0);
-    for (uint64_t handle : { 2u, 10u, 11u, 12u, 13u })
+    for (uint64_t handle : { 2u, 3u, 4u, 10u, 11u, 12u, 13u })
     {
         IC_CHECK(probe.Count(Point::DecodeStart, handle) == 0);
         IC_CHECK(DeliveredHr(done, handle) == E_PENDING);
@@ -3395,11 +3434,11 @@ namespace
 
 IC_TEST(ReadCancel_BoundedShutdownReleasesCooperativeReads)
 {
-    // Reads blocked on their tokens on both decode workers (full resolution)
-    // and on the prefetch thread, a prefetched thumbnail waiting for decode
-    // (holding a prefetch slot) and queued requests: Shutdown(bound) releases the
-    // reads, joins every thread well within the bound, invokes no callback and
-    // leaves no request or slot behind.
+    // Reads blocked on their tokens on both main-image readers (full
+    // resolution, two archives) and on a lane reader, a prefetched thumbnail
+    // waiting for decode (holding a prefetch slot) and queued requests:
+    // Shutdown(bound) releases the reads, joins every thread well within the
+    // bound, invokes no callback and leaves no request or slot behind.
     const auto& files = Files();
     FileByteCache& cache = FileByteCache::Instance();
     Completions done;
@@ -3407,7 +3446,7 @@ IC_TEST(ReadCancel_BoundedShutdownReleasesCooperativeReads)
     Watchdog watchdog("bounded shutdown, cooperative", std::chrono::seconds(60));
     ControlledSource source(files.dir);
     const std::wstring fullB = source.Entry(files.thumbs[25]);
-    const std::wstring fullD = source.Entry(files.thumbs[26]);
+    const std::wstring fullD = source.Entry(files.thumbs[26], L"other.zip");
     const std::wstring thumbA = source.Entry(files.thumbs[27]);
     source.SetMode(fullB, Mode::Cooperative);
     source.SetMode(fullD, Mode::Cooperative);
@@ -3418,22 +3457,33 @@ IC_TEST(ReadCancel_BoundedShutdownReleasesCooperativeReads)
         TestScheduler scheduler;
         scheduler.SetTestHook(probe.Hook());
         scheduler.SetThreadCount(2);
-        OnExit release { [&] { source.Release(); } };
+        OnExit release { [&] { probe.ReleaseAll(); source.Release(); } };
 
+        // Decode workers never read, so both are held where they take a task:
+        // the background worker with the prefetched thumbnail (3, holding its
+        // slot), the full-resolution worker with a local image (6).
+        probe.HoldAt(Point::TaskTaken, 3);
+        probe.HoldAt(Point::TaskTaken, 6);
         IC_REQUIRE(scheduler.Enqueue(MakeTask(fullB, ImagePurpose::FullResolution, 1, done.Callback(1))));
         IC_REQUIRE(source.WaitEntered(fullB));
         IC_REQUIRE(scheduler.Enqueue(MakeTask(fullD, ImagePurpose::FullResolution, 2, done.Callback(2))));
         IC_REQUIRE(source.WaitEntered(fullD));
         IC_REQUIRE(scheduler.Enqueue(MakeTask(source.Entry(files.thumbs[28]), ImagePurpose::Thumbnail, 3, done.Callback(3))));
-        IC_REQUIRE(WaitUntil([&] { return scheduler.PrefetchedTaskCount() == 1; }));
+        IC_REQUIRE(probe.WaitHeld(Point::TaskTaken, 3));
+        IC_REQUIRE(scheduler.PrefetchedTaskCount() == 1);
         IC_REQUIRE(scheduler.Enqueue(MakeTask(thumbA, ImagePurpose::Thumbnail, 4, done.Callback(4))));
         IC_REQUIRE(source.WaitEntered(thumbA));
         IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[29], ImagePurpose::Thumbnail, 5, done.Callback(5))));
         IC_REQUIRE(scheduler.Enqueue(MakeTask(files.fullRes, ImagePurpose::FullResolution, 6, done.Callback(6))));
+        IC_REQUIRE(probe.WaitHeld(Point::TaskTaken, 6));
 
+        // The held workers are let go shortly after Shutdown began; they then
+        // find their requests canceled and decode nothing.
         const auto start = std::chrono::steady_clock::now();
+        std::thread releaser([&] { Sleep(100); probe.ReleaseAll(); });
         ok = scheduler.Shutdown(std::chrono::milliseconds(5000));
         elapsed = ElapsedMs(start);
+        releaser.join();
         IC_CHECK(ok);
         IC_CHECK(elapsed < 2000);
         IC_CHECK(scheduler.WorkerCount() == 0);

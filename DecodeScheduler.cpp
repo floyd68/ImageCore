@@ -25,31 +25,18 @@ namespace ImageCore
         } STORAGE_SEEK_PENALTY_DESCRIPTOR, *PSTORAGE_SEEK_PENALTY_DESCRIPTOR;
 #endif
 
-        static std::wstring GetVolumePathForFilePath(const std::wstring& path)
+        // Device and seek penalty of a volume ("C:"), through its volume device
+        // "\\.\C:". Several volume letters on one disk report the same device
+        // number; a volume the query cannot place (spanned volume, RAM disk,
+        // an unopenable device) is its own device. A failed seek-penalty query
+        // is conservative: seek penalty assumed.
+        static DecodeScheduler::VolumeTopology QueryVolumeTopology(const std::wstring& volume)
         {
-            // Resolve archive display paths to the host archive file for volume queries.
-            std::wstring actualPath = path;
-            if (IPathByteSource* source = GetPathByteSource())
-            {
-                actualPath = source->ResolveHostPath(path);
-            }
+            DecodeScheduler::VolumeTopology topology;
+            topology.device = L"volume:" + volume;
+            topology.incursSeekPenalty = true;
 
-            // Prefer "C:" style volume handle for IOCTL queries.
-            // For UNC paths, fall back to empty (unknown -> conservative).
-            return FileByteCache::GetVolumeForPath(actualPath);
-        }
-
-        static bool QueryIncursSeekPenaltyForVolume(const std::wstring& volume)
-        {
-            if (volume.empty())
-            {
-                return true; // conservative: assume HDD/seek penalty
-            }
-
-            // Open volume device like "\\.\C:"
-            std::wstring devicePath = L"\\\\.\\";
-            devicePath += volume;
-
+            const std::wstring devicePath = L"\\\\.\\" + volume;
             HANDLE h = CreateFileW(
                 devicePath.c_str(),
                 0,
@@ -61,7 +48,16 @@ namespace ImageCore
 
             if (h == INVALID_HANDLE_VALUE)
             {
-                return true;
+                return topology;
+            }
+
+            STORAGE_DEVICE_NUMBER number {};
+            DWORD bytesReturned = 0;
+            if (DeviceIoControl(h, IOCTL_STORAGE_GET_DEVICE_NUMBER, nullptr, 0, &number, sizeof(number),
+                &bytesReturned, nullptr) && bytesReturned >= sizeof(number))
+            {
+                topology.device = L"disk:" + std::to_wstring(number.DeviceType) + L":" +
+                    std::to_wstring(number.DeviceNumber);
             }
 
             STORAGE_PROPERTY_QUERY query {};
@@ -69,7 +65,7 @@ namespace ImageCore
             query.QueryType = PropertyStandardQuery;
 
             STORAGE_SEEK_PENALTY_DESCRIPTOR desc {};
-            DWORD bytesReturned = 0;
+            bytesReturned = 0;
             const BOOL ok = DeviceIoControl(
                 h,
                 IOCTL_STORAGE_QUERY_PROPERTY,
@@ -82,12 +78,71 @@ namespace ImageCore
 
             CloseHandle(h);
 
-            if (!ok || bytesReturned < sizeof(desc) || desc.Version == 0 || desc.Size == 0)
+            if (ok && bytesReturned >= sizeof(desc) && desc.Version != 0 && desc.Size != 0)
             {
-                return true;
+                topology.incursSeekPenalty = desc.IncursSeekPenalty ? true : false;
             }
+            return topology;
+        }
 
-            return desc.IncursSeekPenalty ? true : false;
+        std::wstring Lowercase(std::wstring text)
+        {
+            for (auto& c : text)
+            {
+                c = static_cast<wchar_t>(towlower(c));
+            }
+            return text;
+        }
+
+        // Lexical root of a path for Remote lanes and for paths without a drive
+        // letter: the server of a UNC path ("\\server\share\..." or
+        // "\\?\UNC\server\share\..."), lower-cased, or empty.
+        std::wstring UncServerOf(const std::wstring& path)
+        {
+            size_t start = std::wstring::npos;
+            if (path.rfind(L"\\\\?\\UNC\\", 0) == 0)
+            {
+                start = 8;
+            }
+            else if (path.rfind(L"\\\\", 0) == 0 && path.rfind(L"\\\\?\\", 0) != 0 && path.rfind(L"\\\\.\\", 0) != 0)
+            {
+                start = 2;
+            }
+            if (start == std::wstring::npos || start >= path.size())
+            {
+                return {};
+            }
+            const size_t end = path.find_first_of(L"\\/", start);
+            return Lowercase(path.substr(start, end == std::wstring::npos ? std::wstring::npos : end - start));
+        }
+
+        // Drive volume ("C:") of a path, also behind a "\\?\" prefix; empty
+        // when the path has no drive letter.
+        std::wstring DriveVolumeOf(const std::wstring& path)
+        {
+            const std::wstring_view view = (path.rfind(L"\\\\?\\", 0) == 0) ? std::wstring_view(path).substr(4)
+                                                                         : std::wstring_view(path);
+            if (view.size() >= 2 && view[1] == L':' && iswalpha(view[0]))
+            {
+                return std::wstring { static_cast<wchar_t>(towupper(view[0])), L':' };
+            }
+            return {};
+        }
+
+        size_t LaneIndex(IoLane lane)
+        {
+            return static_cast<size_t>(lane);
+        }
+
+        const wchar_t* LaneTag(IoLane lane)
+        {
+            switch (lane)
+            {
+            case IoLane::Archive: return L"archive";
+            case IoLane::Remote: return L"remote";
+            case IoLane::Local: break;
+            }
+            return L"local";
         }
 
         static std::shared_ptr<std::vector<uint8_t>> ReadWholeFileBytes(const std::wstring& path, std::stop_token stop)
@@ -115,19 +170,6 @@ namespace ImageCore
             return bytes;
         }
 
-        static bool IsArchiveBackedPath(const std::wstring& path)
-        {
-            IPathByteSource* source = GetPathByteSource();
-            if (!source || path.empty())
-            {
-                return false;
-            }
-
-            const std::wstring host = source->ResolveHostPath(path);
-            return !host.empty() && host != path;
-        }
-
-        // (debug-only tracing removed)
     }
 
     struct ReadLease
@@ -157,6 +199,7 @@ namespace ImageCore
         // Published for GetDiagnostics only (relaxed stores, never read for
         // scheduling decisions).
         Diagnostics::Role role { Diagnostics::Role::Background };
+        IoLane lane { IoLane::Local };
         std::atomic<Diagnostics::Phase> phase { Diagnostics::Phase::Starting };
         std::atomic<uint64_t> handle { 0 };
         std::atomic<bool> backgroundMode { false };
@@ -166,6 +209,24 @@ namespace ImageCore
             handle.store(newHandle, std::memory_order_relaxed);
             phase.store(newPhase, std::memory_order_relaxed);
         }
+    };
+
+    // One I/O lane (all fields guarded by the queue mutex). See the design
+    // note in DecodeScheduler.h.
+    struct DecodeScheduler::Lane
+    {
+        std::wstring key;
+        IoLane kind { IoLane::Local };
+        std::wstring device;          // admission key (Local/Archive lanes)
+        size_t depth { 2 };           // thumbnail tasks this lane may hold bytes for
+        size_t deviceLimit { kMaxReadsPerSeekDevice };
+
+        PriorityTaskQueue queue;      // thumbnail/preview requests
+        PriorityTaskQueue mainQueue;  // full-resolution requests
+        bool reading { false };       // a thumbnail read in progress
+        bool mainReading { false };   // a main-image read in progress
+        size_t held { 0 };            // thumbnail tasks holding bytes read here
+        uint64_t lastServed { 0 };    // m_serviceClock at the last thumbnail read (0: never)
     };
 
     namespace
@@ -201,6 +262,24 @@ namespace ImageCore
     RequestPriority PriorityTaskQueue::TopPriority() const
     {
         return static_cast<RequestPriority>(255 - m_tasks.begin()->first.rank);
+    }
+
+    uint64_t PriorityTaskQueue::TopSequence() const
+    {
+        return m_tasks.begin()->first.sequence;
+    }
+
+    bool PriorityTaskQueue::Remove(DecodeRequestState& state, DecodeTask& out)
+    {
+        auto it = m_tasks.find(KeyOf(state.priority, state.sequence));
+        if (it == m_tasks.end() || it->second.state.get() != &state)
+        {
+            return false;
+        }
+        out = std::move(it->second);
+        m_tasks.erase(it);
+        state.queuedIn = DecodeRequestState::Stage::None;
+        return true;
     }
 
     DecodeTask PriorityTaskQueue::Pop()
@@ -259,34 +338,236 @@ namespace ImageCore
         return m_volumeProfiles.size();
     }
 
-    size_t DecodeScheduler::PrefetchDepthForPath(const std::wstring& path)
+    void DecodeScheduler::SetVolumeTopologyQuery(VolumeTopologyQuery query)
     {
-        // Resolving the host path and querying storage properties can block (host
-        // byte source, volume device open), so neither runs under a lock; the
-        // per-volume result is cached because the query is relatively expensive.
-        const std::wstring vol = GetVolumePathForFilePath(path);
+        std::lock_guard<std::mutex> lock(m_topologyMutex);
+        m_topologyQuery = std::move(query);
+        m_topologyByVolume.clear();
+    }
 
-        bool known = false;
-        bool incursSeek = true;
+    DecodeScheduler::VolumeTopology DecodeScheduler::TopologyForVolume(const std::wstring& volume)
+    {
+        // The device query opens the volume device and can block, so it runs
+        // without any lock held; its result is cached per volume and refreshed
+        // after kTopologyRefreshInterval (a drive letter can be remapped).
+        const auto now = std::chrono::steady_clock::now();
+        VolumeTopologyQuery query;
         {
-            std::lock_guard<std::mutex> lock(m_seekPenaltyMutex);
-            auto it = m_seekPenaltyByVolume.find(vol);
-            if (it != m_seekPenaltyByVolume.end())
+            std::lock_guard<std::mutex> lock(m_topologyMutex);
+            auto it = m_topologyByVolume.find(volume);
+            if (it != m_topologyByVolume.end() && now - it->second.queried < kTopologyRefreshInterval)
             {
-                known = true;
-                incursSeek = it->second;
+                return it->second.topology;
+            }
+            query = m_topologyQuery;
+        }
+
+        VolumeTopology topology;
+        try
+        {
+            topology = query ? query(volume) : QueryVolumeTopology(volume);
+        }
+        catch (...)
+        {
+            topology = VolumeTopology { L"volume:" + volume, true };
+        }
+        if (topology.device.empty())
+        {
+            topology.device = L"volume:" + volume;
+        }
+
+        std::lock_guard<std::mutex> lock(m_topologyMutex);
+        m_topologyByVolume[volume] = CachedTopology { topology, now };
+        return topology;
+    }
+
+    DecodeScheduler::Route DecodeScheduler::RouteFor(const ImageRequest& request, IoLane lane)
+    {
+        const bool mainImage = (request.purpose == ImagePurpose::FullResolution);
+        Route route;
+        route.lane = lane;
+        const std::wstring& path = request.source;
+
+        if (lane == IoLane::Remote)
+        {
+            // Never a local device query for a remote path: the lane is the
+            // server (UNC) or the drive letter, lexically.
+            std::wstring root = UncServerOf(path);
+            if (root.empty())
+            {
+                root = DriveVolumeOf(path);
+            }
+            route.device = L"remote:" + root;
+            route.depth = 2;
+            route.deviceLimit = kReadersPerLane;  // not device-admitted
+            route.key = std::wstring(LaneTag(lane)) + L"|" + root;
+            return route;
+        }
+
+        // Local and Archive lanes are admitted against the device that holds
+        // the file (for an archive entry, the host archive file).
+        std::wstring host = path;
+        if (lane == IoLane::Archive)
+        {
+            if (IPathByteSource* source = GetPathByteSource())
+            {
+                try
+                {
+                    host = source->ResolveHostPath(path);
+                }
+                catch (...)
+                {
+                    host = path;
+                }
             }
         }
-        if (!known)
+
+        const std::wstring volume = DriveVolumeOf(host);
+        VolumeTopology topology;
+        if (!volume.empty())
         {
-            incursSeek = QueryIncursSeekPenaltyForVolume(vol);
-            std::lock_guard<std::mutex> lock(m_seekPenaltyMutex);
-            m_seekPenaltyByVolume.emplace(vol, incursSeek);
+            topology = TopologyForVolume(volume);
+        }
+        else
+        {
+            // No drive letter: a UNC host is its own device; anything else
+            // shares one conservative unknown device.
+            const std::wstring server = UncServerOf(host);
+            topology.device = server.empty() ? L"unknown" : L"unc:" + server;
+            topology.incursSeekPenalty = true;
         }
 
+        route.device = topology.device;
         // SSD/NVMe (no seek penalty) -> deeper prefetch helps hide latency.
         // HDD (seek penalty) -> keep shallow to avoid memory + avoid extra I/O pressure.
-        return incursSeek ? 2 : 4;
+        route.depth = topology.incursSeekPenalty ? 2 : 4;
+        route.deviceLimit = topology.incursSeekPenalty ? kMaxReadsPerSeekDevice : kMaxReadsPerSolidStateDevice;
+        route.key = std::wstring(LaneTag(lane)) + L"|" + topology.device;
+        if (lane == IoLane::Archive && (mainImage || !topology.incursSeekPenalty))
+        {
+            // Without a seek penalty, each archive is its own lane (bounded by
+            // the archive readers and the device limit). Main-image reads are
+            // not device-admitted, so they are serialized per archive only.
+            route.key += L"|" + Lowercase(host);
+        }
+        return route;
+    }
+
+    bool DecodeScheduler::ThumbnailAdmissible_NoLock(const Lane& lane) const
+    {
+        if (lane.queue.Empty() || lane.reading || lane.held >= lane.depth)
+        {
+            return false;
+        }
+        if (lane.kind == IoLane::Remote)
+        {
+            return true;
+        }
+        auto it = m_readsByDevice.find(lane.device);
+        const size_t reads = (it != m_readsByDevice.end()) ? it->second : 0;
+        return reads < lane.deviceLimit;
+    }
+
+    DecodeScheduler::Lane* DecodeScheduler::SelectThumbnailLane_NoLock(IoLane kind)
+    {
+        // Global count bound: tasks holding bytes plus reads in progress.
+        const size_t used = m_prefetchedTotal + m_prefetchReads;
+        if (used >= m_globalPrefetchCap)
+        {
+            return nullptr;
+        }
+        const size_t freeSlots = m_globalPrefetchCap - used;
+
+        // Priority, then least recently served lane, then the oldest request.
+        const auto better = [](const Lane& a, const Lane& b)
+        {
+            const auto pa = a.queue.TopPriority();
+            const auto pb = b.queue.TopPriority();
+            if (pa != pb)
+            {
+                return pa > pb;
+            }
+            if (a.lastServed != b.lastServed)
+            {
+                return a.lastServed < b.lastServed;
+            }
+            return a.queue.TopSequence() < b.queue.TopSequence();
+        };
+
+        Lane* best = nullptr;
+        for (auto& [key, lane] : m_lanes)
+        {
+            if (lane->kind == kind && ThumbnailAdmissible_NoLock(*lane) && (!best || better(*lane, *best)))
+            {
+                best = lane.get();
+            }
+        }
+        if (!best)
+        {
+            return nullptr;
+        }
+
+        // Priority across lane kinds for the last free slots: leave them to
+        // higher-priority work that an idle reader of another kind can take.
+        const RequestPriority priority = best->queue.TopPriority();
+        size_t ahead = 0;
+        for (IoLane other : { IoLane::Local, IoLane::Archive, IoLane::Remote })
+        {
+            if (other == kind)
+            {
+                continue;
+            }
+            const size_t busy = m_readsInProgress[LaneIndex(other)];
+            const size_t idle = busy < kReadersPerLane ? kReadersPerLane - busy : 0;
+            size_t higher = 0;
+            for (auto& [key, lane] : m_lanes)
+            {
+                if (lane->kind == other && ThumbnailAdmissible_NoLock(*lane) && lane->queue.TopPriority() > priority)
+                {
+                    ++higher;
+                }
+            }
+            ahead += (std::min)(idle, higher);
+        }
+        return ahead < freeSlots ? best : nullptr;
+    }
+
+    DecodeScheduler::Lane* DecodeScheduler::SelectMainLane_NoLock()
+    {
+        if (m_mainReads + m_mainHeld >= kMainImageInputCap)
+        {
+            return nullptr;
+        }
+        Lane* best = nullptr;
+        for (auto& [key, lane] : m_lanes)
+        {
+            if (lane->mainQueue.Empty() || lane->mainReading)
+            {
+                continue;
+            }
+            if (!best ||
+                lane->mainQueue.TopPriority() > best->mainQueue.TopPriority() ||
+                (lane->mainQueue.TopPriority() == best->mainQueue.TopPriority() &&
+                    lane->mainQueue.TopSequence() < best->mainQueue.TopSequence()))
+            {
+                best = lane.get();
+            }
+        }
+        return best;
+    }
+
+    void DecodeScheduler::ReclaimLane_NoLock(const std::wstring& key)
+    {
+        auto it = m_lanes.find(key);
+        if (it == m_lanes.end())
+        {
+            return;
+        }
+        const Lane& lane = *it->second;
+        if (lane.queue.Empty() && lane.mainQueue.Empty() && !lane.reading && !lane.mainReading && lane.held == 0)
+        {
+            m_lanes.erase(it);
+        }
     }
 
     void DecodeScheduler::SetTestHook(TestHook hook)
@@ -462,6 +743,15 @@ namespace ImageCore
     bool DecodeScheduler::ReleasePrefetch_NoLock(DecodeRequestState& state)
     {
         state.prefetched.reset();
+        if (state.holdsMainInput)
+        {
+            state.holdsMainInput = false;
+            if (m_mainHeld > 0)
+            {
+                --m_mainHeld;
+            }
+            return true;
+        }
         if (!state.holdsPrefetchSlot)
         {
             return false;
@@ -471,10 +761,14 @@ namespace ImageCore
         {
             --m_prefetchedTotal;
         }
-        auto it = m_prefetchedByVolume.find(state.prefetchVolume);
-        if (it != m_prefetchedByVolume.end() && --it->second == 0)
+        auto it = m_lanes.find(state.laneKey);
+        if (it != m_lanes.end())
         {
-            m_prefetchedByVolume.erase(it);
+            if (it->second->held > 0)
+            {
+                --it->second->held;
+            }
+            ReclaimLane_NoLock(state.laneKey);
         }
         return true;
     }
@@ -505,6 +799,7 @@ namespace ImageCore
             {
                 Diagnostics::Thread thread;
                 thread.role = slot->role;
+                thread.lane = slot->lane;
                 thread.phase = slot->phase.load(std::memory_order_relaxed);
                 thread.handle = slot->handle.load(std::memory_order_relaxed);
                 thread.backgroundMode = slot->backgroundMode.load(std::memory_order_relaxed);
@@ -534,11 +829,18 @@ namespace ImageCore
         std::lock_guard<std::mutex> lock(m_queueMutex);
         diagnostics.shutdown = m_shutdown.load();
         diagnostics.highQueued = m_highQueue.size();
-        diagnostics.ioQueued = m_thumbIoQueue.Size();
+        for (const auto& [key, lane] : m_lanes)
+        {
+            diagnostics.ioQueued += lane->queue.Size();
+            diagnostics.mainIoQueued += lane->mainQueue.Size();
+        }
         diagnostics.decodeQueued = m_backgroundQueue.Size();
         diagnostics.liveRequests = m_liveRequests.size();
         diagnostics.prefetchedTasks = m_prefetchedTotal;
+        diagnostics.prefetchReads = m_prefetchReads;
         diagnostics.prefetchCap = m_globalPrefetchCap;
+        diagnostics.mainInputs = m_mainReads + m_mainHeld;
+        diagnostics.lanes = m_lanes.size();
         return diagnostics;
     }
 
@@ -603,12 +905,26 @@ namespace ImageCore
         }
         m_workerCount = m_threads.size();
 
-        // One serialized thumbnail I/O thread: reads files sequentially into memory, then schedules CPU work.
-        // This avoids HDD seek thrashing while still allowing CPU decode/resize to run in parallel.
+        // I/O lane readers: a fixed pool per logical lane, plus the main-image
+        // readers for Archive/Remote full-resolution requests. Each lane reads
+        // sequentially (one read per lane, admitted per device), then schedules
+        // CPU work, so HDDs are not thrashed while decode/resize runs in parallel.
+        for (IoLane lane : { IoLane::Local, IoLane::Archive, IoLane::Remote })
+        {
+            for (size_t i = 0; i < kReadersPerLane; ++i)
+            {
+                auto slot = std::make_unique<ThreadSlot>();
+                slot->role = Diagnostics::Role::Prefetch;
+                slot->lane = lane;
+                slot->thread = std::thread(&DecodeScheduler::LaneReaderThread, this, lane, slot.get());
+                m_threads.push_back(std::move(slot));
+            }
+        }
+        for (size_t i = 0; i < kMainImageReaders; ++i)
         {
             auto slot = std::make_unique<ThreadSlot>();
-            slot->role = Diagnostics::Role::Prefetch;
-            slot->thread = std::thread(&DecodeScheduler::ThumbPrefetchThread, this, slot.get());
+            slot->role = Diagnostics::Role::MainReader;
+            slot->thread = std::thread(&DecodeScheduler::MainReaderThread, this, slot.get());
             m_threads.push_back(std::move(slot));
         }
 
@@ -634,15 +950,29 @@ namespace ImageCore
     {
         const bool fullResolution = (task.request.purpose == ImagePurpose::FullResolution);
 
-        // Storage tuning for thumbnail/preview work is resolved before taking the
-        // queue mutex: it can block on the host byte source or a volume query,
-        // which would otherwise stall every worker, Cancel and Enqueue.
-        std::wstring vol;
-        size_t desiredDepth = 0;
-        if (!fullResolution)
+        // The lane is resolved before taking the queue mutex: classification,
+        // the host path and the volume device query can block on the host byte
+        // source or the OS, which would otherwise stall every reader, worker,
+        // Cancel and Enqueue.
+        PathSourceKind kind = PathSourceKind::Unknown;
+        if (IPathByteSource* source = GetPathByteSource())
         {
-            vol = FileByteCache::GetVolumeForPath(task.request.source);
-            desiredDepth = PrefetchDepthForPath(task.request.source);
+            try
+            {
+                kind = source->ClassifyPath(task.request.source);
+            }
+            catch (...)
+            {
+                kind = PathSourceKind::Unknown;
+            }
+        }
+        const IoLane laneKind = IoLaneFor(kind);
+        // Local full-resolution requests are read by the decoder itself.
+        const bool needsLane = !fullResolution || laneKind != IoLane::Local;
+        Route route;
+        if (needsLane)
+        {
+            route = RouteFor(task.request, laneKind);
         }
 
         task.state = std::make_shared<DecodeRequestState>();
@@ -661,36 +991,51 @@ namespace ImageCore
                 m_liveRequests[task.handle] = task.state;
             }
 
-            // FullResolution is user-interactive (main image). Prioritize it.
-            if (fullResolution)
+            if (!needsLane)
             {
+                // FullResolution is user-interactive (main image). Prioritize it.
                 m_highQueue.push(std::move(task));
             }
             else
             {
-                // Auto-tune per-volume thumbnail prefetch depth based on storage seek penalty.
-                VolumeIoProfile profile {};
-                profile.incursSeek = (desiredDepth <= 2);
-                profile.prefetchDepth = desiredDepth;
-                m_volumeProfiles[vol] = profile;
-
-                // Global cache hard-cap: sum of per-volume depths (bounded), so mixed HDD+SSD doesn't get stuck conservative.
-                size_t sumDepth = 0;
-                for (const auto& kv : m_volumeProfiles)
+                std::unique_ptr<Lane>& lane = m_lanes[route.key];
+                if (!lane)
                 {
-                    sumDepth += kv.second.prefetchDepth;
+                    lane = std::make_unique<Lane>();
+                    lane->key = route.key;
+                    lane->kind = route.lane;
+                    lane->device = route.device;
                 }
-                const size_t hardCap = 8;
-                m_globalPrefetchCap = (std::min)(hardCap, (std::max)(static_cast<size_t>(1), sumDepth));
-                FileByteCache::Instance().SetMaxEntries(m_globalPrefetchCap);
+                // The latest topology applies to the lane's admission.
+                lane->depth = route.depth;
+                lane->deviceLimit = route.deviceLimit;
+                task.state->laneKey = route.key;
 
-                // Thumbnail/Preview: go through serialized I/O prefetch stage first.
-                m_thumbIoQueue.Push(std::move(task), DecodeRequestState::Stage::Io);
+                if (fullResolution)
+                {
+                    lane->mainQueue.Push(std::move(task), DecodeRequestState::Stage::MainIo);
+                }
+                else
+                {
+                    // Prefetch depth per device; the global cap (and FileByteCache's
+                    // entry limit) is their sum, bounded, so mixed HDD+SSD doesn't get
+                    // stuck conservative.
+                    m_volumeProfiles[route.device] = route.depth;
+                    size_t sumDepth = 0;
+                    for (const auto& kv : m_volumeProfiles)
+                    {
+                        sumDepth += kv.second;
+                    }
+                    m_globalPrefetchCap = (std::min)(kMaxPrefetchCap, (std::max)(static_cast<size_t>(1), sumDepth));
+                    FileByteCache::Instance().SetMaxEntries(m_globalPrefetchCap);
+
+                    lane->queue.Push(std::move(task), DecodeRequestState::Stage::Io);
+                }
             }
         }
-        // Multiple threads wait on the same condition_variable with different queue predicates
-        // (high/background/thumb-IO). Using notify_all avoids a missed wakeup where we wake a thread
-        // whose predicate is false, leaving the correct worker asleep even though work is available.
+        // Multiple threads wait on the same condition_variable with different predicates
+        // (high/background queues, lanes). Using notify_all avoids a missed wakeup where we wake a
+        // thread whose predicate is false, leaving the correct one asleep even though work is available.
         m_queueCondition.notify_all();
         return true;
     }
@@ -716,8 +1061,17 @@ namespace ImageCore
             switch (state.queuedIn)
             {
             case DecodeRequestState::Stage::Io:
-                (void)m_thumbIoQueue.Reprioritize(state, priority);
+            case DecodeRequestState::Stage::MainIo:
+            {
+                auto lane = m_lanes.find(state.laneKey);
+                if (lane != m_lanes.end())
+                {
+                    PriorityTaskQueue& queue = (state.queuedIn == DecodeRequestState::Stage::Io)
+                        ? lane->second->queue : lane->second->mainQueue;
+                    (void)queue.Reprioritize(state, priority);
+                }
                 break;
+            }
             case DecodeRequestState::Stage::Decode:
                 (void)m_backgroundQueue.Reprioritize(state, priority);
                 break;
@@ -727,7 +1081,7 @@ namespace ImageCore
                 break;
             }
         }
-        // The prefetch stage may be holding lower-priority work for a slot.
+        // A promoted request may now win the next free reader or slot.
         m_queueCondition.notify_all();
     }
 
@@ -740,14 +1094,18 @@ namespace ImageCore
 
         // The flag lives with the task; the live-request entry is dropped now, so
         // a cancel after completion (or of an unknown handle) never accumulates.
-        // A request that is still queued gives back its prefetched bytes and
-        // prefetch slot here, so canceled work cannot hold back prefetch; the
-        // task itself is discarded when a thread next reaches it. Everything is
-        // found through the live-request table: no queue is scanned, so bulk
-        // cancellation stays linear. A request already being decoded keeps its
-        // bytes until the decode finishes.
+        // A request waiting in an I/O lane is removed from it here (it holds no
+        // capacity; an emptied lane is reclaimed), and one waiting for decode
+        // gives back its read bytes and capacity, so canceled work cannot hold
+        // back prefetch; a task waiting for decode is discarded when a worker
+        // next reaches it. Everything is found through the live-request table
+        // and the lane key: no queue is scanned, so bulk cancellation stays
+        // O(n log n). A request already being decoded keeps its bytes until the
+        // decode finishes.
         std::wstring releasedPath;
         bool releasedSlot = false;
+        bool removedFromLane = false;
+        DecodeTask removed;  // destroyed after the locks are released
         std::shared_ptr<DecodeRequestState> canceledState;
         {
             std::lock_guard<std::mutex> lock(m_queueMutex);
@@ -759,7 +1117,18 @@ namespace ImageCore
             canceledState = it->second;
             DecodeRequestState& state = *it->second;
             state.canceled.store(true);
-            if (!state.decoding && state.holdsPrefetchSlot)
+            if (state.queuedIn == DecodeRequestState::Stage::Io || state.queuedIn == DecodeRequestState::Stage::MainIo)
+            {
+                auto lane = m_lanes.find(state.laneKey);
+                if (lane != m_lanes.end())
+                {
+                    PriorityTaskQueue& queue = (state.queuedIn == DecodeRequestState::Stage::Io)
+                        ? lane->second->queue : lane->second->mainQueue;
+                    removedFromLane = queue.Remove(state, removed);
+                    ReclaimLane_NoLock(state.laneKey);
+                }
+            }
+            if (!state.decoding && (state.holdsPrefetchSlot || state.holdsMainInput))
             {
                 releasedPath = it->second->prefetchPath;
                 releasedSlot = ReleasePrefetch_NoLock(state);
@@ -779,10 +1148,14 @@ namespace ImageCore
         RunTestHook(TestPoint::CancelPublished, handle);
 
         // The request no longer holds its bytes; drop the shared cache entry if
-        // nothing else uses it, then wake the prefetch stage for the free slot.
+        // nothing else uses it, then wake the readers for the free capacity (a
+        // removed lane task can also unblock another lane kind's slot choice).
         if (releasedSlot)
         {
             FileByteCache::Instance().EraseIfUnshared(releasedPath);
+        }
+        if (releasedSlot || removedFromLane)
+        {
             m_queueCondition.notify_all();
         }
     }
@@ -971,17 +1344,22 @@ namespace ImageCore
         {
             std::lock_guard<std::mutex> lock(m_queueMutex);
             m_highQueue = {};
-            m_thumbIoQueue = {};
             m_backgroundQueue = {};
+            m_lanes.clear();
+            m_readsByDevice.clear();
+            std::fill(std::begin(m_readsInProgress), std::end(m_readsInProgress), size_t { 0 });
+            m_serviceClock = 0;
             m_prefetchedTotal = 0;
-            m_prefetchedByVolume.clear();
+            m_prefetchReads = 0;
+            m_mainReads = 0;
+            m_mainHeld = 0;
             m_liveRequests.clear();
             m_volumeProfiles.clear();
             m_globalPrefetchCap = 4;
         }
         {
-            std::lock_guard<std::mutex> lock(m_seekPenaltyMutex);
-            m_seekPenaltyByVolume.clear();
+            std::lock_guard<std::mutex> lock(m_topologyMutex);
+            m_topologyByVolume.clear();
         }
         {
             std::lock_guard<std::mutex> lock(m_stopMutex);
@@ -1159,41 +1537,18 @@ namespace ImageCore
                 DecodeInput input {};
 
                 const std::wstring& src = task.request.source;
-                const bool isArchivePath = IsArchiveBackedPath(src);
 
-                if (task.request.purpose != ImagePurpose::FullResolution)
+                // The bytes an I/O lane attached to this request: thumbnail/preview
+                // bytes, or the input of an Archive/Remote full-resolution request
+                // read by a main-image reader (taken above; never re-looked-up by
+                // path, so a same-path request that was canceled or finished cannot
+                // take them away). A local full-resolution request has none: the
+                // decoder reads its file.
+                if (bytesHold && !bytesHold->empty())
                 {
-                    // Thumbnail/Preview: the bytes the prefetch stage attached to this
-                    // request (taken above; never re-looked-up by path, so a same-path
-                    // request that was canceled or finished cannot take them away).
-                    if (bytesHold && !bytesHold->empty())
-                    {
-                        input.bytes = std::span<const uint8_t>(bytesHold->data(), bytesHold->size());
-                        const size_t headerSize = (std::min)(bytesHold->size(), ImageFormatDetector::kProbeSize);
-                        input.header = std::span<const uint8_t>(bytesHold->data(), headerSize);
-                    }
-                }
-                else if (isArchivePath && task.state)
-                {
-                    // FullResolution from archive: must read via the host byte source
-                    bool stopped = false;
-                    slot->Publish(Diagnostics::Phase::Reading, task.handle);
-                    auto bytes = LeasedRead(*slot->lease, task.state, task.handle, task.request.source, stopped);
-                    if (stopped)
-                    {
-                        skipped = true;
-                    }
-                    else if (bytes && !bytes->empty())
-                    {
-                        bytesHold = bytes;
-                        input.bytes = std::span<const uint8_t>(bytesHold->data(), bytesHold->size());
-                        const size_t headerSize = (std::min)(bytesHold->size(), ImageFormatDetector::kProbeSize);
-                        input.header = std::span<const uint8_t>(bytesHold->data(), headerSize);
-                    }
-                    else
-                    {
-                        IC_LOG_WARN("[DecodeScheduler] Full-res archive read returned empty bytes.");
-                    }
+                    input.bytes = std::span<const uint8_t>(bytesHold->data(), bytesHold->size());
+                    const size_t headerSize = (std::min)(bytesHold->size(), ImageFormatDetector::kProbeSize);
+                    input.header = std::span<const uint8_t>(bytesHold->data(), headerSize);
                 }
 
                 // Work taken just before shutdown began is dropped as well (a
@@ -1203,7 +1558,13 @@ namespace ImageCore
                     skipped = true;
                 }
 
-                if (!skipped)
+                if (!skipped && task.state && task.state->slowReadFailed)
+                {
+                    // No path fallback: it would block this worker on the slow source.
+                    result = PipelineResult(HRESULT_FROM_WIN32(ERROR_READ_FAULT));
+                    IC_LOG_ERROR("[DecodeScheduler] Slow-source read failed ({})", Log::ToUtf8(src));
+                }
+                else if (!skipped)
                 {
                     RunTestHook(TestPoint::DecodeStart, task.handle);
                     slot->Publish(Diagnostics::Phase::Decoding, task.handle);
@@ -1241,19 +1602,21 @@ namespace ImageCore
                 task.callback(std::move(result));  // delivered via move
             }
 
-            // Thumbnail/Preview prefetched bytes are transient: give back the
-            // prefetch slot and drop the shared cache entry if nothing else uses it.
-            if (task.request.purpose != ImagePurpose::FullResolution)
+            // Read bytes are transient: give back the prefetch slot (or main-image
+            // input) and drop the shared cache entry if nothing else uses it.
             {
                 bytesHold.reset();
                 bool released = false;
                 {
-                    // The prefetch stage's wait predicate reads the slot counts under
+                    // The readers' selection reads the capacity counts under
                     // m_queueMutex, so they change under it and the notify follows.
                     std::lock_guard<std::mutex> lock(m_queueMutex);
                     released = task.state && ReleasePrefetch_NoLock(*task.state);
                 }
-                FileByteCache::Instance().EraseIfUnshared(task.request.source);
+                if (task.request.purpose != ImagePurpose::FullResolution)
+                {
+                    FileByteCache::Instance().EraseIfUnshared(task.request.source);
+                }
                 if (released)
                 {
                     m_queueCondition.notify_all();
@@ -1284,116 +1647,99 @@ namespace ImageCore
         SignalExit(*slot);
     }
 
-    void DecodeScheduler::ThumbPrefetchThread(ThreadSlot* slot)
+    void DecodeScheduler::LaneReaderThread(IoLane kind, ThreadSlot* slot)
     {
         BindLeaseToCurrentThread(*slot->lease);
 
         // The read runs in background mode (low CPU and I/O priority); the thread
         // waits and schedules outside it, at normal priority, so it wakes for
         // shutdown or a new task without being starved by normal-priority load.
+        //
+        // The thread selects its next lane in the same critical section that
+        // finishes the previous read, so it continues a lane it just served
+        // when that lane is still the best choice (and reads of one lane stay
+        // on one thread while it keeps up).
 
-        while (!m_shutdown)
+        // A canceled or stopped request, destroyed outside the queue mutex
+        // (its callback may own host objects).
+        DecodeTask discard;
+        std::shared_ptr<const std::vector<uint8_t>> discardBytes;
+        std::wstring discardPath;
+        bool discardPending = false;
+        const auto flushDiscard = [&]
         {
-            DecodeTask task;
-
-            slot->Publish(Diagnostics::Phase::Idle, 0);
+            discardBytes.reset();
+            if (!discardPath.empty())
             {
-                std::unique_lock<std::mutex> lock(m_queueMutex);
-                m_queueCondition.wait(lock, [this]
-                {
-                    return !m_thumbIoQueue.Empty() || m_shutdown;
-                });
+                FileByteCache::Instance().EraseIfUnshared(discardPath);
+                discardPath.clear();
+            }
+            discard = DecodeTask {};
+            discardPending = false;
+        };
 
-                // Queued work is dropped at shutdown (Shutdown canceled it).
-                if (m_shutdown)
-                {
-                    break;
-                }
+        const size_t laneIndex = LaneIndex(kind);
+        const bool deviceAdmitted = (kind != IoLane::Remote);
 
-                if (m_thumbIoQueue.Empty())
-                {
-                    continue;
-                }
-
-                task = m_thumbIoQueue.Pop();
-
-                if (task.state && task.state->canceled.load())
-                {
-                    Finish_NoLock(task);
-                    continue;
-                }
-                if (task.state)
-                {
-                    task.state->readLease = slot->lease;
-                }
+        std::unique_lock<std::mutex> lock(m_queueMutex);
+        for (;;)
+        {
+            // Queued work is dropped at shutdown (Shutdown canceled it).
+            if (m_shutdown)
+            {
+                break;
             }
 
-            // Ensure this stage is only used for thumbnail/preview.
-            if (task.request.purpose == ImagePurpose::FullResolution)
+            Lane* lane = SelectThumbnailLane_NoLock(kind);
+            if (!lane)
             {
-                // Should never happen, but push to high queue just in case.
+                if (discardPending)
                 {
-                    std::lock_guard<std::mutex> lock(m_queueMutex);
-                    m_highQueue.push(std::move(task));
+                    lock.unlock();
+                    flushDiscard();
+                    lock.lock();
+                    continue;
                 }
-                m_queueCondition.notify_all();
+                slot->Publish(Diagnostics::Phase::Idle, 0);
+                m_queueCondition.wait(lock);
                 continue;
             }
 
-            // Per-volume in-flight cap + global cap.
-            const std::wstring vol = FileByteCache::GetVolumeForPath(task.request.source);
-            size_t volCap = 2;
+            DecodeTask task = lane->queue.Pop();
+            const std::wstring laneKey = lane->key;
+            if (!task.state || task.state->canceled.load())
             {
-                std::lock_guard<std::mutex> lock(m_queueMutex);
-                auto it = m_volumeProfiles.find(vol);
-                if (it != m_volumeProfiles.end())
-                {
-                    volCap = it->second.prefetchDepth;
-                }
-            }
-
-            // Backpressure without Sleep: wait until fewer tasks hold prefetched bytes
-            // than the global and per-volume caps allow. A higher-priority request
-            // queued (or promoted) meanwhile takes the slot instead: this task goes
-            // back to the queue with its age and the loop picks the new top.
-            bool yielded = false;
-            slot->Publish(Diagnostics::Phase::WaitingForSlot, task.handle);
-            {
-                std::unique_lock<std::mutex> lock(m_queueMutex);
-                const auto outranked = [this, &task]
-                {
-                    return task.state && !m_thumbIoQueue.Empty() &&
-                        m_thumbIoQueue.TopPriority() > task.state->priority;
-                };
-                m_queueCondition.wait(lock, [this, vol, volCap, &outranked]
-                {
-                    if (m_shutdown || outranked())
-                    {
-                        return true;
-                    }
-                    auto it = m_prefetchedByVolume.find(vol);
-                    const size_t volCount = (it != m_prefetchedByVolume.end()) ? it->second : 0;
-                    return m_prefetchedTotal < m_globalPrefetchCap && volCount < volCap;
-                });
-                if (m_shutdown)
-                {
-                    break;
-                }
-                if (outranked())
-                {
-                    m_thumbIoQueue.Push(std::move(task), DecodeRequestState::Stage::Io);
-                    yielded = true;
-                }
-            }
-            if (yielded)
-            {
+                // Cancel removes queued tasks, so this is a task of a Shutdown.
+                Finish_NoLock(task);
+                ReclaimLane_NoLock(laneKey);
+                lock.unlock();
+                task = DecodeTask {};
+                lock.lock();
                 continue;
             }
 
-            // Read file bytes sequentially on this single thread. The shared cache
-            // only de-duplicates reads for same-path tasks; the bytes are attached
-            // to this task, which owns them from here on. A canceled read is never
-            // cached, so a same-path request behind it reads its own bytes.
+            // Admitted: the lane reads, and the read counts against the global
+            // prefetch cap, the lane kind and the device until it is finished.
+            const std::wstring device = lane->device;
+            lane->reading = true;
+            lane->lastServed = ++m_serviceClock;
+            ++m_prefetchReads;
+            ++m_readsInProgress[laneIndex];
+            if (deviceAdmitted)
+            {
+                ++m_readsByDevice[device];
+            }
+            task.state->readLease = slot->lease;
+            lock.unlock();
+            if (discardPending)
+            {
+                flushDiscard();
+            }
+
+            // Read the file bytes. The shared cache only de-duplicates reads for
+            // same-path tasks; the bytes are attached to this task, which owns them
+            // from here on. A canceled read is never cached, so a same-path request
+            // behind it reads its own bytes.
             std::shared_ptr<const std::vector<uint8_t>> bytes = FileByteCache::Instance().Get(task.request.source);
             bool stopped = false;
             if (!bytes)
@@ -1419,39 +1765,155 @@ namespace ImageCore
                 }
             }
 
-            // Schedule CPU decode work unless canceled; the decoder falls back to the
-            // file path if an uncanceled prefetch failed.
-            bool canceled = false;
+            lock.lock();
+            // The lane cannot have been reclaimed while it was reading.
+            Lane& done = *m_lanes.at(laneKey);
+            done.reading = false;
+            --m_prefetchReads;
+            --m_readsInProgress[laneIndex];
+            if (deviceAdmitted)
             {
-                std::lock_guard<std::mutex> lock(m_queueMutex);
-                canceled = stopped || task.state->canceled.load();
-                if (canceled)
+                auto it = m_readsByDevice.find(device);
+                if (it != m_readsByDevice.end() && --it->second == 0)
                 {
-                    // Canceled while its bytes were being read (it was in no queue).
-                    Finish_NoLock(task);
+                    m_readsByDevice.erase(it);
+                }
+            }
+
+            // Schedule CPU decode work unless canceled. After a failed Local read
+            // the decoder falls back to the file path; a failed Archive/Remote
+            // read is delivered as a failure (slowReadFailed).
+            if (stopped || task.state->canceled.load())
+            {
+                // Canceled while its bytes were being read (it was in no queue).
+                Finish_NoLock(task);
+                discardPath = task.request.source;
+                discardBytes = std::move(bytes);
+                discard = std::move(task);
+                discardPending = true;
+            }
+            else
+            {
+                if ((!bytes || bytes->empty()) && kind != IoLane::Local)
+                {
+                    task.state->slowReadFailed = true;
+                }
+                if (bytes)
+                {
+                    task.state->prefetched = std::move(bytes);
+                    task.state->holdsPrefetchSlot = true;
+                    task.state->prefetchPath = task.request.source;
+                    ++m_prefetchedTotal;
+                    ++done.held;
+                }
+                m_backgroundQueue.Push(std::move(task), DecodeRequestState::Stage::Decode);
+            }
+            ReclaimLane_NoLock(laneKey);
+            // A decode is queued, or capacity was freed for the other readers.
+            m_queueCondition.notify_all();
+        }
+        lock.unlock();
+        flushDiscard();
+
+        slot->Publish(Diagnostics::Phase::Exited, 0);
+        SignalExit(*slot);
+    }
+
+    void DecodeScheduler::MainReaderThread(ThreadSlot* slot)
+    {
+        BindLeaseToCurrentThread(*slot->lease);
+
+        // Main-image reads are user-interactive: above normal, like the
+        // full-resolution worker, for the thread's whole life.
+        (void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+
+        DecodeTask discard;  // destroyed outside the queue mutex
+        bool discardPending = false;
+
+        std::unique_lock<std::mutex> lock(m_queueMutex);
+        for (;;)
+        {
+            if (m_shutdown)
+            {
+                break;
+            }
+
+            Lane* lane = SelectMainLane_NoLock();
+            if (!lane)
+            {
+                if (discardPending)
+                {
+                    lock.unlock();
+                    discard = DecodeTask {};
+                    discardPending = false;
+                    lock.lock();
+                    continue;
+                }
+                slot->Publish(Diagnostics::Phase::Idle, 0);
+                m_queueCondition.wait(lock);
+                continue;
+            }
+
+            DecodeTask task = lane->mainQueue.Pop();
+            const std::wstring laneKey = lane->key;
+            if (!task.state || task.state->canceled.load())
+            {
+                // Cancel removes queued tasks, so this is a task of a Shutdown.
+                Finish_NoLock(task);
+                ReclaimLane_NoLock(laneKey);
+                lock.unlock();
+                task = DecodeTask {};
+                lock.lock();
+                continue;
+            }
+
+            lane->mainReading = true;
+            ++m_mainReads;
+            task.state->readLease = slot->lease;
+            lock.unlock();
+            if (discardPending)
+            {
+                discard = DecodeTask {};
+                discardPending = false;
+            }
+
+            bool stopped = false;
+            slot->Publish(Diagnostics::Phase::Reading, task.handle);
+            auto bytes = LeasedRead(*slot->lease, task.state, task.handle, task.request.source, stopped);
+            if (!stopped && (!bytes || bytes->empty()))
+            {
+                IC_LOG_WARN("[DecodeScheduler] Full-res lane read returned empty bytes.");
+            }
+
+            lock.lock();
+            m_lanes.at(laneKey)->mainReading = false;
+            --m_mainReads;
+            if (stopped || task.state->canceled.load())
+            {
+                Finish_NoLock(task);
+                discard = std::move(task);
+                discardPending = true;
+            }
+            else
+            {
+                if (bytes && !bytes->empty())
+                {
+                    task.state->prefetched = std::move(bytes);
+                    task.state->holdsMainInput = true;
+                    ++m_mainHeld;
                 }
                 else
                 {
-                    if (bytes && task.state)
-                    {
-                        task.state->prefetched = std::move(bytes);
-                        task.state->holdsPrefetchSlot = true;
-                        task.state->prefetchVolume = vol;
-                        task.state->prefetchPath = task.request.source;
-                        ++m_prefetchedTotal;
-                        ++m_prefetchedByVolume[vol];
-                    }
-                    m_backgroundQueue.Push(std::move(task), DecodeRequestState::Stage::Decode);
+                    // Main-image readers serve Archive/Remote lanes only.
+                    task.state->slowReadFailed = true;
                 }
+                m_highQueue.push(std::move(task));
             }
-            if (canceled)
-            {
-                bytes.reset();
-                FileByteCache::Instance().EraseIfUnshared(task.request.source);
-                continue;
-            }
+            ReclaimLane_NoLock(laneKey);
             m_queueCondition.notify_all();
         }
+        lock.unlock();
+        discard = DecodeTask {};
 
         slot->Publish(Diagnostics::Phase::Exited, 0);
         SignalExit(*slot);
