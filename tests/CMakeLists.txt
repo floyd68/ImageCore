@@ -4,6 +4,7 @@
 add_executable(ImageCoreTests
     TestHarness.h
     TestMain.cpp
+    DdsMipSelectionTests.cpp
     DecodeSchedulerTests.cpp
     ImageLoaderTests.cpp
     LogTests.cpp
@@ -31,7 +32,8 @@ add_test(NAME ImageCore.DecodeScheduler COMMAND ImageCoreTests DecodeScheduler_)
 add_test(NAME ImageCore.ReadCancel COMMAND ImageCoreTests ReadCancel_)
 add_test(NAME ImageCore.Log COMMAND ImageCoreTests Log_)
 add_test(NAME ImageCore.SrgbConversion COMMAND ImageCoreTests SrgbConversion_)
+add_test(NAME ImageCore.DdsMipSelection COMMAND ImageCoreTests DdsMip_)
 # ImageLoader is a process singleton whose Shutdown is final: own process.
 add_test(NAME ImageCore.ImageLoader COMMAND ImageCoreTests ImageLoader_)
 # Safety net only: every wait inside the tests is bounded at 10 s.
-set_tests_properties(ImageCore.DecodeScheduler ImageCore.ReadCancel ImageCore.Log ImageCore.SrgbConversion ImageCore.ImageLoader PROPERTIES TIMEOUT 120)
+set_tests_properties(ImageCore.DecodeScheduler ImageCore.ReadCancel ImageCore.Log ImageCore.SrgbConversion ImageCore.DdsMipSelection ImageCore.ImageLoader PROPERTIES TIMEOUT 120)

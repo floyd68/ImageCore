@@ -668,15 +668,10 @@ namespace ImageCore
                         }
                     }
 
-                    if (bestMaxDim != static_cast<size_t>(-1))
-                    {
-                        mipIndex = bestMip;
-                    }
-                    else
-                    {
-                        // If all mips are smaller than target, use the smallest available.
-                        mipIndex = static_cast<size_t>((metadata.mipLevels > 0) ? (metadata.mipLevels - 1) : 0);
-                    }
+                    // If all mips are smaller than the target, use mip 0 (the
+                    // largest): the fit below never upscales, so the thumbnail
+                    // shows the image at source size instead of a tiny mip.
+                    mipIndex = (bestMaxDim != static_cast<size_t>(-1)) ? bestMip : 0;
                 }
 
                 auto convertedScratch = std::make_unique<DirectX::ScratchImage>();
