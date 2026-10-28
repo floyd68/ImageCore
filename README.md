@@ -35,7 +35,8 @@ It focuses on high-throughput DDS workloads (thumbnails + full-resolution) while
   - Worker pools:
     - **HighPriority**: user-interactive full-resolution loads
     - **Background**: thumbnail/preview decode/resize work
-    - **ThumbPrefetchThread**: serialized thumbnail I/O to reduce random-seek thrashing
+    - **I/O lane readers**: thumbnail/preview reads in Local, Archive and Remote lanes, serialized per lane and admitted per physical device (see [I/O lanes](#io-lanes))
+    - **Main-image readers**: full-resolution reads of archive entries and remote files, so a decode worker never waits for slow I/O
   - Uses `notify_all()` intentionally because multiple worker types share a CV with different predicates
   - Best-effort cancel: canceled handles suppress callbacks (in-flight decode cannot be interrupted)
 
@@ -49,7 +50,7 @@ It focuses on high-throughput DDS workloads (thumbnails + full-resolution) while
 
 ### FullResolution (main image)
 
-1) Request goes to `DecodeScheduler` high queue
+1) Request goes to `DecodeScheduler` high queue (an archive entry or remote file is first read by a main-image reader, and queued with its bytes)
 2) High worker decodes via `ImageDecodeDispatcher`
 3) Callback returns a **`DecodedImage`** payload:
    - CPU path: BGRA8 premultiplied pixels (`DXGI_FORMAT_B8G8R8A8_UNORM`)
@@ -58,12 +59,24 @@ It focuses on high-throughput DDS workloads (thumbnails + full-resolution) while
 
 ### Thumbnail / Preview
 
-1) Request goes through `ThumbPrefetchThread`
-2) File bytes are prefetched (sequential disk reads) and attached to the task, which owns them; `FileByteCache` only de-duplicates reads for same-path tasks
+1) Request goes to its I/O lane (from `IPathByteSource::ClassifyPath`)
+2) File bytes are prefetched by a lane reader (sequential within the lane) and attached to the task, which owns them; `FileByteCache` only de-duplicates reads for same-path tasks
 3) Task is pushed to background queue
 4) Background worker decodes using the task's prefetched bytes when available
 
-Backpressure counts tasks holding prefetched bytes (global and per-volume caps). Canceling a queued task removes it immediately and releases its bytes and slot.
+Backpressure counts tasks holding prefetched bytes plus reads in progress (a global cap, and a per-lane depth). Canceling a queued task removes it immediately and releases its bytes and slot.
+
+## I/O lanes
+
+A slow read that is still wanted (a deep entry of a solid 7z, a network or cloud file) only delays the work behind it in its own lane. The full design is in the comment above `DecodeScheduler` in `DecodeScheduler.h`; in short:
+
+- **Classification**: the host reports `Local`, `Archive`, `Remote` or `Unknown` per path (`IPathByteSource::ClassifyPath`, a fast synchronous call made once per request). `Unknown` is scheduled as `Local`; the default classification is `Archive` when `ResolveHostPath` changes the path, else `Unknown`.
+- **Lanes**: Local lanes per physical device; Archive lanes per device on an HDD and per archive on an SSD; Remote lanes per UNC server or drive letter. Each lane reads one thumbnail/preview at a time, in priority order.
+- **Device admission**: devices come from `IOCTL_STORAGE_GET_DEVICE_NUMBER` (several volume letters of one disk are one device), cached per volume for 60 s. An HDD admits two reads at once, one per lane kind (Local, Archive): a blocked archive read does not stop local thumbnails on the same disk, at the cost of two interleaved read streams there. Strict one-reader-per-HDD serialization is not promised. Remote reads are not counted against a local device.
+- **Bounds**: two reader threads per lane kind (a slow lane kind cannot take readers from another), two main-image readers, at most two main-image reads plus inputs held; thumbnail bytes held plus reads in progress stay within the global prefetch cap (at most 8). The memory bound is a count bound: each read is at most 1 GiB, and there is no aggregate byte budget.
+- **Fairness**: at equal priority the lane served least recently goes first, so a newly active folder is not queued behind another lane's backlog; across lane kinds, the last free prefetch slot goes to the higher-priority request.
+- **Main images**: an archive or remote main image is read beside its lane's thumbnail reads (never behind them) by a main-image reader and then decoded; local main images are decoded by the worker directly as before.
+- **Cancellation**: a request waiting for lane, device or slot capacity holds nothing and is removed from its lane by `Cancel` at once; idle lanes are reclaimed.
 
 ## DDS specifics
 
@@ -94,6 +107,7 @@ DirectXTex decoding supports:
 - A thread is in background mode only while it runs that work (a thumbnail/preview decode, the prefetch read); idle workers and the idle prefetch thread wait at normal priority or above, so they wake for new work or shutdown without queuing behind normal-priority load.
 - `Shutdown` raises every scheduler thread above normal priority before waiting for it, overriding background mode: a thread in background mode runs below all normal-priority work, and on a CPU-saturated machine it would otherwise get the processor only every few seconds and miss a shutdown bound.
 - The same starvation applies to the thumbnail work itself: under normal-priority load on every CPU, background-mode reads and decodes advance only every few seconds. `DecodeScheduler::SetBackgroundWorkPriority(Normal)` is a test seam that runs that work at normal priority instead; the scheduling-logic tests use it so their progress deadlines do not depend on other load on the machine, and the priority tests keep background mode. Production always uses background mode.
+- I/O lanes keep this policy: a lane reader enters background mode only around a thumbnail/preview read and waits at normal priority; main-image readers run above normal. With lanes, a starved or scan-delayed background read holds up only its own lane. Raising the read priority alone would not make thumbnails progress under all-core normal-priority load, since their decode also runs in background mode; changing both stages is a separate decision.
 
 ## Building
 

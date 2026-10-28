@@ -7,6 +7,29 @@
 
 namespace ImageCore
 {
+    // What kind of source a path's bytes come from, as far as the host knows.
+    // It selects the I/O lane of a request (IoLaneFor); see DecodeScheduler.h.
+    enum class PathSourceKind : uint8_t
+    {
+        Unknown,  // no classification: scheduled as Local (the conservative default)
+        Local,    // a plain file on a local drive
+        Archive,  // an entry inside an archive (extraction can take seconds)
+        Remote,   // a network path or a cloud placeholder (the read waits on a download)
+    };
+
+    // Logical I/O lanes. A slow read in one lane never holds up another lane;
+    // within a lane, reads are additionally admitted per physical device (see
+    // DecodeScheduler.h).
+    enum class IoLane : uint8_t
+    {
+        Local,
+        Archive,
+        Remote,
+    };
+
+    // Unknown and Local -> Local, Archive -> Archive, Remote -> Remote.
+    IoLane IoLaneFor(PathSourceKind kind);
+
     // Host-provided byte source for filesystem and archive-backed paths.
     // ImageCore stays free of Floar/VFS dependencies; the app installs an adapter.
     class IPathByteSource
@@ -39,6 +62,19 @@ namespace ImageCore
         // sources keep working; their reads are not interrupted by the token,
         // and a bounded scheduler shutdown may then report a timeout.
         virtual std::vector<uint8_t> ReadAll(const std::wstring& path, std::stop_token stop) const;
+
+        // Classifies `path` for lane selection. Called once per request from
+        // DecodeScheduler::Enqueue, on the caller's thread and outside every
+        // scheduler lock; ImageCore treats it as a fast synchronous call and
+        // does not cache the result. It must use only cheap signals (lexical
+        // checks, cached drive types, local metadata): never a network
+        // metadata query or a file read. Return Unknown when unsure; an
+        // exception is treated as Unknown.
+        //
+        // The default returns Archive when ResolveHostPath(path) is a
+        // different, non-empty path (an archive entry, as ImageCore has always
+        // inferred), otherwise Unknown.
+        virtual PathSourceKind ClassifyPath(const std::wstring& path) const;
     };
 
     void SetPathByteSource(IPathByteSource* source);

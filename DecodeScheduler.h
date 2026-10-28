@@ -2,6 +2,7 @@
 
 #include "ImageRequest.h"
 #include "DecodeTypes.h"
+#include "IPathByteSource.h"
 #include <thread>
 #include <vector>
 #include <queue>
@@ -43,19 +44,23 @@ namespace ImageCore
         // mutex; set once, when a prefetch or decode thread takes the task).
         std::shared_ptr<ReadLease> readLease;
 
-        // Thumbnail/preview bytes read by the prefetch stage. Owned by this request,
-        // so no other request (canceled, finished, or same-path) can take them away.
+        // Bytes read by an I/O lane: thumbnail/preview bytes, or the input of a
+        // full-resolution request read by a main-image reader. Owned by this
+        // request, so no other request (canceled, finished, or same-path) can
+        // take them away.
         std::shared_ptr<const std::vector<uint8_t>> prefetched;
-        bool holdsPrefetchSlot { false };  // counted for prefetch backpressure
+        bool holdsPrefetchSlot { false };  // thumbnail bytes, counted for prefetch backpressure
+        bool holdsMainInput { false };     // main-image input, counted against kMainImageInputCap
         bool decoding { false };           // taken by a worker
-        std::wstring prefetchVolume;
+        std::wstring laneKey;              // I/O lane (empty: a local full-resolution request)
         std::wstring prefetchPath;
 
         // Scheduling (guarded by the queue mutex). The sequence orders requests
         // of one priority by age and survives promotion.
         RequestPriority priority { RequestPriority::Visible };
         uint64_t sequence { 0 };
-        enum class Stage { None, Io, Decode } queuedIn { Stage::None };
+        // Io: a lane's thumbnail queue; MainIo: a lane's main-image queue.
+        enum class Stage { None, Io, MainIo, Decode } queuedIn { Stage::None };
     };
 
     // Decode task
@@ -84,9 +89,12 @@ namespace ImageCore
         bool Empty() const { return m_tasks.empty(); }
         size_t Size() const { return m_tasks.size(); }
         RequestPriority TopPriority() const;
+        uint64_t TopSequence() const;
         DecodeTask Pop();
         // Moves the queued task of `state` to `priority`; false if not queued here.
         bool Reprioritize(DecodeRequestState& state, RequestPriority priority);
+        // Removes the queued task of `state` into `out`; false if not queued here.
+        bool Remove(DecodeRequestState& state, DecodeTask& out);
 
     private:
         struct Key
@@ -106,6 +114,111 @@ namespace ImageCore
         std::map<Key, DecodeTask> m_tasks;
     };
 
+    // Slow-source I/O lanes (floyd68/ImageCore#15)
+    // =============================================
+    //
+    // Byte-source reads (thumbnail/preview prefetch, and full-resolution reads
+    // of archive entries and remote files) run on I/O reader threads, never on
+    // a decode worker, and are scheduled in lanes so that a slow read that is
+    // still wanted (a deep entry of a solid 7z, a network or cloud file, a
+    // first open held up by on-access scanning) only delays work behind it in
+    // its own lane.
+    //
+    // Logical lanes. The host classifies each path once at Enqueue
+    // (IPathByteSource::ClassifyPath; IoLaneFor maps the kind to a lane):
+    // Local (also Unknown, the conservative default), Archive and Remote
+    // (network paths and cloud placeholders). A lane queue is keyed by
+    //   Local:   the physical device of the file;
+    //   Archive: the physical device of the host archive file, and on a device
+    //            without a seek penalty also the archive itself (two archives
+    //            on one SSD are separate lanes, on one HDD they share one);
+    //   Remote:  the server of a UNC path, or the drive letter (no local
+    //            device query is ever made for a Remote path).
+    // Each lane reads at most one thumbnail/preview at a time (in priority
+    // order, then age), so reads of one device stay sequential within a lane.
+    //
+    // Physical-device admission. A device is identified from a volume
+    // (IOCTL_STORAGE_GET_DEVICE_NUMBER on "\\.\X:", so several volume letters
+    // on one disk are one device; a volume the query cannot place is its own
+    // device). Local and Archive thumbnail reads are admitted per device: at
+    // most kMaxReadsPerSeekDevice on a device with a seek penalty (HDD, or
+    // unknown) and kMaxReadsPerSolidStateDevice otherwise. Remote reads are
+    // not admitted against a local device: they wait on the network.
+    //
+    // Same-HDD tradeoff (chosen: a bounded override, not strict
+    // serialization). Strict one-reader admission per HDD cannot also let a
+    // local read progress past a blocked archive read on that disk. A device
+    // with a seek penalty therefore admits two reads, one per logical lane
+    // (Local and Archive): a slow archive extraction (mostly decompression)
+    // and local thumbnails on the same HDD both progress, at the cost of at
+    // most two interleaved read streams on that disk. Two local folders of one
+    // HDD (even on different volume letters) still share one serialized lane,
+    // as do two archives on one HDD. Strict per-device serialization is not
+    // promised.
+    //
+    // Readers and bounds (process-wide per scheduler; ImageLoader owns one):
+    // - kReadersPerLane reader threads per logical lane (Local, Archive,
+    //   Remote), started with the scheduler. A lane kind can use only its own
+    //   readers, so blocked Archive or Remote reads never take a reader from
+    //   another lane kind (static reservation); with more active lanes of one
+    //   kind than its readers, the excess lanes wait (all lanes busy).
+    // - Fairness among lanes of one kind: a free reader takes the admissible
+    //   lane whose next request has the highest priority; on a tie, the lane
+    //   served least recently (a newly active lane counts as never served),
+    //   then the oldest request. So a newly active source is served by the
+    //   next free reader of its kind instead of after the backlog of busier
+    //   lanes.
+    // - Prefetch memory is bounded by counts, not bytes: thumbnail/preview
+    //   tasks holding read bytes plus thumbnail reads in progress never exceed
+    //   the global prefetch cap (at most 8: the sum of the per-device depths,
+    //   2 on a seek-penalty device and 4 otherwise), and each lane holds at
+    //   most its device's depth. When one prefetch slot is left, a reader does
+    //   not take it for lower-priority work while an idle reader of another
+    //   lane kind has higher-priority work waiting (#11 across lanes).
+    //   FileByteCache is capped at the same count. Each read is at most 1 GiB
+    //   (ReadWholeFileBytes), so the worst case is (cap + main-image inputs) x
+    //   1 GiB; there is no aggregate byte budget. The host's own budgets add to
+    //   this one (FICture2's ArchiveEntryHandoff documents the composition).
+    // - Lanes are created on demand and reclaimed as soon as one has no queued
+    //   request, no read in progress and no bytes held. Reader threads are a
+    //   fixed pool (3 x kReadersPerLane + kMainImageReaders).
+    //
+    // Main images. Full-resolution requests of Local paths are queued for the
+    // decode workers directly (the decoder reads the file, as before).
+    // Archive and Remote ones are read first by one of kMainImageReaders
+    // main-image reader threads, at above-normal priority, and then queued for
+    // the decode workers with their bytes; so a slow main-image read never
+    // occupies a decode worker (with SetThreadCount(1) the only worker keeps
+    // decoding thumbnails and local images meanwhile). Each lane also has a
+    // main-image queue that runs beside its thumbnail reads (a main image never
+    // waits for a thumbnail read of its lane, as before #15), one main-image
+    // read per lane at a time; the main-image lane of an archive entry is
+    // always the archive itself (also on an HDD), since main-image reads are
+    // not admitted against the device (as before #15). Main-image reads in
+    // progress plus inputs held for decoding are capped at kMainImageInputCap.
+    //
+    // Cancellation and admission waits. A request waits for lane, device and
+    // slot capacity in its lane queue, holding nothing; Cancel removes it from
+    // that queue at once (no callback), which can reclaim the lane. A read in
+    // progress is stopped as before (#14 stop token, read lease and
+    // CancelSynchronousIo on the reader thread). Capacity is only ever held by
+    // a read in progress or by bytes waiting for a decode worker, and decode
+    // workers never wait for I/O, so neither cancellation nor main-image work
+    // can deadlock behind an admission wait.
+    //
+    // Priority policy for the readers: a thumbnail/preview read enters
+    // background mode (THREAD_MODE_BACKGROUND_BEGIN) only around the read
+    // itself, as before #15 (SetBackgroundWorkPriority selects Normal for
+    // tests); readers wait at normal priority. Main-image readers run above
+    // normal. Rationale: lanes confine a starved or scan-delayed background
+    // read to its own lane, and raising only the read priority would not make
+    // thumbnails progress under all-core normal-priority load, because their
+    // decode also runs in background mode; changing both is a separate policy
+    // decision (see README "Priority").
+    //
+    // Topology cache: the device and seek-penalty answer of each volume is
+    // cached for kTopologyRefreshInterval, then queried again by the next
+    // Enqueue that needs it (outside the queue mutex); a restart clears it.
     class DecodeScheduler
     {
     public:
@@ -113,12 +226,21 @@ namespace ImageCore
         ~DecodeScheduler();
 
         // Upper bound on decode workers: one dedicated full-resolution worker plus
-        // up to four background (thumbnail) workers. Thumbnail I/O is serialized on a
-        // separate prefetch thread, so more decode workers only add CPU contention.
+        // up to four background (thumbnail) workers. Byte-source I/O runs on the
+        // separate lane readers, so more decode workers only add CPU contention.
         static constexpr size_t kMaxDecodeWorkers = 5;
 
-        // Set the number of decode worker threads (the serialized thumbnail prefetch
-        // thread is separate). The count is clamped to [1, kMaxDecodeWorkers];
+        // I/O lanes (see the design note above).
+        static constexpr size_t kReadersPerLane = 2;          // per logical lane
+        static constexpr size_t kMainImageReaders = 2;        // Archive/Remote full-resolution reads
+        static constexpr size_t kMainImageInputCap = 2;       // main-image reads + inputs held
+        static constexpr size_t kMaxReadsPerSeekDevice = 2;   // thumbnail reads per HDD
+        static constexpr size_t kMaxReadsPerSolidStateDevice = 3;
+        static constexpr size_t kMaxPrefetchCap = 8;          // global prefetch cap
+        static constexpr std::chrono::seconds kTopologyRefreshInterval { 60 };
+
+        // Set the number of decode worker threads (the I/O lane readers are
+        // separate). The count is clamped to [1, kMaxDecodeWorkers];
         // WorkerCount() reports the number actually started. With 1, a single shared
         // worker serves full-resolution work first and background work when no
         // full-resolution work is queued; with 2 or more, one worker is dedicated to
@@ -143,10 +265,16 @@ namespace ImageCore
         // invokes the callback) once the scheduler has been shut down.
         //
         // Priority: full-resolution requests have their own queue, served first
-        // by every worker. Thumbnail/preview requests pass the serialized I/O
-        // stage and then the decode stage; both take the highest priority first
-        // (then the oldest), and a higher-priority request also takes over the
-        // next free prefetch slot from a lower-priority one waiting for it.
+        // by every worker (Archive/Remote ones are read by a main-image reader
+        // first). Thumbnail/preview requests pass their I/O lane and then the
+        // decode stage; both take the highest priority first (then the oldest),
+        // and a higher-priority request also takes the next free prefetch slot
+        // before a lower-priority one waiting for it.
+        //
+        // Lane selection calls the byte source's ClassifyPath and
+        // ResolveHostPath, and on the first request of a volume (and after
+        // kTopologyRefreshInterval) a volume device query; all of it runs on the
+        // calling thread before the queue mutex is taken.
         bool Enqueue(DecodeTask task);
 
         // Changes the priority of a queued request, O(log n): promotion moves it
@@ -156,10 +284,11 @@ namespace ImageCore
         // a recycled tile can promote or demote a stale handle safely.
         void SetPriority(uint64_t handle, RequestPriority priority);
 
-        // Best-effort cancel, O(1). A queued task releases its prefetched bytes
-        // and prefetch slot at once and is dropped without a callback when a
-        // thread reaches it. A byte-source read in progress (thumbnail prefetch
-        // or full-resolution archive read) is asked to stop through the
+        // Best-effort cancel, O(log n). A task waiting in an I/O lane is removed
+        // at once (no callback). A task waiting for decode releases its read
+        // bytes and prefetch slot at once and is dropped without a callback when
+        // a worker reaches it. A byte-source read in progress (thumbnail prefetch
+        // or full-resolution archive/remote read) is asked to stop through the
         // request's stop token, and CancelSynchronousIo is tried on the reading
         // thread (best effort); its result is discarded, never cached, and the
         // request never reaches the decode stage (so the decoders' own path
@@ -212,7 +341,7 @@ namespace ImageCore
         // state is only held for these).
         size_t LiveRequestCount() const;
 
-        // Tests/diagnostics: volumes with recorded prefetch tuning.
+        // Tests/diagnostics: devices with recorded prefetch tuning.
         size_t VolumeProfileCount() const;
 
         // Tests/diagnostics: tasks currently holding prefetched bytes (the
@@ -233,15 +362,15 @@ namespace ImageCore
                 HighPriority,   // full-resolution worker
                 Background,     // thumbnail decode worker (also steals full-resolution work)
                 Shared,         // sole worker: full-resolution first, then thumbnails
-                Prefetch,       // serialized thumbnail I/O thread
+                Prefetch,       // thumbnail/preview I/O lane reader (see `lane`)
                 StopDispatch,   // runs stop requests for Cancel and Shutdown
+                MainReader,     // full-resolution Archive/Remote reader
             };
             enum class Phase : uint8_t
             {
                 Starting,       // thread started, not yet waiting for work
-                Idle,           // waiting for work
+                Idle,           // waiting for work (a reader: no admissible lane)
                 Taken,          // worker: task taken, entering its priority mode
-                WaitingForSlot, // prefetch: task taken, waiting for a prefetch slot
                 Reading,        // byte-source read in progress
                 Decoding,       // decode stage in progress
                 Delivering,     // result callback running
@@ -251,6 +380,7 @@ namespace ImageCore
             struct Thread
             {
                 Role role { Role::Background };
+                IoLane lane { IoLane::Local };  // Prefetch readers: the lane kind served
                 Phase phase { Phase::Starting };
                 uint64_t handle { 0 };        // request in progress (0: none)
                 bool backgroundMode { false };// entering, in or leaving background mode
@@ -261,11 +391,15 @@ namespace ImageCore
 
             bool shutdown { false };
             size_t highQueued { 0 };        // full-resolution queue
-            size_t ioQueued { 0 };          // thumbnail prefetch (I/O) queue
+            size_t ioQueued { 0 };          // thumbnail/preview requests in lane queues
+            size_t mainIoQueued { 0 };      // full-resolution requests in lane queues
             size_t decodeQueued { 0 };      // thumbnail decode queue
             size_t liveRequests { 0 };      // queued or in progress
             size_t prefetchedTasks { 0 };   // admitted: holding prefetched bytes
+            size_t prefetchReads { 0 };     // thumbnail reads in progress (hold a slot too)
             size_t prefetchCap { 0 };       // global prefetch cap
+            size_t mainInputs { 0 };        // main-image reads in progress + inputs held
+            size_t lanes { 0 };             // lanes alive (reclaimed when idle)
             bool threadsListed { false };
             std::vector<Thread> threads;
         };
@@ -314,6 +448,22 @@ namespace ImageCore
         // starts a task, so it may be called at any time.
         void SetBackgroundWorkPriority(BackgroundWorkPriority priority);
 
+        // Physical placement of a volume ("C:"): `device` identifies the disk
+        // (volumes with equal ids share admission), `incursSeekPenalty` selects
+        // the HDD admission bound and prefetch depth.
+        struct VolumeTopology
+        {
+            std::wstring device;
+            bool incursSeekPenalty { true };
+        };
+        using VolumeTopologyQuery = std::function<VolumeTopology(const std::wstring& volume)>;
+
+        // Test seam: replaces the volume device query (an empty function
+        // restores it). Called from Enqueue, outside the queue mutex, with the
+        // volume of the file (or of the host archive); never for Remote paths
+        // or paths without a drive letter. Set it before the first Enqueue.
+        void SetVolumeTopologyQuery(VolumeTopologyQuery query);
+
     private:
         enum class WorkerKind
         {
@@ -322,12 +472,40 @@ namespace ImageCore
             Shared      // sole worker: high queue first, then background queue
         };
 
-        // One scheduler thread (decode worker or prefetch thread) and its read
-        // lease. Defined in DecodeScheduler.cpp.
+        // One scheduler thread (decode worker or reader) and its read lease.
+        // Defined in DecodeScheduler.cpp.
         struct ThreadSlot;
 
+        // One I/O lane queue (see the design note). Defined in DecodeScheduler.cpp.
+        struct Lane;
+
+        // Where a request's bytes are read: its lane key and the lane's
+        // admission parameters. Computed outside the queue mutex.
+        struct Route
+        {
+            IoLane lane { IoLane::Local };
+            std::wstring key;
+            std::wstring device;
+            size_t depth { 2 };
+            size_t deviceLimit { kMaxReadsPerSeekDevice };
+        };
+
         void WorkerThread(WorkerKind kind, ThreadSlot* slot);
-        void ThumbPrefetchThread(ThreadSlot* slot);
+        void LaneReaderThread(IoLane lane, ThreadSlot* slot);
+        void MainReaderThread(ThreadSlot* slot);
+
+        // Lane of `request` (host classification, host path, volume topology).
+        // Called without m_queueMutex: the host and the device query can block.
+        Route RouteFor(const ImageRequest& request, IoLane lane);
+        VolumeTopology TopologyForVolume(const std::wstring& volume);
+
+        // Lane selection for a free reader; null when none is admissible.
+        // Require m_queueMutex.
+        Lane* SelectThumbnailLane_NoLock(IoLane kind);
+        Lane* SelectMainLane_NoLock();
+        bool ThumbnailAdmissible_NoLock(const Lane& lane) const;
+        // Erases `key`'s lane when it has nothing queued, in progress or held.
+        void ReclaimLane_NoLock(const std::wstring& key);
 
         // Last step of every scheduler thread: marks `slot` exited for Shutdown.
         void SignalExit(ThreadSlot& slot);
@@ -371,16 +549,12 @@ namespace ImageCore
         // for its handle). Requires m_queueMutex.
         void Finish_NoLock(const DecodeTask& task);
 
-        // Gives back the request's prefetch slot (backpressure count) and drops
-        // its bytes. Returns true if a slot was released; the caller then notifies
-        // m_queueCondition after unlocking. Requires m_queueMutex.
+        // Gives back the request's prefetch slot or main-image input (capacity
+        // counts) and drops its bytes. Returns true if capacity was released;
+        // the caller then notifies m_queueCondition. Requires m_queueMutex.
         bool ReleasePrefetch_NoLock(DecodeRequestState& state);
 
-        // Cached per-volume seek-penalty query. Called without m_queueMutex: the
-        // storage query opens the volume device and can block.
-        size_t PrefetchDepthForPath(const std::wstring& path);
-
-        // Decode workers and the prefetch thread. Started and joined only by
+        // Decode workers and the I/O readers. Started and joined only by
         // SetThreadCount and Shutdown, under m_lifecycleMutex (which also guards
         // m_joinPending: a bounded Shutdown left threads unjoined).
         mutable std::mutex m_lifecycleMutex;
@@ -403,7 +577,6 @@ namespace ImageCore
         std::atomic<BackgroundWorkPriority> m_backgroundWorkPriority { BackgroundWorkPriority::BackgroundMode };
 
         std::queue<DecodeTask> m_highQueue;
-        PriorityTaskQueue m_thumbIoQueue;     // serialized disk reads (thumbnail/preview)
         PriorityTaskQueue m_backgroundQueue;  // CPU decode/resize work (from prefetched bytes)
         uint64_t m_nextSequence { 0 };        // guarded by m_queueMutex
         mutable std::mutex m_queueMutex;
@@ -412,26 +585,38 @@ namespace ImageCore
 
         size_t m_threadCount;
 
-        struct VolumeIoProfile
-        {
-            bool incursSeek { true };
-            size_t prefetchDepth { 2 };
-        };
+        // I/O lanes by key, and their capacity counts (guarded by m_queueMutex).
+        std::map<std::wstring, std::unique_ptr<Lane>> m_lanes;
+        std::unordered_map<std::wstring, size_t> m_readsByDevice {};  // thumbnail reads in progress
+        size_t m_readsInProgress[3] {};   // thumbnail reads in progress per IoLane
+        uint64_t m_serviceClock { 0 };    // fairness: lane service order
 
-        // Guarded by m_queueMutex.
-        std::unordered_map<std::wstring, VolumeIoProfile> m_volumeProfiles {};
+        // Prefetch depth per device (guarded by m_queueMutex); the global cap
+        // is their sum, at most kMaxPrefetchCap.
+        std::unordered_map<std::wstring, size_t> m_volumeProfiles {};
         size_t m_globalPrefetchCap { 4 };
 
-        // Tasks holding prefetched bytes, in total and per volume (guarded by
-        // m_queueMutex). The prefetch stage waits while these are at their caps.
+        // Tasks holding prefetched thumbnail bytes and thumbnail reads in
+        // progress (guarded by m_queueMutex); together at most the global cap.
         size_t m_prefetchedTotal { 0 };
-        std::unordered_map<std::wstring, size_t> m_prefetchedByVolume {};
+        size_t m_prefetchReads { 0 };
+
+        // Main-image reads in progress and inputs held (guarded by m_queueMutex).
+        size_t m_mainReads { 0 };
+        size_t m_mainHeld { 0 };
 
         // Queued or decoding requests by handle (guarded by m_queueMutex).
         std::unordered_map<uint64_t, std::shared_ptr<DecodeRequestState>> m_liveRequests {};
 
-        // Seek-penalty results by volume (guarded by m_seekPenaltyMutex).
-        mutable std::mutex m_seekPenaltyMutex;
-        std::unordered_map<std::wstring, bool> m_seekPenaltyByVolume {};
+        // Volume topology by volume, with the time of the query (guarded by
+        // m_topologyMutex), and the test seam replacing the query.
+        struct CachedTopology
+        {
+            VolumeTopology topology;
+            std::chrono::steady_clock::time_point queried;
+        };
+        mutable std::mutex m_topologyMutex;
+        std::unordered_map<std::wstring, CachedTopology> m_topologyByVolume {};
+        VolumeTopologyQuery m_topologyQuery;
     };
 }
