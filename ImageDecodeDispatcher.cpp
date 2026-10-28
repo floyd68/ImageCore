@@ -1019,13 +1019,19 @@ namespace ImageCore
         // safe even if app already called it
         RegisterBuiltInDecoders();
 
-        // Prefer explicit header bytes if available (avoids extra disk I/O in the dispatcher).
-        // Otherwise fall back to ProbeFile(path).
+        // The header comes from what is decoded: the explicit header, else the
+        // start of the in-memory bytes (the file at the path may differ or not
+        // exist); only a path-only request reads it from the file (ProbeFile).
         static ImageFormatDetector s_detector;
         FormatProbe probe {};
-        if (!input.header.empty())
+        std::span<const uint8_t> header = input.header;
+        if (header.empty() && !input.bytes.empty())
         {
-            probe.header.assign(input.header.begin(), input.header.end());
+            header = input.bytes.first((std::min)(input.bytes.size(), ImageFormatDetector::kProbeSize));
+        }
+        if (!header.empty())
+        {
+            probe.header.assign(header.begin(), header.end());
             probe.extensionLower = ImageFormatDetector::GetLowerExtension(request.source);
             probe.info = ImageFormatDetector::DetectByMagic(probe.header);
             if (probe.info.format == ImageFormat::Unknown && !probe.extensionLower.empty())
@@ -1039,7 +1045,8 @@ namespace ImageCore
         }
 
         // Decoders get the probed header, so they route by the detected
-        // format as the candidate factories do (a path-only request has none).
+        // format as the candidate factories do (a path-only or bytes-only
+        // request has none).
         DecodeInput routed = input;
         if (routed.header.empty())
         {

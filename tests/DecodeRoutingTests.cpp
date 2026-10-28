@@ -192,8 +192,11 @@ namespace
         }
     }
 
-    // Decodes on a fresh thread. `bytes` empty means a path-only request.
-    Outcome Decode(const std::wstring& source, ImagePurpose purpose, const std::vector<uint8_t>& bytes)
+    // Decodes on a fresh thread. `bytes` empty means a path-only request;
+    // `withHeader` false leaves the optional header of an in-memory request
+    // empty.
+    Outcome Decode(const std::wstring& source, ImagePurpose purpose, const std::vector<uint8_t>& bytes,
+        bool withHeader = true)
     {
         RegisterBuiltInDecoders();
         ImageRequest request(source, purpose);
@@ -207,7 +210,10 @@ namespace
         if (!bytes.empty())
         {
             input.bytes = std::span<const uint8_t>(bytes.data(), bytes.size());
-            input.header = std::span<const uint8_t>(bytes.data(), (std::min)(bytes.size(), ImageFormatDetector::kProbeSize));
+            if (withHeader)
+            {
+                input.header = std::span<const uint8_t>(bytes.data(), (std::min)(bytes.size(), ImageFormatDetector::kProbeSize));
+            }
         }
 
         Outcome outcome {};
@@ -392,6 +398,48 @@ IC_TEST(DecodeRouting_ValidDdsWithAMismatchingExtensionDecodes)
             {
                 IC_CHECK(pathOnly.pixels == reference.pixels);
             }
+        }
+    }
+}
+
+// In-memory bytes without the optional header are routed by the bytes, never
+// by the file at the source path: decoys of another format there (an HDR
+// signature, a PNG, a DDS) change nothing.
+IC_TEST(DecodeRouting_BytesWithoutHeaderAreRoutedByTheBytes)
+{
+    static constexpr uint8_t kHdr[] = { '#', '?', 'R', 'A', 'D', 'I', 'A', 'N', 'C', 'E', '\n' };
+    const std::vector<uint8_t> dds = Encode(Format::Dds, kWidth, kHeight);
+    const std::vector<uint8_t> png = Encode(Format::Png, kWidth, kHeight);
+    const std::wstring hdrDecoy = WriteFile(L"hdr_decoy.dds", std::vector<uint8_t>(std::begin(kHdr), std::end(kHdr)));
+    const std::wstring pngDecoy = WriteFile(L"png_decoy.dds", Encode(Format::Png, kHeight, kWidth));
+    const std::wstring ddsDecoy = WriteFile(L"dds_decoy.png", Encode(Format::Dds, kHeight, kWidth));
+
+    for (const ImagePurpose purpose : { ImagePurpose::Thumbnail, ImagePurpose::FullResolution })
+    {
+        const bool thumb = (purpose == ImagePurpose::Thumbnail);
+        const uint32_t expectedWidth = thumb ? static_cast<uint32_t>(kThumbTarget) : static_cast<uint32_t>(kWidth);
+        const uint32_t expectedHeight = thumb ? static_cast<uint32_t>(kThumbTarget / 2) : static_cast<uint32_t>(kHeight);
+
+        struct Case
+        {
+            const std::wstring* source;
+            const std::vector<uint8_t>* bytes;
+            bool viaWic;
+        };
+        for (const Case& c : { Case { &hdrDecoy, &dds, false }, Case { &pngDecoy, &dds, false },
+                 Case { &ddsDecoy, &png, true } })
+        {
+            const Outcome withHeader = Decode(*c.source, purpose, *c.bytes);
+            const Outcome bytesOnly = Decode(*c.source, purpose, *c.bytes, false);
+            if (FAILED(bytesOnly.hr))
+            {
+                std::fprintf(stderr, "  bytes-only decode failed: hr=0x%08lX\n", static_cast<unsigned long>(bytesOnly.hr));
+            }
+            IC_CHECK(SUCCEEDED(withHeader.hr));
+            IC_CHECK(SUCCEEDED(bytesOnly.hr));
+            IC_CHECK(bytesOnly.width == expectedWidth && bytesOnly.height == expectedHeight);
+            IC_CHECK(bytesOnly.wicFactoryAfter == c.viaWic);
+            IC_CHECK(!bytesOnly.pixels.empty() && bytesOnly.pixels == withHeader.pixels);
         }
     }
 }
