@@ -865,15 +865,16 @@ namespace ImageCore
                 const ImageFormatInfo info = ImageFormatDetector::DetectByMagic(header);
                 switch (info.format)
                 {
-                case ImageFormat::PNG:
-                case ImageFormat::JPEG:
-                case ImageFormat::BMP:
-                case ImageFormat::GIF:
-                case ImageFormat::TIFF:
-                case ImageFormat::WEBP:
-                    return true;
+                case ImageFormat::DDS:
+                case ImageFormat::EXR:
+                case ImageFormat::HDR:
+                    // Owned by the DirectXTex factory: a file it rejects is not
+                    // retried through WIC (which would also create this thread's
+                    // WIC factory, e.g. on an Explorer thread in the thumbnail DLL).
+                    return false;
                 default:
-                    // If Unknown, keep it as an extension-based candidate (try another decoder on Decode failure)
+                    // WIC formats, and Unknown kept as an extension-based candidate
+                    // (try another decoder on Decode failure).
                     return true;
                 }
             }

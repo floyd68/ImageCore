@@ -1,5 +1,7 @@
 #include "TestHarness.h"
 
+#include "DecoderRegistry.h"
+#include "IImageDecoderFactory.h"
 #include "ImageCore.h"
 #include "ImageDecodeDispatcher.h"
 #include "ImageFormatDetector.h"
@@ -106,6 +108,14 @@ namespace
         }
         const auto* bytes = static_cast<const uint8_t*>(blob.GetBufferPointer());
         return std::vector<uint8_t>(bytes, bytes + blob.GetBufferSize());
+    }
+
+    // "DDS " magic followed by a header DirectXTex rejects (size field 0).
+    std::vector<uint8_t> CorruptDds()
+    {
+        std::vector<uint8_t> bytes(4 + 124 + 256, 0);
+        std::memcpy(bytes.data(), "DDS ", 4);
+        return bytes;
     }
 
     std::filesystem::path TempDir()
@@ -218,6 +228,23 @@ namespace
         });
         return outcome;
     }
+
+    std::vector<std::wstring> CandidateIds(const std::wstring& source, std::span<const uint8_t> header)
+    {
+        RegisterBuiltInDecoders();
+        std::vector<std::wstring> ids;
+        for (const auto& factory : DecoderRegistry::Instance().GetCandidateFactories(
+                 ImageRequest(source, ImagePurpose::Thumbnail), header))
+        {
+            ids.emplace_back(factory->Id());
+        }
+        return ids;
+    }
+
+    bool Contains(const std::vector<std::wstring>& ids, const wchar_t* id)
+    {
+        return std::find(ids.begin(), ids.end(), id) != ids.end();
+    }
 }
 
 IC_TEST(DecodeRouting_ThreadResourceQueryTracksTheWicFactory)
@@ -241,6 +268,47 @@ IC_TEST(DecodeRouting_ThreadResourceQueryTracksTheWicFactory)
         ImageDecodeDispatcher::ReleaseThreadResources();
         IC_CHECK(!ImageDecodeDispatcher::HasThreadResources());
     });
+}
+
+IC_TEST(DecodeRouting_WicProbeRejectsMagicOwnedByDirectXTex)
+{
+    const std::vector<uint8_t> dds = Encode(Format::Dds, kWidth, kHeight);
+    const std::vector<uint8_t> corrupt = CorruptDds();
+    static constexpr uint8_t kHdr[] = { '#', '?', 'R', 'A', 'D', 'I', 'A', 'N', 'C', 'E', '\n' };
+    static constexpr uint8_t kExr[] = { 0x76, 0x2F, 0x31, 0x01, 0x02, 0x00, 0x00, 0x00 };
+
+    // DDS magic: DirectXTex only, whatever the extension says.
+    const std::vector<std::wstring> ddsIds = CandidateIds(L"x.dds", dds);
+    IC_CHECK(Contains(ddsIds, L"builtin.dxtex"));
+    IC_CHECK(!Contains(ddsIds, L"builtin.wic"));
+    IC_CHECK(!Contains(CandidateIds(L"x.dds", corrupt), L"builtin.wic"));
+    IC_CHECK(!Contains(CandidateIds(L"x.png", dds), L"builtin.wic"));
+    IC_CHECK(!Contains(CandidateIds(L"x.hdr", kHdr), L"builtin.wic"));
+    IC_CHECK(!Contains(CandidateIds(L"x.exr", kExr), L"builtin.wic"));
+
+    // WIC formats and unknown magic keep WIC as a candidate.
+    const std::vector<uint8_t> png = Encode(Format::Png, kWidth, kHeight);
+    IC_CHECK(Contains(CandidateIds(L"x.png", png), L"builtin.wic"));
+    IC_CHECK(Contains(CandidateIds(L"x.dds", png), L"builtin.wic"));
+    IC_CHECK(Contains(CandidateIds(L"x.jpg", {}), L"builtin.wic"));
+}
+
+IC_TEST(DecodeRouting_CorruptDdsFailsWithoutWic)
+{
+    const std::vector<uint8_t> corrupt = CorruptDds();
+    const std::wstring missing = (TempDir() / L"missing_corrupt.dds").wstring();
+    const std::wstring onDisk = WriteFile(L"corrupt.dds", corrupt);
+
+    for (const ImagePurpose purpose : { ImagePurpose::Thumbnail, ImagePurpose::FullResolution })
+    {
+        const Outcome inMemory = Decode(missing, purpose, corrupt);
+        IC_CHECK(FAILED(inMemory.hr));
+        IC_CHECK(!inMemory.wicFactoryAfter);
+
+        const Outcome pathOnly = Decode(onDisk, purpose, {});
+        IC_CHECK(FAILED(pathOnly.hr));
+        IC_CHECK(!pathOnly.wicFactoryAfter);
+    }
 }
 
 IC_TEST(DecodeRouting_InMemoryAndPathOnlyRequests)
