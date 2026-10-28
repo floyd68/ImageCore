@@ -101,7 +101,7 @@ namespace
         static const HRESULT s_hrCom = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         IC_REQUIRE(SUCCEEDED(s_hrCom));
         ImageDecodeDispatcher dispatcher;
-        PipelineResult result = dispatcher.Decode(request, nullptr, input);
+        PipelineResult result = dispatcher.Decode(request, input);
         if (FAILED(result.hr))
         {
             std::fprintf(stderr, "  decode failed: hr=0x%08lX\n", static_cast<unsigned long>(result.hr));

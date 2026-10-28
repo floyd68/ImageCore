@@ -537,9 +537,8 @@ namespace ImageCore
         class WICThumbnailDecoder final : public IImageDecoder, private WICDecoderCommon
         {
         public:
-            PipelineResult Decode(const ImageRequest& request, IWICImagingFactory* wicFactory, const DecodeInput& input) override
+            PipelineResult Decode(const ImageRequest& request, const DecodeInput& input) override
             {
-                UNREFERENCED_PARAMETER(wicFactory);
                 if (request.source.empty())
                 {
                     return PipelineResult(E_INVALIDARG);
@@ -588,9 +587,8 @@ namespace ImageCore
         class WICFullImageDecoder final : public IImageDecoder, private WICDecoderCommon
         {
         public:
-            PipelineResult Decode(const ImageRequest& request, IWICImagingFactory* wicFactory, const DecodeInput& input) override
+            PipelineResult Decode(const ImageRequest& request, const DecodeInput& input) override
             {
-                UNREFERENCED_PARAMETER(wicFactory);
                 if (request.source.empty())
                 {
                     return PipelineResult(E_INVALIDARG);
@@ -622,9 +620,8 @@ namespace ImageCore
         class DXTexThumbnailDecoder final : public IImageDecoder, private DXTexDecoderCommon
         {
         public:
-            PipelineResult Decode(const ImageRequest& request, IWICImagingFactory* wicFactory, const DecodeInput& input) override
+            PipelineResult Decode(const ImageRequest& request, const DecodeInput& input) override
             {
-                UNREFERENCED_PARAMETER(wicFactory);
                 if (request.source.empty())
                 {
                     return PipelineResult(E_INVALIDARG);
@@ -749,9 +746,8 @@ namespace ImageCore
         class DXTexFullImageDecoder final : public IImageDecoder, private DXTexDecoderCommon
         {
         public:
-            PipelineResult Decode(const ImageRequest& request, IWICImagingFactory* wicFactory, const DecodeInput& input) override
+            PipelineResult Decode(const ImageRequest& request, const DecodeInput& input) override
             {
-                UNREFERENCED_PARAMETER(wicFactory);
                 if (request.source.empty())
                 {
                     return PipelineResult(E_INVALIDARG);
@@ -996,7 +992,7 @@ namespace ImageCore
         return DecoderRegistry::Instance().GetSupportedExtensions();
     }
 
-    PipelineResult ImageDecodeDispatcher::Decode(const ImageRequest& request, IWICImagingFactory* wicFactory, const DecodeInput& input)
+    PipelineResult ImageDecodeDispatcher::Decode(const ImageRequest& request, const DecodeInput& input)
     {
         if (request.source.empty())
         {
@@ -1080,7 +1076,7 @@ namespace ImageCore
                 continue;
             }
 
-            PipelineResult result = decoder->Decode(request, wicFactory, input);
+            PipelineResult result = decoder->Decode(request, input);
             lastHr = result.hr;
             if (SUCCEEDED(result.hr))
             {

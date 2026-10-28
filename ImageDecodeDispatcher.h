@@ -12,7 +12,7 @@ namespace ImageCore
     {
     public:
         static std::vector<std::wstring> GetSupportedExtensions();
-        PipelineResult Decode(const ImageRequest& request, IWICImagingFactory* wicFactory, const DecodeInput& input);
+        PipelineResult Decode(const ImageRequest& request, const DecodeInput& input);
 
         // Releases the calling thread's cached COM objects (the per-thread WIC
         // factory). A decode worker must call this before CoUninitialize(); a

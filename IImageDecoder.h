@@ -2,8 +2,6 @@
 
 #include "DecodeTypes.h"
 
-struct IWICImagingFactory;
-
 namespace ImageCore
 {
     // Minimal interface implemented by user-defined extension decoders
@@ -11,7 +9,7 @@ namespace ImageCore
     {
     public:
         virtual ~IImageDecoder() = default;
-        virtual PipelineResult Decode(const ImageRequest& request, IWICImagingFactory* wicFactory, const DecodeInput& input) = 0;
+        virtual PipelineResult Decode(const ImageRequest& request, const DecodeInput& input) = 0;
     };
 }
 
