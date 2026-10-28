@@ -52,6 +52,10 @@ namespace ImageCore
         bool holdsPrefetchSlot { false };  // thumbnail bytes, counted for prefetch backpressure
         bool holdsMainInput { false };     // main-image input, counted against kMainImageInputCap
         bool decoding { false };           // taken by a worker
+        // An Archive/Remote lane read returned no bytes: the request is
+        // delivered as a failure without decoding, since the decoders would
+        // reopen the path on a decode worker (outside the lanes).
+        bool slowReadFailed { false };
         std::wstring laneKey;              // I/O lane (empty: a local full-resolution request)
         std::wstring prefetchPath;
 
@@ -196,6 +200,12 @@ namespace ImageCore
     // always the archive itself (also on an HDD), since main-image reads are
     // not admitted against the device (as before #15). Main-image reads in
     // progress plus inputs held for decoding are capped at kMainImageInputCap.
+    //
+    // Failed slow reads. An Archive or Remote read (thumbnail or main image)
+    // that returns no bytes without being stopped is delivered as
+    // HRESULT_FROM_WIN32(ERROR_READ_FAULT) without decoding: the decoders'
+    // path fallback would reopen the source on a decode worker, outside the
+    // lanes. A failed Local read still falls back to the path, as before.
     //
     // Cancellation and admission waits. A request waits for lane, device and
     // slot capacity in its lane queue, holding nothing; Cancel removes it from

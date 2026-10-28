@@ -1558,7 +1558,13 @@ namespace ImageCore
                     skipped = true;
                 }
 
-                if (!skipped)
+                if (!skipped && task.state && task.state->slowReadFailed)
+                {
+                    // No path fallback: it would block this worker on the slow source.
+                    result = PipelineResult(HRESULT_FROM_WIN32(ERROR_READ_FAULT));
+                    IC_LOG_ERROR("[DecodeScheduler] Slow-source read failed ({})", Log::ToUtf8(src));
+                }
+                else if (!skipped)
                 {
                     RunTestHook(TestPoint::DecodeStart, task.handle);
                     slot->Publish(Diagnostics::Phase::Decoding, task.handle);
@@ -1774,8 +1780,9 @@ namespace ImageCore
                 }
             }
 
-            // Schedule CPU decode work unless canceled; the decoder falls back to the
-            // file path if an uncanceled prefetch failed.
+            // Schedule CPU decode work unless canceled. After a failed Local read
+            // the decoder falls back to the file path; a failed Archive/Remote
+            // read is delivered as a failure (slowReadFailed).
             if (stopped || task.state->canceled.load())
             {
                 // Canceled while its bytes were being read (it was in no queue).
@@ -1787,6 +1794,10 @@ namespace ImageCore
             }
             else
             {
+                if ((!bytes || bytes->empty()) && kind != IoLane::Local)
+                {
+                    task.state->slowReadFailed = true;
+                }
                 if (bytes)
                 {
                     task.state->prefetched = std::move(bytes);
@@ -1871,7 +1882,6 @@ namespace ImageCore
             auto bytes = LeasedRead(*slot->lease, task.state, task.handle, task.request.source, stopped);
             if (!stopped && (!bytes || bytes->empty()))
             {
-                // The decoder then tries the path itself, as before lanes.
                 IC_LOG_WARN("[DecodeScheduler] Full-res lane read returned empty bytes.");
             }
 
@@ -1891,6 +1901,11 @@ namespace ImageCore
                     task.state->prefetched = std::move(bytes);
                     task.state->holdsMainInput = true;
                     ++m_mainHeld;
+                }
+                else
+                {
+                    // Main-image readers serve Archive/Remote lanes only.
+                    task.state->slowReadFailed = true;
                 }
                 m_highQueue.push(std::move(task));
             }

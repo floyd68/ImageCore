@@ -1290,3 +1290,77 @@ IC_TEST(Lanes_TwoWorkersDecodeWhileTwoArchiveMainImagesAreBlocked)
     IC_CHECK(!done.Done(1));
     std::printf("  two workers: 10 local thumbnails + local main image in %lld ms with two archive main images blocked\n", ms);
 }
+
+IC_TEST(Lanes_FailedSlowReadsNeverFallBackToThePathOnAWorker)
+{
+    // A Remote read that returns no bytes is delivered as a failure without
+    // decoding: the decoders' path fallback would reopen the source on the
+    // decode worker, outside the lanes. The path is a local named pipe whose
+    // reads block until the pipe is closed, so a fallback would hold the only
+    // worker; local thumbnails and a local main image must still complete.
+    Watchdog watchdog("failed slow reads, one worker");
+    FakeTopology topology;
+    LaneSource source(Files().dir, topology);
+    Completions done;
+
+    const std::wstring pipe = L"\\\\.\\pipe\\ImageCoreLaneFallback_" + std::to_wstring(GetCurrentProcessId()) + L".bmp";
+    // Two listening instances: one per possible fallback open.
+    HANDLE instances[2] {};
+    for (HANDLE& instance : instances)
+    {
+        instance = CreateNamedPipeW(pipe.c_str(), PIPE_ACCESS_OUTBOUND, PIPE_TYPE_BYTE | PIPE_WAIT,
+            2, 4096, 4096, 0, nullptr);
+        IC_REQUIRE(instance != INVALID_HANDLE_VALUE);
+    }
+    // Without the fix a decoder blocks on the pipe: closing it releases the
+    // worker before the scheduler joins it (the check below then fails).
+    const auto closePipes = [&]
+    {
+        for (HANDLE& instance : instances)
+        {
+            if (instance)
+            {
+                DisconnectNamedPipe(instance);
+                CloseHandle(instance);
+                instance = nullptr;
+            }
+        }
+    };
+    OnExit closeAtEnd { closePipes };
+
+    long long ms = 0;
+    {
+        LaneScheduler scheduler(topology, 1);
+        IC_REQUIRE(scheduler.WorkerCount() == 1);
+        OnExit releaseWorker { closePipes };
+
+        // LaneSource has no file of that name: both reads return no bytes.
+        IC_REQUIRE(scheduler.Enqueue(Full(pipe, 1, done)));
+        IC_REQUIRE(scheduler.Enqueue(Thumb(pipe, 2, done)));
+        IC_REQUIRE(WaitUntil(scheduler, "failed slow reads delivered", [&] { return done.AllDone(1, 2); }));
+        IC_CHECK(!done.Succeeded(1));
+        IC_CHECK(!done.Succeeded(2));
+        IC_CHECK(source.Reads(pipe) == 2);
+
+        const auto start = std::chrono::steady_clock::now();
+        for (uint64_t i = 0; i < 10; ++i)
+        {
+            IC_REQUIRE(scheduler.Enqueue(Thumb(LocalPath(L"F:", 30 + static_cast<int>(i)), 10 + i, done)));
+        }
+        IC_REQUIRE(scheduler.Enqueue(Full(Files().fullRes, 3, done)));
+        IC_REQUIRE(WaitUntil(scheduler, "local work", [&] { return done.AllDone(10, 19) && done.Done(3); }));
+        ms = MsSince(start);
+        IC_CHECK(done.Succeeded(3));
+        IC_REQUIRE(Idle(scheduler));
+
+        // No decoder opened the pipe: neither instance has a client.
+        for (HANDLE instance : instances)
+        {
+            DWORD mode = PIPE_NOWAIT;
+            IC_REQUIRE(SetNamedPipeHandleState(instance, &mode, nullptr, nullptr));
+            IC_CHECK(!ConnectNamedPipe(instance, nullptr) && GetLastError() == ERROR_PIPE_LISTENING);
+        }
+    }
+
+    std::printf("  failed slow reads delivered without a path fallback; local work in %lld ms\n", ms);
+}
