@@ -153,6 +153,19 @@ namespace ImageCore
         std::thread thread;
         std::shared_ptr<ReadLease> lease { std::make_shared<ReadLease>() };
         bool exited { false };  // guarded by m_exitMutex
+
+        // Published for GetDiagnostics only (relaxed stores, never read for
+        // scheduling decisions).
+        Diagnostics::Role role { Diagnostics::Role::Background };
+        std::atomic<Diagnostics::Phase> phase { Diagnostics::Phase::Starting };
+        std::atomic<uint64_t> handle { 0 };
+        std::atomic<bool> backgroundMode { false };
+
+        void Publish(Diagnostics::Phase newPhase, uint64_t newHandle)
+        {
+            handle.store(newHandle, std::memory_order_relaxed);
+            phase.store(newPhase, std::memory_order_relaxed);
+        }
     };
 
     namespace
@@ -281,6 +294,11 @@ namespace ImageCore
         m_testHook = std::move(hook);
     }
 
+    void DecodeScheduler::SetBackgroundWorkPriority(BackgroundWorkPriority priority)
+    {
+        m_backgroundWorkPriority.store(priority, std::memory_order_relaxed);
+    }
+
     void DecodeScheduler::RunTestHook(TestPoint point, uint64_t handle) const
     {
         if (m_testHook)
@@ -392,6 +410,7 @@ namespace ImageCore
         for (;;)
         {
             std::shared_ptr<DecodeRequestState> state;
+            slot->Publish(Diagnostics::Phase::Idle, 0);
             {
                 std::unique_lock<std::mutex> lock(m_stopMutex);
                 m_stopCondition.wait(lock, [this] { return !m_stopQueue.empty() || m_stopExit; });
@@ -402,10 +421,12 @@ namespace ImageCore
                 state = std::move(m_stopQueue.front());
                 m_stopQueue.pop_front();
             }
+            slot->Publish(Diagnostics::Phase::Stopping, state->handle);
             StopRequest(state);
             RunTestHook(TestPoint::StopDispatched, state->handle);
         }
 
+        slot->Publish(Diagnostics::Phase::Exited, 0);
         RunTestHook(TestPoint::StopDispatchExit, 0);
         SignalExit(*slot);
     }
@@ -464,6 +485,63 @@ namespace ImageCore
         return m_prefetchedTotal;
     }
 
+    DecodeScheduler::Diagnostics DecodeScheduler::GetDiagnostics() const
+    {
+        Diagnostics diagnostics;
+
+        // m_threads changes only under m_lifecycleMutex, which a restart or a
+        // Shutdown holds while it joins; never wait behind a stuck join.
+        std::unique_lock<std::mutex> lifecycle(m_lifecycleMutex, std::defer_lock);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+        while (!lifecycle.try_lock() && std::chrono::steady_clock::now() < deadline)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
+        if (lifecycle.owns_lock())
+        {
+            diagnostics.threadsListed = true;
+            for (const auto& slot : m_threads)
+            {
+                Diagnostics::Thread thread;
+                thread.role = slot->role;
+                thread.phase = slot->phase.load(std::memory_order_relaxed);
+                thread.handle = slot->handle.load(std::memory_order_relaxed);
+                thread.backgroundMode = slot->backgroundMode.load(std::memory_order_relaxed);
+                if (slot->thread.joinable())
+                {
+                    const HANDLE handle = static_cast<HANDLE>(const_cast<std::thread&>(slot->thread).native_handle());
+                    thread.threadId = GetThreadId(handle);
+                    thread.priority = GetThreadPriority(handle);
+                    FILETIME created {}, exited {}, kernel {}, user {};
+                    if (GetThreadTimes(handle, &created, &exited, &kernel, &user))
+                    {
+                        const auto ticks = [](const FILETIME& time)
+                        {
+                            return (static_cast<uint64_t>(time.dwHighDateTime) << 32) | time.dwLowDateTime;
+                        };
+                        thread.cpuMs = static_cast<double>(ticks(kernel) + ticks(user)) / 10000.0;
+                    }
+                }
+                else
+                {
+                    thread.phase = Diagnostics::Phase::Exited;
+                }
+                diagnostics.threads.push_back(thread);
+            }
+        }
+
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        diagnostics.shutdown = m_shutdown.load();
+        diagnostics.highQueued = m_highQueue.size();
+        diagnostics.ioQueued = m_thumbIoQueue.Size();
+        diagnostics.decodeQueued = m_backgroundQueue.Size();
+        diagnostics.liveRequests = m_liveRequests.size();
+        diagnostics.prefetchedTasks = m_prefetchedTotal;
+        diagnostics.prefetchCap = m_globalPrefetchCap;
+        return diagnostics;
+    }
+
     DecodeScheduler::~DecodeScheduler()
     {
         Shutdown();
@@ -493,6 +571,9 @@ namespace ImageCore
         const auto startWorker = [this](WorkerKind kind)
         {
             auto slot = std::make_unique<ThreadSlot>();
+            slot->role = (kind == WorkerKind::HighPriority) ? Diagnostics::Role::HighPriority
+                : (kind == WorkerKind::Shared) ? Diagnostics::Role::Shared
+                : Diagnostics::Role::Background;
             slot->thread = std::thread(&DecodeScheduler::WorkerThread, this, kind, slot.get());
             m_threads.push_back(std::move(slot));
         };
@@ -526,6 +607,7 @@ namespace ImageCore
         // This avoids HDD seek thrashing while still allowing CPU decode/resize to run in parallel.
         {
             auto slot = std::make_unique<ThreadSlot>();
+            slot->role = Diagnostics::Role::Prefetch;
             slot->thread = std::thread(&DecodeScheduler::ThumbPrefetchThread, this, slot.get());
             m_threads.push_back(std::move(slot));
         }
@@ -538,6 +620,7 @@ namespace ImageCore
         }
         {
             auto slot = std::make_unique<ThreadSlot>();
+            slot->role = Diagnostics::Role::StopDispatch;
             slot->thread = std::thread(&DecodeScheduler::StopDispatchThread, this, slot.get());
             m_threads.push_back(std::move(slot));
         }
@@ -921,23 +1004,40 @@ namespace ImageCore
         // a background task. A thread waiting in background mode would wake (for a
         // stolen full-resolution task, or for shutdown) at background priority, which
         // normal-priority load starves for seconds before it can even leave the mode.
+        // With BackgroundWorkPriority::Normal (a test seam) background tasks run at
+        // normal priority instead, still below full-resolution work.
         bool inBackgroundMode = false;
-        auto setBackgroundMode = [&inBackgroundMode](bool background)
+        bool inBackgroundTask = false;
+        auto setBackgroundTask = [this, &inBackgroundMode, &inBackgroundTask, slot](bool background)
         {
-            if (background == inBackgroundMode)
+            if (background == inBackgroundTask)
             {
                 return;
             }
             if (background)
             {
-                (void)SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+                if (m_backgroundWorkPriority.load(std::memory_order_relaxed) == BackgroundWorkPriority::BackgroundMode)
+                {
+                    slot->backgroundMode.store(true, std::memory_order_relaxed);
+                    (void)SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+                    inBackgroundMode = true;
+                }
+                else
+                {
+                    (void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+                }
             }
             else
             {
-                (void)SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
+                if (inBackgroundMode)
+                {
+                    (void)SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
+                    slot->backgroundMode.store(false, std::memory_order_relaxed);
+                    inBackgroundMode = false;
+                }
                 (void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
             }
-            inBackgroundMode = background;
+            inBackgroundTask = background;
         };
         (void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
 
@@ -961,6 +1061,7 @@ namespace ImageCore
             bool tookBackgroundTask = false;
             std::shared_ptr<const std::vector<uint8_t>> bytesHold {};
 
+            slot->Publish(Diagnostics::Phase::Idle, 0);
             {
                 std::unique_lock<std::mutex> lock(m_queueMutex);
                 if (kind == WorkerKind::HighPriority)
@@ -1042,10 +1143,11 @@ namespace ImageCore
                 }
             }
 
+            slot->Publish(Diagnostics::Phase::Taken, task.handle);
             RunTestHook(TestPoint::TaskTaken, task.handle);
 
             // Run this task at its own priority (see above).
-            setBackgroundMode(tookBackgroundTask);
+            setBackgroundTask(tookBackgroundTask);
 
             // Run decode through the dispatcher (includes format routing + decoder selection).
             // A request canceled before its decode starts is neither decoded nor
@@ -1075,6 +1177,7 @@ namespace ImageCore
                 {
                     // FullResolution from archive: must read via the host byte source
                     bool stopped = false;
+                    slot->Publish(Diagnostics::Phase::Reading, task.handle);
                     auto bytes = LeasedRead(*slot->lease, task.state, task.handle, task.request.source, stopped);
                     if (stopped)
                     {
@@ -1103,6 +1206,7 @@ namespace ImageCore
                 if (!skipped)
                 {
                     RunTestHook(TestPoint::DecodeStart, task.handle);
+                    slot->Publish(Diagnostics::Phase::Decoding, task.handle);
                     try
                     {
                         result = dispatcher.Decode(task.request, nullptr, input);
@@ -1133,6 +1237,7 @@ namespace ImageCore
             }
             if (deliver && task.callback)
             {
+                slot->Publish(Diagnostics::Phase::Delivering, task.handle);
                 task.callback(std::move(result));  // delivered via move
             }
 
@@ -1155,8 +1260,10 @@ namespace ImageCore
                 }
             }
 
-            setBackgroundMode(false);
+            setBackgroundTask(false);
         }
+
+        slot->Publish(Diagnostics::Phase::Exited, 0);
 
         // Drop this thread's cached COM objects while the apartment is still alive.
         // Letting the thread_local WIC factory release at thread exit (after
@@ -1189,6 +1296,7 @@ namespace ImageCore
         {
             DecodeTask task;
 
+            slot->Publish(Diagnostics::Phase::Idle, 0);
             {
                 std::unique_lock<std::mutex> lock(m_queueMutex);
                 m_queueCondition.wait(lock, [this]
@@ -1249,6 +1357,7 @@ namespace ImageCore
             // queued (or promoted) meanwhile takes the slot instead: this task goes
             // back to the queue with its age and the loop picks the new top.
             bool yielded = false;
+            slot->Publish(Diagnostics::Phase::WaitingForSlot, task.handle);
             {
                 std::unique_lock<std::mutex> lock(m_queueMutex);
                 const auto outranked = [this, &task]
@@ -1289,9 +1398,20 @@ namespace ImageCore
             bool stopped = false;
             if (!bytes)
             {
-                (void)SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+                slot->Publish(Diagnostics::Phase::Reading, task.handle);
+                const bool backgroundMode = m_backgroundWorkPriority.load(std::memory_order_relaxed) ==
+                    BackgroundWorkPriority::BackgroundMode;
+                if (backgroundMode)
+                {
+                    slot->backgroundMode.store(true, std::memory_order_relaxed);
+                    (void)SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+                }
                 auto read = LeasedRead(*slot->lease, task.state, task.handle, task.request.source, stopped);
-                (void)SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
+                if (backgroundMode)
+                {
+                    (void)SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
+                    slot->backgroundMode.store(false, std::memory_order_relaxed);
+                }
                 if (read && !task.state->canceled.load())
                 {
                     FileByteCache::Instance().Put(task.request.source, read);
@@ -1333,6 +1453,7 @@ namespace ImageCore
             m_queueCondition.notify_all();
         }
 
+        slot->Publish(Diagnostics::Phase::Exited, 0);
         SignalExit(*slot);
     }
 }

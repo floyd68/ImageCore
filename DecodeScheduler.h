@@ -219,6 +219,58 @@ namespace ImageCore
         // quantity bounded by prefetch backpressure).
         size_t PrefetchedTaskCount() const;
 
+        // Tests/diagnostics: a point-in-time view of the scheduler, for reports
+        // when a progress wait times out. Each scheduler thread publishes its
+        // phase and the handle it works on with relaxed atomic stores; this
+        // reads them together with the queue state and asks the OS for each
+        // thread's priority and CPU time. Not for use on a hot path: it takes the
+        // queue mutex, and tries the lifecycle mutex briefly (while a restart or
+        // Shutdown holds it, `threadsListed` is false and `threads` is empty).
+        struct Diagnostics
+        {
+            enum class Role : uint8_t
+            {
+                HighPriority,   // full-resolution worker
+                Background,     // thumbnail decode worker (also steals full-resolution work)
+                Shared,         // sole worker: full-resolution first, then thumbnails
+                Prefetch,       // serialized thumbnail I/O thread
+                StopDispatch,   // runs stop requests for Cancel and Shutdown
+            };
+            enum class Phase : uint8_t
+            {
+                Starting,       // thread started, not yet waiting for work
+                Idle,           // waiting for work
+                Taken,          // worker: task taken, entering its priority mode
+                WaitingForSlot, // prefetch: task taken, waiting for a prefetch slot
+                Reading,        // byte-source read in progress
+                Decoding,       // decode stage in progress
+                Delivering,     // result callback running
+                Stopping,       // stop-dispatch: running a stop request
+                Exited,         // left its loop
+            };
+            struct Thread
+            {
+                Role role { Role::Background };
+                Phase phase { Phase::Starting };
+                uint64_t handle { 0 };        // request in progress (0: none)
+                bool backgroundMode { false };// entering, in or leaving background mode
+                unsigned long threadId { 0 };
+                int priority { 0 };           // GetThreadPriority (background mode reads low)
+                double cpuMs { 0.0 };         // kernel + user time so far
+            };
+
+            bool shutdown { false };
+            size_t highQueued { 0 };        // full-resolution queue
+            size_t ioQueued { 0 };          // thumbnail prefetch (I/O) queue
+            size_t decodeQueued { 0 };      // thumbnail decode queue
+            size_t liveRequests { 0 };      // queued or in progress
+            size_t prefetchedTasks { 0 };   // admitted: holding prefetched bytes
+            size_t prefetchCap { 0 };       // global prefetch cap
+            bool threadsListed { false };
+            std::vector<Thread> threads;
+        };
+        Diagnostics GetDiagnostics() const;
+
         // Test-only seam: points in a request's life at which the hook runs, on
         // the thread named. No scheduler lock is held, except CancelDispatch,
         // which runs under the reading thread's read-lease mutex (so the worker
@@ -241,6 +293,26 @@ namespace ImageCore
         // Installs the hook. Set it before the first Enqueue (it is read without
         // synchronization by the scheduler threads).
         void SetTestHook(TestHook hook);
+
+        // How thumbnail/preview work (the prefetch read and the background
+        // decode) runs. BackgroundMode, the default and the only mode used in
+        // production, enters THREAD_MODE_BACKGROUND_BEGIN (low CPU and I/O
+        // priority). Under normal-priority load on every CPU such a thread runs
+        // only when the OS starvation boost picks it, every few seconds, so its
+        // progress has no useful bound (see floyd68/ImageCore#15). Normal runs
+        // that work at THREAD_PRIORITY_NORMAL with normal I/O priority.
+        enum class BackgroundWorkPriority
+        {
+            BackgroundMode,
+            Normal,
+        };
+
+        // Test seam: tests of scheduling logic (ordering, backpressure,
+        // cancellation) select Normal so that their progress deadlines do not
+        // depend on the absence of other load on the machine; tests of the
+        // priority policy keep BackgroundMode. Each thread reads it when it
+        // starts a task, so it may be called at any time.
+        void SetBackgroundWorkPriority(BackgroundWorkPriority priority);
 
     private:
         enum class WorkerKind
@@ -311,7 +383,7 @@ namespace ImageCore
         // Decode workers and the prefetch thread. Started and joined only by
         // SetThreadCount and Shutdown, under m_lifecycleMutex (which also guards
         // m_joinPending: a bounded Shutdown left threads unjoined).
-        std::mutex m_lifecycleMutex;
+        mutable std::mutex m_lifecycleMutex;
         std::vector<std::unique_ptr<ThreadSlot>> m_threads;
         bool m_joinPending { false };
         // ThreadSlot::exited is guarded by m_exitMutex; m_exitCondition is
@@ -328,6 +400,7 @@ namespace ImageCore
         bool m_stopExit { false };
         std::atomic<size_t> m_workerCount { 0 };  // decode workers in m_threads
         TestHook m_testHook;
+        std::atomic<BackgroundWorkPriority> m_backgroundWorkPriority { BackgroundWorkPriority::BackgroundMode };
 
         std::queue<DecodeTask> m_highQueue;
         PriorityTaskQueue m_thumbIoQueue;     // serialized disk reads (thumbnail/preview)

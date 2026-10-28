@@ -93,6 +93,7 @@ DirectXTex decoding supports:
 - Full-resolution (main image) work always runs at above-normal thread priority, including when a background worker picks it up; thumbnail/preview work runs in Windows background mode (lower CPU and I/O priority).
 - A thread is in background mode only while it runs that work (a thumbnail/preview decode, the prefetch read); idle workers and the idle prefetch thread wait at normal priority or above, so they wake for new work or shutdown without queuing behind normal-priority load.
 - `Shutdown` raises every scheduler thread above normal priority before waiting for it, overriding background mode: a thread in background mode runs below all normal-priority work, and on a CPU-saturated machine it would otherwise get the processor only every few seconds and miss a shutdown bound.
+- The same starvation applies to the thumbnail work itself: under normal-priority load on every CPU, background-mode reads and decodes advance only every few seconds. `DecodeScheduler::SetBackgroundWorkPriority(Normal)` is a test seam that runs that work at normal priority instead; the scheduling-logic tests use it so their progress deadlines do not depend on other load on the machine, and the priority tests keep background mode. Production always uses background mode.
 
 ## Building
 
