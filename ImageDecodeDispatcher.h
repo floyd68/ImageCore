@@ -2,6 +2,8 @@
 
 #include "DecodeTypes.h"
 #include <wincodec.h>
+#include <wrl/client.h>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -28,6 +30,13 @@ namespace ImageCore
         // Tests/diagnostics: WIC decoders (opens of a decoded input) created on
         // the calling thread. A WIC decode creates one.
         static uint64_t ThreadWicDecoderCount();
+
+        // Test seam: every WIC decoder ImageCore creates on the calling thread
+        // is passed through `wrapper` (an empty function: none), so a test can
+        // stand in for parts of a container, such as its thumbnail.
+        using WicDecoderWrapper = std::function<Microsoft::WRL::ComPtr<IWICBitmapDecoder>(
+            Microsoft::WRL::ComPtr<IWICBitmapDecoder>)>;
+        static void SetThreadWicDecoderWrapperForTesting(WicDecoderWrapper wrapper);
     };
 }
 

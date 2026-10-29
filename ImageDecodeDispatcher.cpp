@@ -39,6 +39,8 @@ namespace ImageCore
 
         // WIC decoders created on this thread (see ThreadWicDecoderCount).
         thread_local uint64_t t_wicDecoders = 0;
+        // See SetThreadWicDecoderWrapperForTesting.
+        thread_local ImageCore::ImageDecodeDispatcher::WicDecoderWrapper t_wicDecoderWrapper {};
 
         // ---------- WIC common ----------
         class WICDecoderCommon
@@ -125,6 +127,11 @@ namespace ImageCore
                         &outDecoder);
                 }
 
+                if (SUCCEEDED(hr) && outDecoder && t_wicDecoderWrapper)
+                {
+                    outDecoder = t_wicDecoderWrapper(outDecoder);
+                    hr = outDecoder ? S_OK : E_FAIL;
+                }
                 return hr;
             }
 
@@ -1233,4 +1240,9 @@ bool ImageCore::ImageDecodeDispatcher::HasThreadResources()
 uint64_t ImageCore::ImageDecodeDispatcher::ThreadWicDecoderCount()
 {
     return t_wicDecoders;
+}
+
+void ImageCore::ImageDecodeDispatcher::SetThreadWicDecoderWrapperForTesting(WicDecoderWrapper wrapper)
+{
+    t_wicDecoderWrapper = std::move(wrapper);
 }
