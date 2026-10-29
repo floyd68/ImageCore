@@ -211,11 +211,20 @@ namespace ImageCore
                 {
                     return E_POINTER;
                 }
+                // The flip-rotator fetches its source again for every band it
+                // produces; over a decoder or a scaler that re-decodes the
+                // image each time (once per output row for a 90 degree turn),
+                // so the source is decoded into memory once first.
+                Microsoft::WRL::ComPtr<IWICBitmap> cached;
+                HRESULT hr = wicFactory->CreateBitmapFromSource(source.Get(), WICBitmapCacheOnLoad, &cached);
                 Microsoft::WRL::ComPtr<IWICBitmapFlipRotator> rotator;
-                HRESULT hr = wicFactory->CreateBitmapFlipRotator(&rotator);
                 if (SUCCEEDED(hr))
                 {
-                    hr = rotator->Initialize(source.Get(), options);
+                    hr = wicFactory->CreateBitmapFlipRotator(&rotator);
+                }
+                if (SUCCEEDED(hr))
+                {
+                    hr = rotator->Initialize(cached.Get(), options);
                 }
                 if (SUCCEEDED(hr))
                 {
