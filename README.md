@@ -100,7 +100,7 @@ DirectXTex decoding supports:
 - Byte sources that implement only `ReadAll(path)` keep working (the stop-aware overload delegates to it); their reads are not interrupted.
 - Cancellation state is owned by each request and released when the request finishes, is canceled, or the scheduler shuts down; canceling an unknown or finished handle is a no-op and leaves nothing behind.
 - `ImageLoader::Shutdown()` is idempotent and final: it cancels every live request (as above), queued requests are dropped without callbacks, and later `RequestDecoded` calls return 0 without invoking the callback. It joins the decode threads without a bound, so a read that honours neither its token nor OS cancellation keeps it waiting.
-- `ImageLoader::Shutdown(bound)` does the same but waits at most `bound` and returns whether every thread was joined. On `false` nothing is detached: the loader keeps its scheduler and cache, keeps rejecting requests, and a later call retries the join; the host should take a forced-exit path instead of static destruction. `DecodeScheduler::SetThreadCount` does not restart until a retry succeeds.
+- `ImageLoader::Shutdown(bound)` does the same but waits at most `bound` and returns whether every thread was joined. On `false` nothing is detached: the loader keeps its scheduler, keeps rejecting requests, and a later call retries the join; the host should take a forced-exit path instead of static destruction. `DecodeScheduler::SetThreadCount` does not restart until a retry succeeds.
 - `ImageLoader::ShutdownIfCreated(bound)` is the bounded shutdown for host cleanup paths: it never constructs the loader (returns `true` when ImageCore was never used, starting no thread) and otherwise returns `Instance().Shutdown(bound)`.
 
 ## Priority

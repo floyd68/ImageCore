@@ -1,5 +1,4 @@
 #include "ImageLoader.h"
-#include "ImageCache.h"
 #include "DecodeScheduler.h"
 #include "ImageCore.h"
 #include <algorithm>
@@ -54,7 +53,6 @@ namespace ImageCore
         // Ensure built-in decoders are registered (safe to call multiple times)
         RegisterBuiltInDecoders();
 
-        m_cache = std::make_unique<ImageCache>();
         m_scheduler = std::make_shared<DecodeScheduler>();
     }
 
@@ -77,7 +75,6 @@ namespace ImageCore
             // nullptr above or a scheduler that rejects it.
             scheduler->Shutdown();
         }
-        m_cache.reset();
     }
 
     bool ImageLoader::Shutdown(std::chrono::milliseconds bound)
@@ -85,8 +82,8 @@ namespace ImageCore
         std::shared_ptr<DecodeScheduler> scheduler = Scheduler();
         if (scheduler && !scheduler->Shutdown(bound))
         {
-            // Threads are still running: keep the scheduler and the cache they
-            // may use. The scheduler rejects requests meanwhile.
+            // Threads are still running: keep the scheduler they may use. It
+            // rejects requests meanwhile.
             return false;
         }
         {
@@ -96,7 +93,6 @@ namespace ImageCore
                 m_scheduler.reset();
             }
         }
-        m_cache.reset();
         return true;
     }
 
@@ -176,22 +172,6 @@ namespace ImageCore
         if (std::shared_ptr<DecodeScheduler> scheduler = Scheduler())
         {
             scheduler->SetPriority(handle, priority);
-        }
-    }
-
-    void ImageLoader::ClearCache()
-    {
-        if (m_cache)
-        {
-            m_cache->Clear();
-        }
-    }
-
-    void ImageLoader::SetCacheSizeLimit(size_t maxMemoryBytes)
-    {
-        if (m_cache)
-        {
-            m_cache->SetSizeLimit(maxMemoryBytes);
         }
     }
 

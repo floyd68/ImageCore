@@ -4,7 +4,6 @@ target_sources(ImageCore PRIVATE
     DecoderRegistry.cpp
     DecodeScheduler.cpp
     FileByteCache.cpp
-    ImageCache.cpp
     ImageCoreLog.cpp
     ImageDecodeDispatcher.cpp
     ImageFormatDetector.cpp
