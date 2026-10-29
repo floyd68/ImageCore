@@ -667,3 +667,162 @@ IC_TEST(DecodeRouting_WicDecodeOpensTheInputOnce)
         }
     }
 }
+
+namespace
+{
+    // The four quadrant colors of the upright reference image (BGRA).
+    struct Quadrant
+    {
+        uint8_t b;
+        uint8_t g;
+        uint8_t r;
+    };
+    constexpr Quadrant kTopLeft { 0x20, 0x20, 0xE0 };      // red
+    constexpr Quadrant kTopRight { 0x20, 0xE0, 0x20 };     // green
+    constexpr Quadrant kBottomLeft { 0xE0, 0x20, 0x20 };   // blue
+    constexpr Quadrant kBottomRight { 0xE0, 0xE0, 0xE0 };  // white
+
+    Quadrant UprightColor(size_t x, size_t y, size_t width, size_t height)
+    {
+        const bool right = x >= width / 2;
+        const bool bottom = y >= height / 2;
+        return bottom ? (right ? kBottomRight : kBottomLeft) : (right ? kTopRight : kTopLeft);
+    }
+
+    // Where the upright pixel (x, y) of a width x height image is stored for
+    // EXIF orientation `orientation` (5..8 store it transposed: height x width).
+    std::pair<size_t, size_t> StoredPosition(uint16_t orientation, size_t x, size_t y, size_t width, size_t height)
+    {
+        switch (orientation)
+        {
+        case 2: return { width - 1 - x, y };
+        case 3: return { width - 1 - x, height - 1 - y };
+        case 4: return { x, height - 1 - y };
+        case 5: return { y, x };
+        case 6: return { y, width - 1 - x };
+        case 7: return { height - 1 - y, width - 1 - x };
+        case 8: return { height - 1 - y, x };
+        default: return { x, y };
+        }
+    }
+
+    // A JPEG storing the upright quadrant image as a camera does for
+    // `orientation`, with an Exif APP1 (built by hand) holding that tag.
+    std::vector<uint8_t> OrientedJpeg(uint16_t orientation, size_t width, size_t height)
+    {
+        EnsureProcessCom();
+        const bool swap = orientation >= 5;
+        const size_t storedW = swap ? height : width;
+        const size_t storedH = swap ? width : height;
+        DirectX::ScratchImage scratch;
+        IC_REQUIRE(SUCCEEDED(scratch.Initialize2D(DXGI_FORMAT_B8G8R8A8_UNORM, storedW, storedH, 1, 1)));
+        const DirectX::Image* image = scratch.GetImage(0, 0, 0);
+        IC_REQUIRE(image != nullptr);
+        for (size_t y = 0; y < height; ++y)
+        {
+            for (size_t x = 0; x < width; ++x)
+            {
+                const auto [sx, sy] = StoredPosition(orientation, x, y, width, height);
+                const Quadrant c = UprightColor(x, y, width, height);
+                uint8_t* px = image->pixels + sy * image->rowPitch + sx * 4;
+                px[0] = c.b;
+                px[1] = c.g;
+                px[2] = c.r;
+                px[3] = 0xFF;
+            }
+        }
+        DirectX::Blob blob;
+        IC_REQUIRE(SUCCEEDED(DirectX::SaveToWICMemory(*image, DirectX::WIC_FLAGS_NONE,
+            DirectX::GetWICCodec(DirectX::WIC_CODEC_JPEG), blob)));
+        const auto* bytes = static_cast<const uint8_t*>(blob.GetBufferPointer());
+        const std::vector<uint8_t> jpeg(bytes, bytes + blob.GetBufferSize());
+
+        // TIFF header, IFD0 with the one Orientation entry, no next IFD.
+        std::vector<uint8_t> tiff { 'I', 'I', 0x2A, 0x00 };
+        Put32(tiff, 8);
+        Put16(tiff, 1);
+        PutIfdEntry(tiff, 0x0112, 3, orientation);
+        Put32(tiff, 0);
+        const size_t segmentLength = 2 + 6 + tiff.size();
+        std::vector<uint8_t> app1 { 0xFF, 0xE1,
+            static_cast<uint8_t>(segmentLength >> 8), static_cast<uint8_t>(segmentLength & 0xFF),
+            'E', 'x', 'i', 'f', 0x00, 0x00 };
+        app1.insert(app1.end(), tiff.begin(), tiff.end());
+        std::vector<uint8_t> out(jpeg.begin(), jpeg.begin() + 2);
+        out.insert(out.end(), app1.begin(), app1.end());
+        out.insert(out.end(), jpeg.begin() + 2, jpeg.end());
+        return out;
+    }
+
+    // The decoded image shows the upright quadrants (sampled at their centers;
+    // JPEG and scaling only blur the edges).
+    bool ShowsUprightQuadrants(const Outcome& outcome)
+    {
+        if (outcome.width == 0 || outcome.height == 0 ||
+            outcome.pixels.size() < static_cast<size_t>(outcome.width) * outcome.height * 4)
+        {
+            return false;
+        }
+        const auto similar = [](uint8_t a, uint8_t b) { return (a > b ? a - b : b - a) < 60; };
+        constexpr double kCenters[4][2] { { 0.25, 0.25 }, { 0.75, 0.25 }, { 0.25, 0.75 }, { 0.75, 0.75 } };
+        for (const auto& center : kCenters)
+        {
+            const double fx = center[0];
+            const double fy = center[1];
+            const size_t x = static_cast<size_t>(fx * outcome.width);
+            const size_t y = static_cast<size_t>(fy * outcome.height);
+            const uint8_t* px = outcome.pixels.data() + (y * outcome.width + x) * 4;
+            const Quadrant expected = UprightColor(x, y, outcome.width, outcome.height);
+            if (!similar(px[0], expected.b) || !similar(px[1], expected.g) || !similar(px[2], expected.r))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+}
+
+// A JPEG with an EXIF orientation decodes upright on every WIC path: the
+// thumbnail (scaled to fit the target), the preview and the full-resolution
+// image, path-only and in memory, with the upright dimensions. Orientation 1
+// and a PNG (no tag) are unchanged.
+IC_TEST(DecodeRouting_ExifOrientationDecodesUpright)
+{
+    constexpr size_t kUprightW = 48;
+    constexpr size_t kUprightH = 32;
+    const std::wstring missing = (TempDir() / L"missing_oriented.jpg").wstring();
+    IC_REQUIRE(!std::filesystem::exists(missing));
+
+    for (uint16_t orientation = 1; orientation <= 8; ++orientation)
+    {
+        const std::vector<uint8_t> jpeg = OrientedJpeg(orientation, kUprightW, kUprightH);
+        const std::wstring onDisk = WriteFile(L"oriented" + std::to_wstring(orientation) + L".jpg", jpeg);
+        for (const ImagePurpose purpose : { ImagePurpose::Thumbnail, ImagePurpose::Preview, ImagePurpose::FullResolution })
+        {
+            const bool thumb = (purpose == ImagePurpose::Thumbnail);
+            // 48 x 32 fit into 16 x 16: 16 x 11 (10.67 rounded).
+            const uint32_t expectedW = thumb ? 16u : static_cast<uint32_t>(kUprightW);
+            const uint32_t expectedH = thumb ? 11u : static_cast<uint32_t>(kUprightH);
+            for (const Outcome& outcome : { Decode(onDisk, purpose, {}), Decode(missing, purpose, jpeg) })
+            {
+                std::printf("  orientation %u, %s: %ux%u\n", static_cast<unsigned>(orientation),
+                    thumb ? "thumbnail" : (purpose == ImagePurpose::Preview ? "preview" : "full"),
+                    outcome.width, outcome.height);
+                const bool upright = ShowsUprightQuadrants(outcome);
+                if (!upright)
+                {
+                    std::printf("    not upright\n");
+                }
+                IC_CHECK(SUCCEEDED(outcome.hr));
+                IC_CHECK(outcome.width == expectedW && outcome.height == expectedH);
+                IC_CHECK(upright);
+            }
+        }
+    }
+
+    // No tag: a PNG decodes as stored.
+    const std::vector<uint8_t> png = Encode(Format::Png, kWidth, kHeight);
+    const Outcome plain = Decode(WriteFile(L"plain_orientation.png", png), ImagePurpose::FullResolution, {});
+    IC_CHECK(SUCCEEDED(plain.hr));
+    IC_CHECK(plain.width == kWidth && plain.height == kHeight);
+}
