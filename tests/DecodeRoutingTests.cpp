@@ -8,7 +8,9 @@
 
 #include <DirectXTex.h>
 #include <objbase.h>
+#include <wincodec.h>
 #include <windows.h>
+#include <wrl/client.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -21,10 +23,11 @@
 #include <span>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 // Decoder routing and the thread-resource query (ImageCore #3), and the
-// probe's header reads (ImageCore #19).
+// probe's header reads and WIC decoder reuse (ImageCore #19).
 //
 // Every decode runs on a fresh COM-initialized thread, so
 // ImageDecodeDispatcher::HasThreadResources() tells whether the decode went
@@ -163,6 +166,7 @@ namespace
         bool wicFactoryBefore { true };
         bool wicFactoryAfter { false };
         uint64_t headerReads { 0 };  // ProbeFile header reads during the decode
+        uint64_t wicDecoders { 0 };  // WIC decoders created during the decode
         std::vector<uint8_t> pixels {};
     };
 
@@ -230,10 +234,12 @@ namespace
         {
             outcome.wicFactoryBefore = ImageDecodeDispatcher::HasThreadResources();
             const uint64_t headerReadsBefore = ImageFormatDetector::ThreadHeaderReadCount();
+            const uint64_t wicDecodersBefore = ImageDecodeDispatcher::ThreadWicDecoderCount();
             ImageDecodeDispatcher dispatcher;
             PipelineResult result = dispatcher.Decode(request, input);
             outcome.wicFactoryAfter = ImageDecodeDispatcher::HasThreadResources();
             outcome.headerReads = ImageFormatDetector::ThreadHeaderReadCount() - headerReadsBefore;
+            outcome.wicDecoders = ImageDecodeDispatcher::ThreadWicDecoderCount() - wicDecodersBefore;
             outcome.hr = result.hr;
             if (SUCCEEDED(result.hr) && result.image.blocks)
             {
@@ -261,6 +267,104 @@ namespace
     bool Contains(const std::vector<std::wstring>& ids, const wchar_t* id)
     {
         return std::find(ids.begin(), ids.end(), id) != ids.end();
+    }
+
+    void Put16(std::vector<uint8_t>& out, uint16_t value)
+    {
+        out.push_back(static_cast<uint8_t>(value & 0xFF));
+        out.push_back(static_cast<uint8_t>(value >> 8));
+    }
+
+    void Put32(std::vector<uint8_t>& out, uint32_t value)
+    {
+        for (int shift = 0; shift < 32; shift += 8)
+        {
+            out.push_back(static_cast<uint8_t>((value >> shift) & 0xFF));
+        }
+    }
+
+    // One little-endian TIFF IFD entry; a SHORT value is left-aligned in the
+    // 4-byte value field.
+    void PutIfdEntry(std::vector<uint8_t>& out, uint16_t tag, uint16_t type, uint32_t value)
+    {
+        Put16(out, tag);
+        Put16(out, type);
+        Put32(out, 1);
+        if (type == 3)
+        {
+            Put16(out, static_cast<uint16_t>(value));
+            Put16(out, 0);
+        }
+        else
+        {
+            Put32(out, value);
+        }
+    }
+
+    // `jpeg` with an Exif APP1 segment, built by hand, inserted after SOI: IFD0
+    // holds Orientation = 1 and links to IFD1, which describes `thumbnail` (a
+    // JPEG stored right after it) the way cameras store the embedded thumbnail
+    // (Compression = 6, JPEGInterchangeFormat/Length). WIC's JPEG encoder is not
+    // relied on to write one.
+    std::vector<uint8_t> WithExifThumbnail(const std::vector<uint8_t>& jpeg, const std::vector<uint8_t>& thumbnail)
+    {
+        // TIFF header (8 bytes), IFD0 at 8 (2 + 12 + 4 = 18 bytes), IFD1 at 26
+        // (2 + 3 * 12 + 4 = 42 bytes), thumbnail data at 68.
+        constexpr uint32_t kIfd1Offset = 26;
+        constexpr uint32_t kThumbnailOffset = 68;
+        std::vector<uint8_t> tiff { 'I', 'I', 0x2A, 0x00 };
+        Put32(tiff, 8);
+        Put16(tiff, 1);
+        PutIfdEntry(tiff, 0x0112, 3, 1);  // Orientation: top-left
+        Put32(tiff, kIfd1Offset);
+        Put16(tiff, 3);
+        PutIfdEntry(tiff, 0x0103, 3, 6);  // Compression: JPEG
+        PutIfdEntry(tiff, 0x0201, 4, kThumbnailOffset);
+        PutIfdEntry(tiff, 0x0202, 4, static_cast<uint32_t>(thumbnail.size()));
+        Put32(tiff, 0);
+        IC_REQUIRE(tiff.size() == kThumbnailOffset);
+        tiff.insert(tiff.end(), thumbnail.begin(), thumbnail.end());
+
+        const size_t segmentLength = 2 + 6 + tiff.size();  // length field + "Exif\0\0" + TIFF
+        IC_REQUIRE(segmentLength <= 0xFFFF);
+        std::vector<uint8_t> app1 { 0xFF, 0xE1,
+            static_cast<uint8_t>(segmentLength >> 8), static_cast<uint8_t>(segmentLength & 0xFF),
+            'E', 'x', 'i', 'f', 0x00, 0x00 };
+        app1.insert(app1.end(), tiff.begin(), tiff.end());
+
+        IC_REQUIRE(jpeg.size() > 2 && jpeg[0] == 0xFF && jpeg[1] == 0xD8);
+        std::vector<uint8_t> out(jpeg.begin(), jpeg.begin() + 2);
+        out.insert(out.end(), app1.begin(), app1.end());
+        out.insert(out.end(), jpeg.begin() + 2, jpeg.end());
+        return out;
+    }
+
+    // The size of the thumbnail WIC's JPEG frame decoder finds in `jpeg`
+    // (IWICBitmapFrameDecode::GetThumbnail), or 0 x 0 when it finds none.
+    std::pair<UINT, UINT> FrameThumbnailSize(const std::vector<uint8_t>& jpeg)
+    {
+        std::pair<UINT, UINT> size { 0, 0 };
+        RunOnComThread([&]()
+        {
+            Microsoft::WRL::ComPtr<IWICImagingFactory> factory;
+            IC_REQUIRE(SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                IID_PPV_ARGS(&factory))));
+            Microsoft::WRL::ComPtr<IWICStream> stream;
+            IC_REQUIRE(SUCCEEDED(factory->CreateStream(&stream)));
+            IC_REQUIRE(SUCCEEDED(stream->InitializeFromMemory(const_cast<BYTE*>(jpeg.data()),
+                static_cast<DWORD>(jpeg.size()))));
+            Microsoft::WRL::ComPtr<IWICBitmapDecoder> decoder;
+            IC_REQUIRE(SUCCEEDED(factory->CreateDecoderFromStream(stream.Get(), nullptr,
+                WICDecodeMetadataCacheOnLoad, &decoder)));
+            Microsoft::WRL::ComPtr<IWICBitmapFrameDecode> frame;
+            IC_REQUIRE(SUCCEEDED(decoder->GetFrame(0, &frame)));
+            Microsoft::WRL::ComPtr<IWICBitmapSource> thumbnail;
+            if (SUCCEEDED(frame->GetThumbnail(&thumbnail)) && thumbnail)
+            {
+                IC_REQUIRE(SUCCEEDED(thumbnail->GetSize(&size.first, &size.second)));
+            }
+        });
+        return size;
     }
 }
 
@@ -521,5 +625,45 @@ IC_TEST(DecodeRouting_HeaderReadsPerRequest)
             }
         }
         CloseHandle(lock);
+    }
+}
+
+// A WIC decode opens its input once: the thumbnail path checks the container's
+// embedded thumbnail and falls back to the scaled frame through the same
+// decoder. The fixtures are a JPEG without and with an Exif thumbnail (built
+// by hand, see WithExifThumbnail), path-only and in memory. ImageCore still
+// returns the scaled main frame for both (the container-level thumbnail query
+// finds no Exif thumbnail), so their pixels match.
+IC_TEST(DecodeRouting_WicDecodeOpensTheInputOnce)
+{
+    const std::vector<uint8_t> plain = Encode(Format::Jpeg, kWidth, kHeight);
+    const std::vector<uint8_t> exif = WithExifThumbnail(plain, Encode(Format::Jpeg, 16, 8));
+    // The fixture is valid: WIC's frame decoder finds the Exif thumbnail.
+    IC_CHECK(FrameThumbnailSize(plain) == std::make_pair(0u, 0u));
+    IC_CHECK(FrameThumbnailSize(exif) == std::make_pair(16u, 8u));
+
+    const std::wstring plainOnDisk = WriteFile(L"plain.jpg", plain);
+    const std::wstring exifOnDisk = WriteFile(L"exif_thumbnail.jpg", exif);
+    const std::wstring missing = (TempDir() / L"missing_exif.jpg").wstring();
+    IC_REQUIRE(!std::filesystem::exists(missing));
+
+    for (const ImagePurpose purpose : { ImagePurpose::Thumbnail, ImagePurpose::Preview, ImagePurpose::FullResolution })
+    {
+        // Preview requests decode through the thumbnail decoder with no target size.
+        const bool thumb = (purpose == ImagePurpose::Thumbnail);
+        const uint32_t expectedWidth = thumb ? static_cast<uint32_t>(kThumbTarget) : static_cast<uint32_t>(kWidth);
+        const uint32_t expectedHeight = thumb ? static_cast<uint32_t>(kThumbTarget / 2) : static_cast<uint32_t>(kHeight);
+
+        const Outcome plainPath = Decode(plainOnDisk, purpose, {});
+        const Outcome plainMemory = Decode(missing, purpose, plain);
+        const Outcome exifPath = Decode(exifOnDisk, purpose, {});
+        const Outcome exifMemory = Decode(missing, purpose, exif);
+        for (const Outcome* outcome : { &plainPath, &plainMemory, &exifPath, &exifMemory })
+        {
+            IC_CHECK(SUCCEEDED(outcome->hr));
+            IC_CHECK(outcome->width == expectedWidth && outcome->height == expectedHeight);
+            IC_CHECK(outcome->wicDecoders == 1);
+            IC_CHECK(!outcome->pixels.empty() && outcome->pixels == plainPath.pixels);
+        }
     }
 }

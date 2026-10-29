@@ -24,6 +24,10 @@ namespace ImageCore
         // by a decode that went through WIC, cleared by ReleaseThreadResources()).
         // No side effects.
         static bool HasThreadResources();
+
+        // Tests/diagnostics: WIC decoders (opens of a decoded input) created on
+        // the calling thread. A WIC decode creates one.
+        static uint64_t ThreadWicDecoderCount();
     };
 }
 

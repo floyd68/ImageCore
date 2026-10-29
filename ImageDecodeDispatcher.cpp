@@ -37,6 +37,9 @@ namespace ImageCore
             return s_factory;
         }
 
+        // WIC decoders created on this thread (see ThreadWicDecoderCount).
+        thread_local uint64_t t_wicDecoders = 0;
+
         // ---------- WIC common ----------
         class WICDecoderCommon
         {
@@ -95,6 +98,7 @@ namespace ImageCore
                     return E_POINTER;
                 }
 
+                ++t_wicDecoders;
                 HRESULT hr = E_FAIL;
                 if (!bytes.empty() && bytes.size() <= static_cast<size_t>(UINT32_MAX))
                 {
@@ -141,9 +145,10 @@ namespace ImageCore
                 return factory;
             }
 
+            // The container's thumbnail (IWICBitmapDecoder::GetThumbnail), from
+            // the decoder the caller also decodes the frame with.
             static bool TryEmbeddedThumbnail(
-                const std::wstring& path,
-                std::span<const uint8_t> bytes,
+                IWICBitmapDecoder* decoder,
                 Microsoft::WRL::ComPtr<IWICBitmapSource>& outBitmap,
                 Size& outSize)
             {
@@ -153,15 +158,8 @@ namespace ImageCore
                     return false;
                 }
 
-                Microsoft::WRL::ComPtr<IWICBitmapDecoder> decoder;
-                HRESULT hr = CreateDecoder(path, bytes, decoder);
-                if (FAILED(hr))
-                {
-                    return false;
-                }
-
                 Microsoft::WRL::ComPtr<IWICBitmapSource> thumbnail;
-                hr = decoder->GetThumbnail(&thumbnail);
+                HRESULT hr = decoder->GetThumbnail(&thumbnail);
                 if (FAILED(hr) || !thumbnail)
                 {
                     return false;
@@ -200,8 +198,7 @@ namespace ImageCore
             }
 
             static HRESULT DecodeAndScale(
-                const std::wstring& path,
-                std::span<const uint8_t> bytes,
+                IWICBitmapDecoder* decoder,
                 const Size& targetSize,
                 Microsoft::WRL::ComPtr<IWICBitmapSource>& outBitmap,
                 Size& outSize)
@@ -212,15 +209,8 @@ namespace ImageCore
                     return E_POINTER;
                 }
 
-                Microsoft::WRL::ComPtr<IWICBitmapDecoder> decoder;
-                HRESULT hr = CreateDecoder(path, bytes, decoder);
-                if (FAILED(hr))
-                {
-                    return hr;
-                }
-
                 Microsoft::WRL::ComPtr<IWICBitmapFrameDecode> frame;
-                hr = decoder->GetFrame(0, &frame);
+                HRESULT hr = decoder->GetFrame(0, &frame);
                 if (FAILED(hr))
                 {
                     return hr;
@@ -560,10 +550,19 @@ namespace ImageCore
                     return PipelineResult(E_INVALIDARG);
                 }
 
+                // One decoder (one open of the input) serves the embedded-thumbnail
+                // check and the scaled-frame fallback.
+                Microsoft::WRL::ComPtr<IWICBitmapDecoder> wicDecoder;
+                HRESULT hr = CreateDecoder(request.source, input.bytes, wicDecoder);
+                if (FAILED(hr))
+                {
+                    return PipelineResult(hr);
+                }
+
                 Microsoft::WRL::ComPtr<IWICBitmapSource> wicBitmap;
                 Size imageSize;
 
-                if (TryEmbeddedThumbnail(request.source, input.bytes, wicBitmap, imageSize))
+                if (TryEmbeddedThumbnail(wicDecoder.Get(), wicBitmap, imageSize))
                 {
                     DecodedImage decoded {};
                     HRESULT hrCopy = CopyWicBitmapToDecodedImage(wicBitmap.Get(), decoded);
@@ -579,7 +578,7 @@ namespace ImageCore
                     return result;
                 }
 
-                HRESULT hr = DecodeAndScale(request.source, input.bytes, request.targetSize, wicBitmap, imageSize);
+                hr = DecodeAndScale(wicDecoder.Get(), request.targetSize, wicBitmap, imageSize);
                 if (FAILED(hr))
                 {
                     return PipelineResult(hr);
@@ -1128,4 +1127,9 @@ void ImageCore::ImageDecodeDispatcher::ReleaseThreadResources()
 bool ImageCore::ImageDecodeDispatcher::HasThreadResources()
 {
     return ThreadWicFactorySlot() != nullptr;
+}
+
+uint64_t ImageCore::ImageDecodeDispatcher::ThreadWicDecoderCount()
+{
+    return t_wicDecoders;
 }
