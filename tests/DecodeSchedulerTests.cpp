@@ -4017,6 +4017,12 @@ namespace
     // read would). Neither Cancel nor a bounded Shutdown may run it on the
     // caller's thread: Cancel returns at once, and Shutdown(bound) times out
     // (keeping its threads) until the callback is released; a retry then joins.
+    //
+    // A second request (a plain file, so a separate lane) is read meanwhile.
+    // Nothing about the canceled request holds it up, so it is held in a
+    // cooperative read too: it stays live after the Cancel and is stopped,
+    // never delivered, by the Shutdown. Left to complete, it finished first
+    // whenever the test thread was slow (floyd68/ImageCore#31).
     void RunBlockedStopCallback(bool cancelFirst)
     {
         const auto& files = Files();
@@ -4024,7 +4030,9 @@ namespace
         Watchdog watchdog("blocked stop callback", std::chrono::seconds(60));
         ControlledSource source(files.dir);
         const std::wstring entry = source.Entry(files.thumbs[cancelFirst ? 1 : 0]);
+        const std::wstring second = files.thumbs[2];
         source.SetMode(entry, Mode::Cooperative);
+        source.SetMode(second, Mode::Cooperative);
         HANDLE gate = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         HANDLE entered = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         std::atomic<DWORD> callbackThread { 0 };
@@ -4040,8 +4048,9 @@ namespace
             OnExit release { [&] { SetEvent(gate); source.Release(); } };
 
             IC_REQUIRE(scheduler.Enqueue(MakeTask(entry, ImagePurpose::Thumbnail, 1, done.Callback(1))));
-            IC_REQUIRE(scheduler.Enqueue(MakeTask(files.thumbs[2], ImagePurpose::Thumbnail, 2, done.Callback(2))));
+            IC_REQUIRE(scheduler.Enqueue(MakeTask(second, ImagePurpose::Thumbnail, 2, done.Callback(2))));
             IC_REQUIRE(source.WaitEntered(entry));
+            IC_REQUIRE(source.WaitEntered(second));
 
             if (cancelFirst)
             {
@@ -4081,6 +4090,7 @@ namespace
         CloseHandle(gate);
         CloseHandle(entered);
         IC_CHECK(source.StoppedReturns(entry) == 1);
+        IC_CHECK(source.StoppedReturns(second) == 1);
         IC_CHECK(DeliveryCount(done) == 0);
     }
 }
