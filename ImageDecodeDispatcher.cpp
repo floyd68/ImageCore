@@ -39,6 +39,8 @@ namespace ImageCore
 
         // WIC decoders created on this thread (see ThreadWicDecoderCount).
         thread_local uint64_t t_wicDecoders = 0;
+        // See SetThreadWicDecoderWrapperForTesting.
+        thread_local ImageCore::ImageDecodeDispatcher::WicDecoderWrapper t_wicDecoderWrapper {};
 
         // ---------- WIC common ----------
         class WICDecoderCommon
@@ -125,6 +127,11 @@ namespace ImageCore
                         &outDecoder);
                 }
 
+                if (SUCCEEDED(hr) && outDecoder && t_wicDecoderWrapper)
+                {
+                    outDecoder = t_wicDecoderWrapper(outDecoder);
+                    hr = outDecoder ? S_OK : E_FAIL;
+                }
                 return hr;
             }
 
@@ -145,10 +152,85 @@ namespace ImageCore
                 return factory;
             }
 
+            // The EXIF orientation of `frame` (TIFF tag 274: 1..8, how the
+            // stored pixels map to the upright image), 1 when it has none.
+            static uint16_t ReadOrientation(IWICBitmapFrameDecode* frame)
+            {
+                Microsoft::WRL::ComPtr<IWICMetadataQueryReader> reader;
+                if (frame == nullptr || FAILED(frame->GetMetadataQueryReader(&reader)) || !reader)
+                {
+                    return 1;
+                }
+                // JPEG keeps it in the Exif APP1 segment, TIFF in its first IFD.
+                for (const wchar_t* query : { L"/app1/ifd/{ushort=274}", L"/ifd/{ushort=274}" })
+                {
+                    PROPVARIANT value;
+                    PropVariantInit(&value);
+                    uint16_t orientation = 0;
+                    if (SUCCEEDED(reader->GetMetadataByName(query, &value)) && value.vt == VT_UI2)
+                    {
+                        orientation = value.uiVal;
+                    }
+                    PropVariantClear(&value);
+                    if (orientation >= 1 && orientation <= 8)
+                    {
+                        return orientation;
+                    }
+                }
+                return 1;
+            }
+
+            // Orientations 5..8 store the image transposed.
+            static bool SwapsAxes(uint16_t orientation)
+            {
+                return orientation >= 5 && orientation <= 8;
+            }
+
+            // Wraps `source` (pixels as the frame stores them) so it reads
+            // upright for `orientation`; leaves it as it is for 1.
+            static HRESULT Orient(uint16_t orientation, Microsoft::WRL::ComPtr<IWICBitmapSource>& source)
+            {
+                WICBitmapTransformOptions options = WICBitmapTransformRotate0;
+                switch (orientation)
+                {
+                case 2: options = WICBitmapTransformFlipHorizontal; break;
+                case 3: options = WICBitmapTransformRotate180; break;
+                case 4: options = WICBitmapTransformFlipVertical; break;
+                // The flip-rotator flips before it rotates: a transpose (5) is
+                // a horizontal flip then a 270 degree turn, a transverse (7) a
+                // horizontal flip then a 90 degree turn.
+                case 5: options = static_cast<WICBitmapTransformOptions>(WICBitmapTransformRotate270 | WICBitmapTransformFlipHorizontal); break;
+                case 6: options = WICBitmapTransformRotate90; break;
+                case 7: options = static_cast<WICBitmapTransformOptions>(WICBitmapTransformRotate90 | WICBitmapTransformFlipHorizontal); break;
+                case 8: options = WICBitmapTransformRotate270; break;
+                default: return S_OK;
+                }
+
+                Microsoft::WRL::ComPtr<IWICImagingFactory> wicFactory = GetWicFactory();
+                if (!wicFactory)
+                {
+                    return E_POINTER;
+                }
+                Microsoft::WRL::ComPtr<IWICBitmapFlipRotator> rotator;
+                HRESULT hr = wicFactory->CreateBitmapFlipRotator(&rotator);
+                if (SUCCEEDED(hr))
+                {
+                    hr = rotator->Initialize(source.Get(), options);
+                }
+                if (SUCCEEDED(hr))
+                {
+                    source = rotator;
+                }
+                return hr;
+            }
+
             // The container's thumbnail (IWICBitmapDecoder::GetThumbnail), from
-            // the decoder the caller also decodes the frame with.
+            // the decoder the caller also decodes the frame with, turned
+            // upright for the frame's `orientation` (cameras store it like the
+            // frame).
             static bool TryEmbeddedThumbnail(
                 IWICBitmapDecoder* decoder,
+                uint16_t orientation,
                 Microsoft::WRL::ComPtr<IWICBitmapSource>& outBitmap,
                 Size& outSize)
             {
@@ -160,7 +242,7 @@ namespace ImageCore
 
                 Microsoft::WRL::ComPtr<IWICBitmapSource> thumbnail;
                 HRESULT hr = decoder->GetThumbnail(&thumbnail);
-                if (FAILED(hr) || !thumbnail)
+                if (FAILED(hr) || !thumbnail || FAILED(Orient(orientation, thumbnail)))
                 {
                     return false;
                 }
@@ -224,15 +306,20 @@ namespace ImageCore
                     return hr;
                 }
 
+                // The target applies to the upright image; the frame is scaled
+                // as stored and turned upright afterwards (the smaller bitmap).
+                const uint16_t orientation = ReadOrientation(frame.Get());
+                const float uprightW = static_cast<float>(SwapsAxes(orientation) ? height : width);
+                const float uprightH = static_cast<float>(SwapsAxes(orientation) ? width : height);
                 const bool needScale = (targetSize.w > 0.0f && targetSize.h > 0.0f) &&
-                    (static_cast<float>(width) > targetSize.w || static_cast<float>(height) > targetSize.h);
+                    (uprightW > targetSize.w || uprightH > targetSize.h);
 
                 Microsoft::WRL::ComPtr<IWICBitmapSource> source = frame;
 
                 if (needScale)
                 {
-                    const float scaleX = targetSize.w / static_cast<float>(width);
-                    const float scaleY = targetSize.h / static_cast<float>(height);
+                    const float scaleX = targetSize.w / uprightW;
+                    const float scaleY = targetSize.h / uprightH;
                     const float scale = (std::min)(scaleX, scaleY);
 
                     const UINT scaledWidth = static_cast<UINT>(std::round(width * scale));
@@ -248,6 +335,12 @@ namespace ImageCore
                             source = scaler;
                         }
                     }
+                }
+
+                hr = Orient(orientation, source);
+                if (FAILED(hr))
+                {
+                    return hr;
                 }
 
                 Microsoft::WRL::ComPtr<IWICFormatConverter> converter;
@@ -306,6 +399,13 @@ namespace ImageCore
                     return hr;
                 }
 
+                Microsoft::WRL::ComPtr<IWICBitmapSource> upright = frame;
+                hr = Orient(ReadOrientation(frame.Get()), upright);
+                if (FAILED(hr))
+                {
+                    return hr;
+                }
+
                 Microsoft::WRL::ComPtr<IWICFormatConverter> converter;
                 hr = wicFactory->CreateFormatConverter(&converter);
                 if (FAILED(hr))
@@ -314,7 +414,7 @@ namespace ImageCore
                 }
 
                 hr = converter->Initialize(
-                    frame.Get(),
+                    upright.Get(),
                     GUID_WICPixelFormat32bppBGRA,
                     WICBitmapDitherTypeNone,
                     nullptr,
@@ -562,7 +662,15 @@ namespace ImageCore
                 Microsoft::WRL::ComPtr<IWICBitmapSource> wicBitmap;
                 Size imageSize;
 
-                if (TryEmbeddedThumbnail(wicDecoder.Get(), wicBitmap, imageSize))
+                uint16_t orientation = 1;
+                {
+                    Microsoft::WRL::ComPtr<IWICBitmapFrameDecode> frame;
+                    if (SUCCEEDED(wicDecoder->GetFrame(0, &frame)))
+                    {
+                        orientation = ReadOrientation(frame.Get());
+                    }
+                }
+                if (TryEmbeddedThumbnail(wicDecoder.Get(), orientation, wicBitmap, imageSize))
                 {
                     DecodedImage decoded {};
                     HRESULT hrCopy = CopyWicBitmapToDecodedImage(wicBitmap.Get(), decoded);
@@ -1132,4 +1240,9 @@ bool ImageCore::ImageDecodeDispatcher::HasThreadResources()
 uint64_t ImageCore::ImageDecodeDispatcher::ThreadWicDecoderCount()
 {
     return t_wicDecoders;
+}
+
+void ImageCore::ImageDecodeDispatcher::SetThreadWicDecoderWrapperForTesting(WicDecoderWrapper wrapper)
+{
+    t_wicDecoderWrapper = std::move(wrapper);
 }

@@ -11,6 +11,7 @@
 #include <wincodec.h>
 #include <windows.h>
 #include <wrl/client.h>
+#include <wrl/implements.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -209,7 +210,7 @@ namespace
     // `withHeader` false leaves the optional header of an in-memory request
     // empty.
     Outcome Decode(const std::wstring& source, ImagePurpose purpose, const std::vector<uint8_t>& bytes,
-        bool withHeader = true)
+        bool withHeader = true, ImageDecodeDispatcher::WicDecoderWrapper wrapper = {})
     {
         RegisterBuiltInDecoders();
         ImageRequest request(source, purpose);
@@ -235,8 +236,10 @@ namespace
             outcome.wicFactoryBefore = ImageDecodeDispatcher::HasThreadResources();
             const uint64_t headerReadsBefore = ImageFormatDetector::ThreadHeaderReadCount();
             const uint64_t wicDecodersBefore = ImageDecodeDispatcher::ThreadWicDecoderCount();
+            ImageDecodeDispatcher::SetThreadWicDecoderWrapperForTesting(wrapper);
             ImageDecodeDispatcher dispatcher;
             PipelineResult result = dispatcher.Decode(request, input);
+            ImageDecodeDispatcher::SetThreadWicDecoderWrapperForTesting({});
             outcome.wicFactoryAfter = ImageDecodeDispatcher::HasThreadResources();
             outcome.headerReads = ImageFormatDetector::ThreadHeaderReadCount() - headerReadsBefore;
             outcome.wicDecoders = ImageDecodeDispatcher::ThreadWicDecoderCount() - wicDecodersBefore;
@@ -665,5 +668,260 @@ IC_TEST(DecodeRouting_WicDecodeOpensTheInputOnce)
             IC_CHECK(outcome->wicDecoders == 1);
             IC_CHECK(!outcome->pixels.empty() && outcome->pixels == plainPath.pixels);
         }
+    }
+}
+
+namespace
+{
+    // The four quadrant colors of the upright reference image (BGRA).
+    struct Quadrant
+    {
+        uint8_t b;
+        uint8_t g;
+        uint8_t r;
+    };
+    constexpr Quadrant kTopLeft { 0x20, 0x20, 0xE0 };      // red
+    constexpr Quadrant kTopRight { 0x20, 0xE0, 0x20 };     // green
+    constexpr Quadrant kBottomLeft { 0xE0, 0x20, 0x20 };   // blue
+    constexpr Quadrant kBottomRight { 0xE0, 0xE0, 0xE0 };  // white
+
+    Quadrant UprightColor(size_t x, size_t y, size_t width, size_t height)
+    {
+        const bool right = x >= width / 2;
+        const bool bottom = y >= height / 2;
+        return bottom ? (right ? kBottomRight : kBottomLeft) : (right ? kTopRight : kTopLeft);
+    }
+
+    // Where the upright pixel (x, y) of a width x height image is stored for
+    // EXIF orientation `orientation` (5..8 store it transposed: height x width).
+    std::pair<size_t, size_t> StoredPosition(uint16_t orientation, size_t x, size_t y, size_t width, size_t height)
+    {
+        switch (orientation)
+        {
+        case 2: return { width - 1 - x, y };
+        case 3: return { width - 1 - x, height - 1 - y };
+        case 4: return { x, height - 1 - y };
+        case 5: return { y, x };
+        case 6: return { y, width - 1 - x };
+        case 7: return { height - 1 - y, width - 1 - x };
+        case 8: return { height - 1 - y, x };
+        default: return { x, y };
+        }
+    }
+
+    // A JPEG storing the upright quadrant image as a camera does for
+    // `orientation`, with an Exif APP1 (built by hand) holding that tag.
+    std::vector<uint8_t> OrientedJpeg(uint16_t orientation, size_t width, size_t height)
+    {
+        EnsureProcessCom();
+        const bool swap = orientation >= 5;
+        const size_t storedW = swap ? height : width;
+        const size_t storedH = swap ? width : height;
+        DirectX::ScratchImage scratch;
+        IC_REQUIRE(SUCCEEDED(scratch.Initialize2D(DXGI_FORMAT_B8G8R8A8_UNORM, storedW, storedH, 1, 1)));
+        const DirectX::Image* image = scratch.GetImage(0, 0, 0);
+        IC_REQUIRE(image != nullptr);
+        for (size_t y = 0; y < height; ++y)
+        {
+            for (size_t x = 0; x < width; ++x)
+            {
+                const auto [sx, sy] = StoredPosition(orientation, x, y, width, height);
+                const Quadrant c = UprightColor(x, y, width, height);
+                uint8_t* px = image->pixels + sy * image->rowPitch + sx * 4;
+                px[0] = c.b;
+                px[1] = c.g;
+                px[2] = c.r;
+                px[3] = 0xFF;
+            }
+        }
+        DirectX::Blob blob;
+        IC_REQUIRE(SUCCEEDED(DirectX::SaveToWICMemory(*image, DirectX::WIC_FLAGS_NONE,
+            DirectX::GetWICCodec(DirectX::WIC_CODEC_JPEG), blob)));
+        const auto* bytes = static_cast<const uint8_t*>(blob.GetBufferPointer());
+        const std::vector<uint8_t> jpeg(bytes, bytes + blob.GetBufferSize());
+
+        // TIFF header, IFD0 with the one Orientation entry, no next IFD.
+        std::vector<uint8_t> tiff { 'I', 'I', 0x2A, 0x00 };
+        Put32(tiff, 8);
+        Put16(tiff, 1);
+        PutIfdEntry(tiff, 0x0112, 3, orientation);
+        Put32(tiff, 0);
+        const size_t segmentLength = 2 + 6 + tiff.size();
+        std::vector<uint8_t> app1 { 0xFF, 0xE1,
+            static_cast<uint8_t>(segmentLength >> 8), static_cast<uint8_t>(segmentLength & 0xFF),
+            'E', 'x', 'i', 'f', 0x00, 0x00 };
+        app1.insert(app1.end(), tiff.begin(), tiff.end());
+        std::vector<uint8_t> out(jpeg.begin(), jpeg.begin() + 2);
+        out.insert(out.end(), app1.begin(), app1.end());
+        out.insert(out.end(), jpeg.begin() + 2, jpeg.end());
+        return out;
+    }
+
+    // The decoded image shows the upright quadrants (sampled at their centers;
+    // JPEG and scaling only blur the edges).
+    bool ShowsUprightQuadrants(const Outcome& outcome)
+    {
+        if (outcome.width == 0 || outcome.height == 0 ||
+            outcome.pixels.size() < static_cast<size_t>(outcome.width) * outcome.height * 4)
+        {
+            return false;
+        }
+        const auto similar = [](uint8_t a, uint8_t b) { return (a > b ? a - b : b - a) < 60; };
+        constexpr double kCenters[4][2] { { 0.25, 0.25 }, { 0.75, 0.25 }, { 0.25, 0.75 }, { 0.75, 0.75 } };
+        for (const auto& center : kCenters)
+        {
+            const double fx = center[0];
+            const double fy = center[1];
+            const size_t x = static_cast<size_t>(fx * outcome.width);
+            const size_t y = static_cast<size_t>(fy * outcome.height);
+            const uint8_t* px = outcome.pixels.data() + (y * outcome.width + x) * 4;
+            const Quadrant expected = UprightColor(x, y, outcome.width, outcome.height);
+            if (!similar(px[0], expected.b) || !similar(px[1], expected.g) || !similar(px[2], expected.r))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+}
+
+// A JPEG with an EXIF orientation decodes upright on every WIC path: the
+// thumbnail (scaled to fit the target), the preview and the full-resolution
+// image, path-only and in memory, with the upright dimensions. Orientation 1
+// and a PNG (no tag) are unchanged.
+IC_TEST(DecodeRouting_ExifOrientationDecodesUpright)
+{
+    constexpr size_t kUprightW = 48;
+    constexpr size_t kUprightH = 32;
+    const std::wstring missing = (TempDir() / L"missing_oriented.jpg").wstring();
+    IC_REQUIRE(!std::filesystem::exists(missing));
+
+    for (uint16_t orientation = 1; orientation <= 8; ++orientation)
+    {
+        const std::vector<uint8_t> jpeg = OrientedJpeg(orientation, kUprightW, kUprightH);
+        const std::wstring onDisk = WriteFile(L"oriented" + std::to_wstring(orientation) + L".jpg", jpeg);
+        for (const ImagePurpose purpose : { ImagePurpose::Thumbnail, ImagePurpose::Preview, ImagePurpose::FullResolution })
+        {
+            const bool thumb = (purpose == ImagePurpose::Thumbnail);
+            // 48 x 32 fit into 16 x 16: 16 x 11 (10.67 rounded).
+            const uint32_t expectedW = thumb ? 16u : static_cast<uint32_t>(kUprightW);
+            const uint32_t expectedH = thumb ? 11u : static_cast<uint32_t>(kUprightH);
+            for (const Outcome& outcome : { Decode(onDisk, purpose, {}), Decode(missing, purpose, jpeg) })
+            {
+                std::printf("  orientation %u, %s: %ux%u\n", static_cast<unsigned>(orientation),
+                    thumb ? "thumbnail" : (purpose == ImagePurpose::Preview ? "preview" : "full"),
+                    outcome.width, outcome.height);
+                const bool upright = ShowsUprightQuadrants(outcome);
+                if (!upright)
+                {
+                    std::printf("    not upright\n");
+                }
+                IC_CHECK(SUCCEEDED(outcome.hr));
+                IC_CHECK(outcome.width == expectedW && outcome.height == expectedH);
+                IC_CHECK(upright);
+            }
+        }
+    }
+
+    // No tag: a PNG decodes as stored.
+    const std::vector<uint8_t> png = Encode(Format::Png, kWidth, kHeight);
+    const Outcome plain = Decode(WriteFile(L"plain_orientation.png", png), ImagePurpose::FullResolution, {});
+    IC_CHECK(SUCCEEDED(plain.hr));
+    IC_CHECK(plain.width == kWidth && plain.height == kHeight);
+}
+
+namespace
+{
+    // A WIC decoder that forwards to a real one, except that its container
+    // thumbnail (IWICBitmapDecoder::GetThumbnail) is `thumbnail`: what a
+    // container with an embedded thumbnail returns, which WIC's JPEG decoder
+    // never does at the container level (see DecodeRouting_WicDecodeOpensTheInputOnce).
+    class ContainerThumbnailDecoder
+        : public Microsoft::WRL::RuntimeClass<Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>, IWICBitmapDecoder>
+    {
+    public:
+        ContainerThumbnailDecoder(Microsoft::WRL::ComPtr<IWICBitmapDecoder> inner,
+            Microsoft::WRL::ComPtr<IWICBitmapSource> thumbnail)
+            : m_inner(std::move(inner))
+            , m_thumbnail(std::move(thumbnail))
+        {
+        }
+
+        STDMETHODIMP QueryCapability(IStream* stream, DWORD* capability) override { return m_inner->QueryCapability(stream, capability); }
+        STDMETHODIMP Initialize(IStream* stream, WICDecodeOptions options) override { return m_inner->Initialize(stream, options); }
+        STDMETHODIMP GetContainerFormat(GUID* format) override { return m_inner->GetContainerFormat(format); }
+        STDMETHODIMP GetDecoderInfo(IWICBitmapDecoderInfo** info) override { return m_inner->GetDecoderInfo(info); }
+        STDMETHODIMP CopyPalette(IWICPalette* palette) override { return m_inner->CopyPalette(palette); }
+        STDMETHODIMP GetMetadataQueryReader(IWICMetadataQueryReader** reader) override { return m_inner->GetMetadataQueryReader(reader); }
+        STDMETHODIMP GetPreview(IWICBitmapSource** preview) override { return m_inner->GetPreview(preview); }
+        STDMETHODIMP GetColorContexts(UINT count, IWICColorContext** contexts, UINT* actual) override { return m_inner->GetColorContexts(count, contexts, actual); }
+        STDMETHODIMP GetThumbnail(IWICBitmapSource** thumbnail) override { return m_thumbnail.CopyTo(thumbnail); }
+        STDMETHODIMP GetFrameCount(UINT* count) override { return m_inner->GetFrameCount(count); }
+        STDMETHODIMP GetFrame(UINT index, IWICBitmapFrameDecode** frame) override { return m_inner->GetFrame(index, frame); }
+
+    private:
+        Microsoft::WRL::ComPtr<IWICBitmapDecoder> m_inner;
+        Microsoft::WRL::ComPtr<IWICBitmapSource> m_thumbnail;
+    };
+}
+
+// The container-thumbnail branch of a thumbnail decode turns the embedded
+// thumbnail upright with the frame's EXIF orientation. The JPEG's frame
+// carries the tag; a decoder wrapper stands in for a container whose
+// thumbnail (24 x 16 upright, stored like the frame) is embedded. For every
+// orientation the decode returns that thumbnail, not the scaled frame
+// (16 x 11), upright and with the upright dimensions.
+IC_TEST(DecodeRouting_ExifOrientationAppliesToTheContainerThumbnail)
+{
+    constexpr size_t kThumbW = 24;
+    constexpr size_t kThumbH = 16;
+    const std::wstring missing = (TempDir() / L"missing_container_thumbnail.jpg").wstring();
+    IC_REQUIRE(!std::filesystem::exists(missing));
+
+    for (uint16_t orientation = 1; orientation <= 8; ++orientation)
+    {
+        // The thumbnail's pixels as the container stores them for `orientation`.
+        const bool swap = orientation >= 5;
+        const UINT storedW = static_cast<UINT>(swap ? kThumbH : kThumbW);
+        const UINT storedH = static_cast<UINT>(swap ? kThumbW : kThumbH);
+        std::vector<uint8_t> stored(static_cast<size_t>(storedW) * storedH * 4);
+        for (size_t y = 0; y < kThumbH; ++y)
+        {
+            for (size_t x = 0; x < kThumbW; ++x)
+            {
+                const auto [sx, sy] = StoredPosition(orientation, x, y, kThumbW, kThumbH);
+                const Quadrant c = UprightColor(x, y, kThumbW, kThumbH);
+                uint8_t* px = stored.data() + (sy * storedW + sx) * 4;
+                px[0] = c.b;
+                px[1] = c.g;
+                px[2] = c.r;
+                px[3] = 0xFF;
+            }
+        }
+
+        size_t wrapped = 0;
+        const auto wrapper = [&](Microsoft::WRL::ComPtr<IWICBitmapDecoder> inner)
+        {
+            Microsoft::WRL::ComPtr<IWICImagingFactory> factory;
+            Microsoft::WRL::ComPtr<IWICBitmap> thumbnail;
+            IC_REQUIRE(SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                IID_PPV_ARGS(&factory))));
+            IC_REQUIRE(SUCCEEDED(factory->CreateBitmapFromMemory(storedW, storedH, GUID_WICPixelFormat32bppBGRA,
+                storedW * 4, static_cast<UINT>(stored.size()), stored.data(), &thumbnail)));
+            ++wrapped;
+            Microsoft::WRL::ComPtr<IWICBitmapDecoder> decoder =
+                Microsoft::WRL::Make<ContainerThumbnailDecoder>(std::move(inner), thumbnail);
+            return decoder;
+        };
+
+        const std::vector<uint8_t> jpeg = OrientedJpeg(orientation, 48, 32);
+        const Outcome outcome = Decode(missing, ImagePurpose::Thumbnail, jpeg, true, wrapper);
+        const bool upright = ShowsUprightQuadrants(outcome);
+        std::printf("  orientation %u, container thumbnail: %ux%u%s\n", static_cast<unsigned>(orientation),
+            outcome.width, outcome.height, upright ? "" : " (not upright)");
+        IC_CHECK(wrapped == 1);
+        IC_CHECK(SUCCEEDED(outcome.hr));
+        IC_CHECK(outcome.width == kThumbW && outcome.height == kThumbH);
+        IC_CHECK(upright);
     }
 }
