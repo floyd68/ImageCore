@@ -23,7 +23,8 @@
 #include <thread>
 #include <vector>
 
-// Decoder routing and the thread-resource query (ImageCore #3).
+// Decoder routing and the thread-resource query (ImageCore #3), and the
+// probe's header reads (ImageCore #19).
 //
 // Every decode runs on a fresh COM-initialized thread, so
 // ImageDecodeDispatcher::HasThreadResources() tells whether the decode went
@@ -45,6 +46,7 @@ namespace
         Jpeg,
         Png,
         Dds,
+        Tga,
     };
 
     const wchar_t* Extension(Format format)
@@ -53,6 +55,7 @@ namespace
         {
         case Format::Jpeg: return L".jpg";
         case Format::Png: return L".png";
+        case Format::Tga: return L".tga";
         default: return L".dds";
         }
     }
@@ -63,6 +66,7 @@ namespace
         {
         case Format::Jpeg: return "JPEG";
         case Format::Png: return "PNG";
+        case Format::Tga: return "TGA";
         default: return "DDS";
         }
     }
@@ -99,6 +103,10 @@ namespace
         if (format == Format::Dds)
         {
             IC_REQUIRE(SUCCEEDED(DirectX::SaveToDDSMemory(*image, DirectX::DDS_FLAGS_NONE, blob)));
+        }
+        else if (format == Format::Tga)
+        {
+            IC_REQUIRE(SUCCEEDED(DirectX::SaveToTGAMemory(*image, DirectX::TGA_FLAGS_NONE, blob)));
         }
         else
         {
@@ -154,6 +162,7 @@ namespace
         DXGI_FORMAT format { DXGI_FORMAT_UNKNOWN };
         bool wicFactoryBefore { true };
         bool wicFactoryAfter { false };
+        uint64_t headerReads { 0 };  // ProbeFile header reads during the decode
         std::vector<uint8_t> pixels {};
     };
 
@@ -220,9 +229,11 @@ namespace
         RunOnComThread([&]()
         {
             outcome.wicFactoryBefore = ImageDecodeDispatcher::HasThreadResources();
+            const uint64_t headerReadsBefore = ImageFormatDetector::ThreadHeaderReadCount();
             ImageDecodeDispatcher dispatcher;
             PipelineResult result = dispatcher.Decode(request, input);
             outcome.wicFactoryAfter = ImageDecodeDispatcher::HasThreadResources();
+            outcome.headerReads = ImageFormatDetector::ThreadHeaderReadCount() - headerReadsBefore;
             outcome.hr = result.hr;
             if (SUCCEEDED(result.hr) && result.image.blocks)
             {
@@ -441,5 +452,74 @@ IC_TEST(DecodeRouting_BytesWithoutHeaderAreRoutedByTheBytes)
             IC_CHECK(bytesOnly.wicFactoryAfter == c.viaWic);
             IC_CHECK(!bytesOnly.pixels.empty() && bytesOnly.pixels == withHeader.pixels);
         }
+    }
+}
+
+// The format probe keeps nothing between calls: every ProbeFile reads the
+// header again, so a file replaced under the same path and write time (a copy
+// that preserves timestamps) is probed by its current content.
+IC_TEST(DecodeRouting_ProbeReadsTheCurrentFileEveryTime)
+{
+    const std::wstring path = WriteFile(L"reprobed.img", Encode(Format::Png, kWidth, kHeight));
+    const auto writeTime = std::filesystem::last_write_time(path);
+
+    const uint64_t before = ImageFormatDetector::ThreadHeaderReadCount();
+    IC_CHECK(ImageFormatDetector::ProbeFile(path).info.format == ImageFormat::PNG);
+    IC_CHECK(ImageFormatDetector::ProbeFile(path).info.format == ImageFormat::PNG);
+    IC_CHECK(ImageFormatDetector::ThreadHeaderReadCount() - before == 2);
+
+    const std::vector<uint8_t> dds = Encode(Format::Dds, kWidth, kHeight);
+    WriteFile(L"reprobed.img", dds);
+    std::filesystem::last_write_time(path, writeTime);
+    IC_REQUIRE(std::filesystem::last_write_time(path) == writeTime);
+
+    const FormatProbe probe = ImageFormatDetector::ProbeFile(path);
+    IC_CHECK(probe.info.format == ImageFormat::DDS);
+    IC_CHECK(probe.header.size() == ImageFormatDetector::kProbeSize);
+    IC_CHECK(std::equal(probe.header.begin(), probe.header.end(), dds.begin()));
+    IC_CHECK(ImageFormatDetector::ThreadHeaderReadCount() - before == 3);
+}
+
+// A path-only request reads the header once, every time it is decoded; a
+// request that carries bytes (with or without the header span) reads none and
+// never touches the file named by `source`: that file is held open without
+// sharing during the decode, so any open of it would fail.
+IC_TEST(DecodeRouting_HeaderReadsPerRequest)
+{
+    for (const Format format : { Format::Jpeg, Format::Png, Format::Dds, Format::Tga })
+    {
+        const std::wstring ext = Extension(format);
+        const std::vector<uint8_t> bytes = Encode(format, kWidth, kHeight);
+        const std::wstring onDisk = WriteFile(L"header_reads" + ext, bytes);
+        // A decoy of another format: decoding it instead of the bytes changes the result.
+        const std::wstring locked = WriteFile(L"locked" + ext,
+            Encode(format == Format::Png ? Format::Dds : Format::Png, kHeight, kWidth));
+        const HANDLE lock = CreateFileW(locked.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL, nullptr);
+        IC_REQUIRE(lock != INVALID_HANDLE_VALUE);
+
+        for (const ImagePurpose purpose : { ImagePurpose::Thumbnail, ImagePurpose::FullResolution })
+        {
+            std::printf("  %s %s\n", Name(format), purpose == ImagePurpose::Thumbnail ? "Thumbnail" : "FullResolution");
+            const Outcome pathOnly = Decode(onDisk, purpose, {});
+            const Outcome pathOnlyAgain = Decode(onDisk, purpose, {});
+            IC_CHECK(SUCCEEDED(pathOnly.hr) && SUCCEEDED(pathOnlyAgain.hr));
+            IC_CHECK(pathOnly.headerReads == 1);
+            IC_CHECK(pathOnlyAgain.headerReads == 1);
+
+            const Outcome withHeader = Decode(locked, purpose, bytes);
+            const Outcome bytesOnly = Decode(locked, purpose, bytes, false);
+            for (const Outcome* outcome : { &withHeader, &bytesOnly })
+            {
+                if (FAILED(outcome->hr))
+                {
+                    std::fprintf(stderr, "  in-memory decode failed: hr=0x%08lX\n", static_cast<unsigned long>(outcome->hr));
+                }
+                IC_CHECK(SUCCEEDED(outcome->hr));
+                IC_CHECK(outcome->headerReads == 0);
+                IC_CHECK(!outcome->pixels.empty() && outcome->pixels == pathOnly.pixels);
+            }
+        }
+        CloseHandle(lock);
     }
 }

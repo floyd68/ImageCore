@@ -1021,8 +1021,8 @@ namespace ImageCore
 
         // The header comes from what is decoded: the explicit header, else the
         // start of the in-memory bytes (the file at the path may differ or not
-        // exist); only a path-only request reads it from the file (ProbeFile).
-        static ImageFormatDetector s_detector;
+        // exist); only a path-only request reads it from the file, once
+        // (ProbeFile).
         FormatProbe probe {};
         std::span<const uint8_t> header = input.header;
         if (header.empty() && !input.bytes.empty())
@@ -1041,7 +1041,7 @@ namespace ImageCore
         }
         else
         {
-            probe = s_detector.ProbeFile(request.source);
+            probe = ImageFormatDetector::ProbeFile(request.source);
         }
 
         // Decoders get the probed header, so they route by the detected

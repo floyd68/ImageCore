@@ -42,7 +42,7 @@ It focuses on high-throughput DDS workloads (thumbnails + full-resolution) while
 
 - **`ImageDecodeDispatcher`** (`ImageDecodeDispatcher.*`)
   - Routes requests to a decoder (WIC/DirectXTex) using a format probe. The WIC probe rejects magic that DirectXTex owns (DDS, HDR, EXR), so a file DirectXTex rejects is not retried through WIC
-  - `Decode(request, input)` decodes from `input.bytes` when present (`request.source` then only supplies the extension and is never opened), otherwise from the path
+  - `Decode(request, input)` decodes from `input.bytes` when present (`request.source` then only supplies the extension and is never opened), otherwise from the path; a path-only request reads its probe header from the file once per decode (probes are not cached)
   - WIC decodes cache a per-thread WIC factory: `HasThreadResources()` reports it, and `ReleaseThreadResources()` releases it; call it before `CoUninitialize()` on any thread that decoded
 
 - **`FileByteCache`** (`FileByteCache.*`)
