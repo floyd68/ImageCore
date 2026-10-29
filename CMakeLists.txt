@@ -4,7 +4,6 @@ target_sources(ImageCore PRIVATE
     DecoderRegistry.cpp
     DecodeScheduler.cpp
     FileByteCache.cpp
-    ImageCache.cpp
     ImageCoreLog.cpp
     ImageDecodeDispatcher.cpp
     ImageFormatDetector.cpp
@@ -31,7 +30,7 @@ target_link_libraries(ImageCore PUBLIC
 )
 
 if(MSVC)
-    target_compile_options(ImageCore PRIVATE /permissive-)
+    target_compile_options(ImageCore PRIVATE /permissive- /utf-8)
 endif()
 
 option(IMAGECORE_BUILD_TESTS "Build ImageCore unit tests (configure from the FICture2 tree)" OFF)

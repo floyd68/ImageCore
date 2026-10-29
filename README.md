@@ -42,7 +42,8 @@ It focuses on high-throughput DDS workloads (thumbnails + full-resolution) while
 
 - **`ImageDecodeDispatcher`** (`ImageDecodeDispatcher.*`)
   - Routes requests to a decoder (WIC/DirectXTex) using a format probe. The WIC probe rejects magic that DirectXTex owns (DDS, HDR, EXR), so a file DirectXTex rejects is not retried through WIC
-  - `Decode(request, input)` decodes from `input.bytes` when present (`request.source` then only supplies the extension and is never opened), otherwise from the path
+  - `Decode(request, input)` decodes from `input.bytes` when present (`request.source` then only supplies the extension and is never opened), otherwise from the path; a path-only request reads its probe header from the file once per decode (probes are not cached)
+  - A WIC decode opens its input once: thumbnail/preview decodes check the container's embedded thumbnail and fall back to the scaled frame through the same decoder
   - WIC decodes cache a per-thread WIC factory: `HasThreadResources()` reports it, and `ReleaseThreadResources()` releases it; call it before `CoUninitialize()` on any thread that decoded
 
 - **`FileByteCache`** (`FileByteCache.*`)
@@ -100,7 +101,7 @@ DirectXTex decoding supports:
 - Byte sources that implement only `ReadAll(path)` keep working (the stop-aware overload delegates to it); their reads are not interrupted.
 - Cancellation state is owned by each request and released when the request finishes, is canceled, or the scheduler shuts down; canceling an unknown or finished handle is a no-op and leaves nothing behind.
 - `ImageLoader::Shutdown()` is idempotent and final: it cancels every live request (as above), queued requests are dropped without callbacks, and later `RequestDecoded` calls return 0 without invoking the callback. It joins the decode threads without a bound, so a read that honours neither its token nor OS cancellation keeps it waiting.
-- `ImageLoader::Shutdown(bound)` does the same but waits at most `bound` and returns whether every thread was joined. On `false` nothing is detached: the loader keeps its scheduler and cache, keeps rejecting requests, and a later call retries the join; the host should take a forced-exit path instead of static destruction. `DecodeScheduler::SetThreadCount` does not restart until a retry succeeds.
+- `ImageLoader::Shutdown(bound)` does the same but waits at most `bound` and returns whether every thread was joined. On `false` nothing is detached: the loader keeps its scheduler, keeps rejecting requests, and a later call retries the join; the host should take a forced-exit path instead of static destruction. `DecodeScheduler::SetThreadCount` does not restart until a retry succeeds.
 - `ImageLoader::ShutdownIfCreated(bound)` is the bounded shutdown for host cleanup paths: it never constructs the loader (returns `true` when ImageCore was never used, starting no thread) and otherwise returns `Instance().Shutdown(bound)`.
 
 ## Priority

@@ -13,7 +13,6 @@
 namespace ImageCore
 {
     // Forward declarations
-    class ImageCache;
     class DecodeScheduler;
 
     // ImageHandle: async request handle
@@ -39,8 +38,8 @@ namespace ImageCore
 
         // Bounded shutdown (see DecodeScheduler::Shutdown(bound)): true when
         // every decode thread was joined within `bound`; the loader then drops
-        // its scheduler and cache as Shutdown() does. On false it keeps both
-        // (the unjoined threads may still use them) and keeps rejecting
+        // its scheduler as Shutdown() does. On false it keeps the scheduler
+        // (the unjoined threads may still use it) and keeps rejecting
         // requests; a later call retries the join. The host should take a
         // forced-exit path rather than run static destruction with threads
         // still running (~ImageLoader joins without a bound).
@@ -77,12 +76,6 @@ namespace ImageCore
         // drop stale results themselves. Unknown or finished handles are a no-op.
         void Cancel(ImageHandle handle);
 
-        // Clear cache
-        void ClearCache();
-
-        // Set cache size limit
-        void SetCacheSizeLimit(size_t maxMemoryBytes);
-
         // Set worker thread count
         void SetWorkerThreadCount(size_t count);
 
@@ -98,8 +91,6 @@ namespace ImageCore
         void Initialize();
 
         std::shared_ptr<DecodeScheduler> Scheduler() const;
-
-        std::unique_ptr<ImageCache> m_cache;
 
         // Requests copy the pointer under m_mutex and use the scheduler outside
         // it, so Shutdown (which joins workers) never holds the mutex while a

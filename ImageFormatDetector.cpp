@@ -1,9 +1,15 @@
 #include "ImageFormatDetector.h"
 #include <algorithm>
+#include <filesystem>
 #include <fstream>
 
 namespace ImageCore
 {
+    namespace
+    {
+        thread_local uint64_t t_headerReads = 0;
+    }
+
     static ImageFormatInfo MakeInfo(ImageFormat f)
     {
         ImageFormatInfo info {};
@@ -55,8 +61,14 @@ namespace ImageCore
         return ext;
     }
 
+    uint64_t ImageFormatDetector::ThreadHeaderReadCount()
+    {
+        return t_headerReads;
+    }
+
     std::vector<uint8_t> ImageFormatDetector::ReadHeader(const std::wstring& path, size_t maxBytes)
     {
+        ++t_headerReads;
         std::vector<uint8_t> data;
         data.resize(maxBytes);
 
@@ -181,19 +193,6 @@ namespace ImageCore
     {
         FormatProbe probe {};
         probe.extensionLower = GetLowerExtension(path);
-
-        std::error_code ec;
-        const auto wt = std::filesystem::last_write_time(std::filesystem::path(path), ec);
-
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            auto it = m_cache.find(path);
-            if (it != m_cache.end() && !ec && it->second.writeTime == wt)
-            {
-                return it->second.probe;
-            }
-        }
-
         probe.header = ReadHeader(path, kProbeSize);
         probe.info = DetectByMagic(probe.header);
 
@@ -204,12 +203,6 @@ namespace ImageCore
             {
                 probe.info = byExt;
             }
-        }
-
-        if (!ec)
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            m_cache[path] = CacheEntry{ wt, probe };
         }
 
         return probe;
