@@ -925,3 +925,115 @@ IC_TEST(DecodeRouting_ExifOrientationAppliesToTheContainerThumbnail)
         IC_CHECK(upright);
     }
 }
+
+namespace
+{
+    // A frame that forwards to a real one and counts the source rows read
+    // through CopyPixels (a whole-image request counts its full height).
+    class CountingFrame
+        : public Microsoft::WRL::RuntimeClass<Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,
+              IWICBitmapFrameDecode, IWICBitmapSource>
+    {
+    public:
+        CountingFrame(Microsoft::WRL::ComPtr<IWICBitmapFrameDecode> inner, std::shared_ptr<uint64_t> rows)
+            : m_inner(std::move(inner))
+            , m_rows(std::move(rows))
+        {
+        }
+
+        STDMETHODIMP GetSize(UINT* width, UINT* height) override { return m_inner->GetSize(width, height); }
+        STDMETHODIMP GetPixelFormat(WICPixelFormatGUID* format) override { return m_inner->GetPixelFormat(format); }
+        STDMETHODIMP GetResolution(double* dpiX, double* dpiY) override { return m_inner->GetResolution(dpiX, dpiY); }
+        STDMETHODIMP CopyPalette(IWICPalette* palette) override { return m_inner->CopyPalette(palette); }
+        STDMETHODIMP CopyPixels(const WICRect* rect, UINT stride, UINT size, BYTE* buffer) override
+        {
+            UINT width = 0;
+            UINT height = 0;
+            (void)m_inner->GetSize(&width, &height);
+            *m_rows += rect ? static_cast<uint64_t>(rect->Height) : height;
+            return m_inner->CopyPixels(rect, stride, size, buffer);
+        }
+        STDMETHODIMP GetMetadataQueryReader(IWICMetadataQueryReader** reader) override { return m_inner->GetMetadataQueryReader(reader); }
+        STDMETHODIMP GetColorContexts(UINT count, IWICColorContext** contexts, UINT* actual) override { return m_inner->GetColorContexts(count, contexts, actual); }
+        STDMETHODIMP GetThumbnail(IWICBitmapSource** thumbnail) override { return m_inner->GetThumbnail(thumbnail); }
+
+    private:
+        Microsoft::WRL::ComPtr<IWICBitmapFrameDecode> m_inner;
+        std::shared_ptr<uint64_t> m_rows;
+    };
+
+    // A decoder whose frames are CountingFrames; the rest is the real decoder.
+    class CountingDecoder
+        : public Microsoft::WRL::RuntimeClass<Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>, IWICBitmapDecoder>
+    {
+    public:
+        CountingDecoder(Microsoft::WRL::ComPtr<IWICBitmapDecoder> inner, std::shared_ptr<uint64_t> rows)
+            : m_inner(std::move(inner))
+            , m_rows(std::move(rows))
+        {
+        }
+
+        STDMETHODIMP QueryCapability(IStream* stream, DWORD* capability) override { return m_inner->QueryCapability(stream, capability); }
+        STDMETHODIMP Initialize(IStream* stream, WICDecodeOptions options) override { return m_inner->Initialize(stream, options); }
+        STDMETHODIMP GetContainerFormat(GUID* format) override { return m_inner->GetContainerFormat(format); }
+        STDMETHODIMP GetDecoderInfo(IWICBitmapDecoderInfo** info) override { return m_inner->GetDecoderInfo(info); }
+        STDMETHODIMP CopyPalette(IWICPalette* palette) override { return m_inner->CopyPalette(palette); }
+        STDMETHODIMP GetMetadataQueryReader(IWICMetadataQueryReader** reader) override { return m_inner->GetMetadataQueryReader(reader); }
+        STDMETHODIMP GetPreview(IWICBitmapSource** preview) override { return m_inner->GetPreview(preview); }
+        STDMETHODIMP GetColorContexts(UINT count, IWICColorContext** contexts, UINT* actual) override { return m_inner->GetColorContexts(count, contexts, actual); }
+        STDMETHODIMP GetThumbnail(IWICBitmapSource** thumbnail) override { return m_inner->GetThumbnail(thumbnail); }
+        STDMETHODIMP GetFrameCount(UINT* count) override { return m_inner->GetFrameCount(count); }
+        STDMETHODIMP GetFrame(UINT index, IWICBitmapFrameDecode** frame) override
+        {
+            Microsoft::WRL::ComPtr<IWICBitmapFrameDecode> inner;
+            const HRESULT hr = m_inner->GetFrame(index, &inner);
+            if (FAILED(hr))
+            {
+                return hr;
+            }
+            Microsoft::WRL::ComPtr<IWICBitmapFrameDecode> counting = Microsoft::WRL::Make<CountingFrame>(inner, m_rows);
+            *frame = counting.Detach();
+            return S_OK;
+        }
+
+    private:
+        Microsoft::WRL::ComPtr<IWICBitmapDecoder> m_inner;
+        std::shared_ptr<uint64_t> m_rows;
+    };
+}
+
+// Turning an image upright reads its frame once, like an image that needs no
+// turn: a flip-rotator over a source that decodes on demand would fetch the
+// source again for every band it produces, re-decoding the JPEG over and
+// over (seconds for a camera photo). The frame rows read for a rotated
+// image stay within twice its stored height, on the full-resolution and the
+// scaled (thumbnail) path.
+IC_TEST(DecodeRouting_OrientedDecodesReadTheFrameOnce)
+{
+    constexpr size_t kUprightW = 640;
+    constexpr size_t kUprightH = 480;
+    const std::wstring missing = (TempDir() / L"missing_counted.jpg").wstring();
+    IC_REQUIRE(!std::filesystem::exists(missing));
+
+    for (const uint16_t orientation : { uint16_t { 1 }, uint16_t { 3 }, uint16_t { 6 }, uint16_t { 8 } })
+    {
+        const std::vector<uint8_t> jpeg = OrientedJpeg(orientation, kUprightW, kUprightH);
+        const uint64_t storedH = (orientation >= 5) ? kUprightW : kUprightH;
+        for (const ImagePurpose purpose : { ImagePurpose::FullResolution, ImagePurpose::Thumbnail })
+        {
+            auto rows = std::make_shared<uint64_t>(0);
+            const auto wrapper = [rows](Microsoft::WRL::ComPtr<IWICBitmapDecoder> inner)
+            {
+                Microsoft::WRL::ComPtr<IWICBitmapDecoder> decoder = Microsoft::WRL::Make<CountingDecoder>(std::move(inner), rows);
+                return decoder;
+            };
+            const Outcome outcome = Decode(missing, purpose, jpeg, true, wrapper);
+            std::printf("  orientation %u, %s: %llu frame rows read (stored height %llu)\n",
+                static_cast<unsigned>(orientation), purpose == ImagePurpose::Thumbnail ? "thumbnail" : "full",
+                static_cast<unsigned long long>(*rows), static_cast<unsigned long long>(storedH));
+            IC_CHECK(SUCCEEDED(outcome.hr));
+            IC_CHECK(ShowsUprightQuadrants(outcome));
+            IC_CHECK(*rows <= 2 * storedH);
+        }
+    }
+}
